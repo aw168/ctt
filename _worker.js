@@ -287,10 +287,12 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
+      // 清空旧的验证码和过期时间
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
         .run();
 
+      // 删除旧的验证消息（如果存在）
       const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -313,15 +315,18 @@ export default {
           .run();
       }
 
+      // 生成并发送新的验证问题
       await sendVerification(chatId);
     }
 
     async function sendVerification(chatId) {
+      // 生成新的随机数学问题
       const num1 = Math.floor(Math.random() * 10);
       const num2 = Math.floor(Math.random() * 10);
       const operation = Math.random() > 0.5 ? '+' : '-';
       const correctResult = operation === '+' ? num1 + num2 : num1 - num2;
 
+      // 生成选项
       const options = new Set();
       options.add(correctResult);
       while (options.size < 4) {
@@ -332,16 +337,20 @@ export default {
       }
       const optionArray = Array.from(options).sort(() => Math.random() - 0.5);
 
+      // 创建按钮
       const buttons = optionArray.map((option) => ({
         text: `(${option})`,
         callback_data: `verify_${chatId}_${option}_${option === correctResult ? 'correct' : 'wrong'}`,
       }));
 
+      // 构造验证问题
       const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const codeExpiry = nowSeconds + 300;
-      await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
-        .bind(chatId, correctResult.toString(), codeExpiry)
+      const codeExpiry = nowSeconds + 300; // 验证码有效期 5 分钟
+
+      // 更新数据库中的验证码和过期时间
+      await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ? WHERE chat_id = ?')
+        .bind(correctResult.toString(), codeExpiry, chatId)
         .run();
 
       try {
@@ -361,6 +370,7 @@ export default {
           console.error(`Failed to send verification message: ${data.description}`);
           return;
         }
+        // 保存新的验证消息 ID
         await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
           .bind(data.result.message_id.toString(), chatId)
           .run();
@@ -415,19 +425,45 @@ export default {
       const [, userChatId, selectedAnswer, result] = data.split('_');
       if (userChatId !== chatId) return;
 
+      // 获取验证码和过期时间
       const verificationState = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
       const storedCode = verificationState ? verificationState.verification_code : null;
       const codeExpiry = verificationState ? verificationState.code_expiry : null;
       const nowSeconds = Math.floor(Date.now() / 1000);
+
+      // 检查验证码是否过期
       if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
         await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
+        // 删除旧的验证消息
+        try {
+          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: messageId,
+            }),
+          });
+        } catch (error) {
+          console.error("Error deleting verification message:", error);
+        }
+        // 响应回调查询
+        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            callback_query_id: callbackQuery.id,
+          }),
+        });
         return;
       }
 
+      // 检查答案是否正确
       if (result === 'correct') {
-        const verifiedExpiry = nowSeconds + 3600;
+        // 答案正确，更新验证状态
+        const verifiedExpiry = nowSeconds + 3600; // 验证有效期 1 小时
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
           .bind(true, verifiedExpiry, chatId)
           .run();
@@ -454,10 +490,12 @@ export default {
             .run();
         }
       } else {
+        // 答案错误，重新生成验证问题
         await sendMessageToUser(chatId, '验证失败，请重新尝试。');
         await handleVerification(chatId, messageId);
       }
 
+      // 删除旧的验证消息
       try {
         await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
           method: 'POST',
@@ -471,6 +509,7 @@ export default {
         console.error("Error deleting verification message:", error);
       }
 
+      // 响应回调查询
       await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
