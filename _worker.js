@@ -30,7 +30,7 @@ export default {
 
     // 检查 D1 绑定
     if (!env.D1) {
-      console.error('D1 database is not bound');
+      console.error('D1 database is not bound. Please check your Worker bindings in the Cloudflare dashboard.');
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
@@ -38,8 +38,8 @@ export default {
     try {
       await initializeDatabase(env.D1);
     } catch (error) {
-      console.error('Failed to initialize database:', error);
-      return new Response('Server configuration error: Failed to initialize database', { status: 500 });
+      console.error('Failed to initialize database:', error.message);
+      return new Response(`Server configuration error: Failed to initialize database - ${error.message}`, { status: 500 });
     }
 
     // 主处理函数
