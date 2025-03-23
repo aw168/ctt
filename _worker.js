@@ -6,10 +6,12 @@ let MAX_MESSAGES_PER_MINUTE;
 // 调试环境变量加载
 export default {
   async fetch(request, env) {
+    // 调试环境变量
     console.log('BOT_TOKEN_ENV:', env.BOT_TOKEN_ENV || 'undefined');
     console.log('GROUP_ID_ENV:', env.GROUP_ID_ENV || 'undefined');
     console.log('MAX_MESSAGES_PER_MINUTE_ENV:', env.MAX_MESSAGES_PER_MINUTE_ENV || 'undefined');
 
+    // 设置环境变量
     if (!env.BOT_TOKEN_ENV) {
       console.error('BOT_TOKEN_ENV is not defined');
       BOT_TOKEN = null;
@@ -33,7 +35,12 @@ export default {
     }
 
     // 自动初始化数据库表
-    await initializeDatabase(env.D1);
+    try {
+      await initializeDatabase(env.D1);
+    } catch (error) {
+      console.error('Failed to initialize database:', error);
+      return new Response('Server configuration error: Failed to initialize database', { status: 500 });
+    }
 
     // 主处理函数
     async function handleRequest(request) {
@@ -64,7 +71,9 @@ export default {
     // 数据库初始化函数
     async function initializeDatabase(d1) {
       try {
-        // 检查表是否存在并创建
+        console.log('Initializing database tables...');
+
+        // 创建 user_states 表
         await d1.exec(`
           CREATE TABLE IF NOT EXISTS user_states (
             chat_id TEXT PRIMARY KEY,
@@ -78,7 +87,9 @@ export default {
             last_verification_message_id TEXT
           )
         `);
+        console.log('user_states table created or already exists');
 
+        // 创建 message_rates 表
         await d1.exec(`
           CREATE TABLE IF NOT EXISTS message_rates (
             chat_id TEXT PRIMARY KEY,
@@ -86,22 +97,24 @@ export default {
             window_start INTEGER
           )
         `);
+        console.log('message_rates table created or already exists');
 
+        // 创建 chat_topic_mappings 表
         await d1.exec(`
           CREATE TABLE IF NOT EXISTS chat_topic_mappings (
             chat_id TEXT PRIMARY KEY,
             topic_id INTEGER UNIQUE
           )
         `);
+        console.log('chat_topic_mappings table created or already exists');
 
         console.log('Database tables initialized successfully');
       } catch (error) {
-        console.error('Error initializing database:', error);
-        throw new Error('Database initialization failed');
+        console.error('Error initializing database:', error.message);
+        throw new Error(`Database initialization failed: ${error.message}`);
       }
     }
 
-    // 其余函数保持不变
     async function handleUpdate(update) {
       if (update.message) {
         await onMessage(update.message);
