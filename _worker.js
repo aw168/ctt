@@ -1,4 +1,4 @@
-// 从环境变量中读取配置（优先从 D1 读取，如果 D1 中没有则从环境变量读取）
+// 从环境变量中读取配置
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
@@ -6,58 +6,41 @@ let MAX_MESSAGES_PER_MINUTE;
 // 调试环境变量加载
 export default {
   async fetch(request, env) {
+    console.log('BOT_TOKEN_ENV:', env.BOT_TOKEN_ENV || 'undefined');
+    console.log('GROUP_ID_ENV:', env.GROUP_ID_ENV || 'undefined');
+    console.log('MAX_MESSAGES_PER_MINUTE_ENV:', env.MAX_MESSAGES_PER_MINUTE_ENV || 'undefined');
+
+    if (!env.BOT_TOKEN_ENV) {
+      console.error('BOT_TOKEN_ENV is not defined');
+      BOT_TOKEN = null;
+    } else {
+      BOT_TOKEN = env.BOT_TOKEN_ENV;
+    }
+
+    if (!env.GROUP_ID_ENV) {
+      console.error('GROUP_ID_ENV is not defined');
+      GROUP_ID = null;
+    } else {
+      GROUP_ID = env.GROUP_ID_ENV;
+    }
+
+    MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
+
     // 检查 D1 绑定
     if (!env.D1) {
       console.error('D1 database is not bound');
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
-    // 初始化数据库（创建表）
-    await initializeDatabase(env);
-
-    // 从 D1 中读取配置（如果存在）
-    const config = await env.D1.prepare('SELECT bot_token, group_id FROM config WHERE id = 1').first();
-    if (config) {
-      BOT_TOKEN = config.bot_token;
-      GROUP_ID = config.group_id;
-    } else {
-      // 如果 D1 中没有配置，则从环境变量读取
-      if (!env.BOT_TOKEN_ENV) {
-        console.error('BOT_TOKEN_ENV is not defined in environment variables');
-        BOT_TOKEN = null;
-      } else {
-        BOT_TOKEN = env.BOT_TOKEN_ENV;
-      }
-
-      if (!env.GROUP_ID_ENV) {
-        console.error('GROUP_ID_ENV is not defined in environment variables');
-        GROUP_ID = null;
-      } else {
-        GROUP_ID = env.GROUP_ID_ENV;
-      }
-    }
-
-    MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
-
-    console.log('BOT_TOKEN:', BOT_TOKEN || 'undefined');
-    console.log('GROUP_ID:', GROUP_ID || 'undefined');
-    console.log('MAX_MESSAGES_PER_MINUTE:', MAX_MESSAGES_PER_MINUTE);
-
     // 主处理函数
     async function handleRequest(request) {
-      const url = new URL(request.url);
-
-      // 处理配置端点
-      if (url.pathname === '/setConfig') {
-        return await setConfig(request);
-      }
-
-      // 检查配置是否完整
+      // 检查环境变量是否加载
       if (!BOT_TOKEN || !GROUP_ID) {
-        console.error('Missing required configuration. Please set BOT_TOKEN and GROUP_ID using /setConfig or environment variables.');
-        return new Response('Server configuration error: Missing required configuration. Please set BOT_TOKEN and GROUP_ID.', { status: 500 });
+        console.error('Missing required environment variables');
+        return new Response('Server configuration error: Missing required environment variables', { status: 500 });
       }
 
+      const url = new URL(request.url);
       if (url.pathname === '/webhook') {
         try {
           const update = await request.json();
@@ -73,85 +56,6 @@ export default {
         return await unRegisterWebhook();
       }
       return new Response('Not Found', { status: 404 });
-    }
-
-    // 初始化数据库表
-    async function initializeDatabase(env) {
-      try {
-        // 创建 config 表（存储 BOT_TOKEN 和 GROUP_ID）
-        await env.D1.exec(`
-          CREATE TABLE IF NOT EXISTS config (
-            id INTEGER PRIMARY KEY,
-            bot_token TEXT,
-            group_id TEXT
-          )
-        `);
-
-        // 创建 user_states 表
-        await env.D1.exec(`
-          CREATE TABLE IF NOT EXISTS user_states (
-            chat_id TEXT PRIMARY KEY,
-            is_blocked BOOLEAN DEFAULT FALSE,
-            is_verified BOOLEAN DEFAULT FALSE,
-            verified_expiry INTEGER,
-            verification_code TEXT,
-            code_expiry INTEGER,
-            last_verification_message_id TEXT,
-            is_first_verification BOOLEAN DEFAULT FALSE,
-            is_rate_limited BOOLEAN DEFAULT FALSE
-          )
-        `);
-
-        // 创建 message_rates 表
-        await env.D1.exec(`
-          CREATE TABLE IF NOT EXISTS message_rates (
-            chat_id TEXT PRIMARY KEY,
-            message_count INTEGER DEFAULT 0,
-            window_start INTEGER
-          )
-        `);
-
-        // 创建 chat_topic_mappings 表
-        await env.D1.exec(`
-          CREATE TABLE IF NOT EXISTS chat_topic_mappings (
-            chat_id TEXT PRIMARY KEY,
-            topic_id TEXT NOT NULL
-          )
-        `);
-
-        console.log('Database tables initialized successfully');
-      } catch (error) {
-        console.error('Error initializing database:', error);
-        throw new Error('Failed to initialize database');
-      }
-    }
-
-    // 设置配置端点
-    async function setConfig(request) {
-      if (request.method !== 'POST') {
-        return new Response('Method Not Allowed. Use POST to set configuration.', { status: 405 });
-      }
-
-      try {
-        const { bot_token, group_id } = await request.json();
-        if (!bot_token || !group_id) {
-          return new Response('Missing bot_token or group_id in request body', { status: 400 });
-        }
-
-        // 存储到 D1
-        await env.D1.prepare('INSERT OR REPLACE INTO config (id, bot_token, group_id) VALUES (?, ?, ?)')
-          .bind(1, bot_token, group_id)
-          .run();
-
-        // 更新内存中的变量
-        BOT_TOKEN = bot_token;
-        GROUP_ID = group_id;
-
-        return new Response('Configuration set successfully', { status: 200 });
-      } catch (error) {
-        console.error('Error setting configuration:', error);
-        return new Response('Failed to set configuration', { status: 500 });
-      }
     }
 
     async function handleUpdate(update) {
@@ -719,16 +623,23 @@ export default {
 
     async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
       for (let i = 0; i < retries; i++) {
-        const response = await fetch(url, options);
-        if (response.ok) {
-          return response;
-        } else if (response.status === 429) {
-          const retryAfter = response.headers.get('Retry-After');
-          const delay = retryAfter ? parseInt(retryAfter) * 1000 : backoff * Math.pow(2, i);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        } else {
-          console.error(`Request failed with status ${response.status}: ${response.statusText}`);
-          throw new Error(`Request failed with status ${response.status}: ${response.statusText}`);
+        try {
+          const response = await fetch(url, options);
+          if (response.ok) {
+            return response;
+          } else if (response.status === 429) {
+            const retryAfter = response.headers.get('Retry-After');
+            const delay = retryAfter ? parseInt(retryAfter) * 1000 : backoff * Math.pow(2, i);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          } else {
+            console.error(`Request failed with status ${response.status}: ${response.statusText}`);
+            throw new Error(`Request failed with status ${response.status}: ${response.statusText}`);
+          }
+        } catch (error) {
+          if (i === retries - 1) {
+            console.error(`Failed to fetch ${url} after ${retries} retries:`, error);
+            throw error;
+          }
         }
       }
       throw new Error(`Failed to fetch ${url} after ${retries} retries`);
@@ -755,6 +666,11 @@ export default {
       return new Response(response.ok ? 'Webhook removed' : JSON.stringify(response, null, 2));
     }
 
-    return await handleRequest(request);
+    try {
+      return await handleRequest(request);
+    } catch (error) {
+      console.error('Unhandled error in fetch handler:', error);
+      return new Response('Internal Server Error', { status: 500 });
+    }
   }
 };
