@@ -32,14 +32,6 @@ export default {
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
-    // 初始化数据库（创建表）
-    try {
-      await initializeDatabase(env);
-    } catch (error) {
-      console.error('Failed to initialize database:', error);
-      return new Response('Server configuration error: Failed to initialize database. Please create tables manually.', { status: 500 });
-    }
-
     // 主处理函数
     async function handleRequest(request) {
       // 检查环境变量是否加载
@@ -62,14 +54,19 @@ export default {
         return await registerWebhook(request);
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
+      } else if (url.pathname === '/initTables') {
+        return await initTables();
       }
       return new Response('Not Found', { status: 404 });
     }
 
-    // 初始化数据库表
-    async function initializeDatabase(env) {
+    // 初始化数据库表（通过 /initTables 端点调用）
+    async function initTables() {
       try {
+        console.log('Starting table initialization...');
+
         // 创建 user_states 表
+        console.log('Creating user_states table...');
         await env.D1.exec(`
           CREATE TABLE IF NOT EXISTS user_states (
             chat_id TEXT PRIMARY KEY,
@@ -83,8 +80,10 @@ export default {
             is_rate_limited BOOLEAN DEFAULT FALSE
           )
         `);
+        console.log('user_states table created successfully');
 
         // 创建 message_rates 表
+        console.log('Creating message_rates table...');
         await env.D1.exec(`
           CREATE TABLE IF NOT EXISTS message_rates (
             chat_id TEXT PRIMARY KEY,
@@ -92,19 +91,23 @@ export default {
             window_start INTEGER
           )
         `);
+        console.log('message_rates table created successfully');
 
         // 创建 chat_topic_mappings 表
+        console.log('Creating chat_topic_mappings table...');
         await env.D1.exec(`
           CREATE TABLE IF NOT EXISTS chat_topic_mappings (
             chat_id TEXT PRIMARY KEY,
             topic_id TEXT NOT NULL
           )
         `);
+        console.log('chat_topic_mappings table created successfully');
 
         console.log('Database tables initialized successfully');
+        return new Response('Database tables initialized successfully', { status: 200 });
       } catch (error) {
         console.error('Error initializing database tables:', error);
-        throw new Error('Failed to initialize database tables');
+        return new Response(`Failed to initialize database tables: ${error.message}`, { status: 500 });
       }
     }
 
