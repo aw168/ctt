@@ -1,0 +1,14 @@
+name = "ctt"
+compatibility_date = "2025-03-23"
+
+# 环境变量
+[vars]
+BOT_TOKEN_ENV = "YOUR_BOT_TOKEN" # 替换为您的 Telegram Bot Token
+GROUP_ID_ENV = "YOUR_GROUP_CHAT_ID" # 替换为您的群组 ID
+MAX_MESSAGES_PER_MINUTE_ENV = "40"
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "D1"
+database_name = "telegram-bot-db"
+database_id = "YOUR_DATABASE_ID" # 替换为您的 D1 数据库 ID
