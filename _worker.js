@@ -1,39 +1,24 @@
-// 从环境变量中读取配置
-let BOT_TOKEN;
-let GROUP_ID;
-let MAX_MESSAGES_PER_MINUTE;
-
 // 调试环境变量加载
 export default {
   async fetch(request, env) {
+    // 从 env 对象中读取环境变量
+    const BOT_TOKEN = env.BOT_TOKEN_ENV || 'YOUR_BOT_TOKEN';
+    const GROUP_ID = env.GROUP_ID_ENV || 'YOUR_GROUP_CHAT_ID';
+    const MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
+
+    // 调试日志
     console.log('BOT_TOKEN_ENV:', env.BOT_TOKEN_ENV || 'undefined');
     console.log('GROUP_ID_ENV:', env.GROUP_ID_ENV || 'undefined');
     console.log('MAX_MESSAGES_PER_MINUTE_ENV:', env.MAX_MESSAGES_PER_MINUTE_ENV || 'undefined');
 
-    if (!env.BOT_TOKEN_ENV) {
-      console.error('BOT_TOKEN_ENV is not defined');
-      BOT_TOKEN = null;
-    } else {
-      BOT_TOKEN = env.BOT_TOKEN_ENV;
+    // 检查环境变量是否加载
+    if (!BOT_TOKEN || !GROUP_ID) {
+      console.error('Missing required environment variables');
+      return new Response('Server configuration error: Missing required environment variables', { status: 500 });
     }
-
-    if (!env.GROUP_ID_ENV) {
-      console.error('GROUP_ID_ENV is not defined');
-      GROUP_ID = null;
-    } else {
-      GROUP_ID = env.GROUP_ID_ENV;
-    }
-
-    MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
     // 主处理函数
     async function handleRequest(request) {
-      // 检查环境变量是否加载
-      if (!BOT_TOKEN || !GROUP_ID) {
-        console.error('Missing required environment variables');
-        return new Response('Server configuration error: Missing required environment variables', { status: 500 });
-      }
-
       const url = new URL(request.url);
       if (url.pathname === '/webhook') {
         try {
@@ -52,7 +37,6 @@ export default {
       return new Response('Not Found', { status: 404 });
     }
 
-    // 其他函数保持不变，但需要确保所有对 BOT_TOKEN 和 GROUP_ID 的访问使用局部变量
     async function handleUpdate(update) {
       if (update.message) {
         await onMessage(update.message);
@@ -560,7 +544,6 @@ export default {
     }
 
     async function registerWebhook(request) {
-      console.log('BOT_TOKEN in registerWebhook:', BOT_TOKEN);
       const webhookUrl = `${new URL(request.url).origin}/webhook`;
       const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
@@ -571,7 +554,6 @@ export default {
     }
 
     async function unRegisterWebhook() {
-      console.log('BOT_TOKEN in unRegisterWebhook:', BOT_TOKEN);
       const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
