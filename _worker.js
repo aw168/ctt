@@ -100,7 +100,7 @@ export default {
         console.log('Creating new tables...');
 
         // 创建 user_states 表（单行格式，避免换行问题）
-        await d1.exec('CREATE TABLE user_states (chat_id TEXT PRIMARY KEY, is_verified BOOLEAN DEFAULT FALSE, verified_expiry INTEGER, verification_code TEXT, code_expiry INTEGER, is_blocked BOOLEAN DEFAULT FALSE, is_rate_limited BOOLEAN DEFAULT FALSE, is_first_verification BOOLEAN DEFAULT TRUE, last_verification_message_id TEXT)');
+        await d1.exec('CREATE TABLE user_states (chat_id TEXT PRIMARY KEY, is_verified BOOLEAN DEFAULT FALSE, verified_expiry INTEGER, verification_code TEXT, code_expiry INTEGER, is_blocked BOOLEAN DEFAULT FALSE, is_rate_limited BOOLEAN DEFAULT FALSE, is_first_verification BOOLEAN DEFAULT TRUE, last_verification_message_id TEXT, last_verification_time INTEGER)');
         console.log('user_states table created');
 
         // 创建 message_rates 表
@@ -287,6 +287,19 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+
+      // 检查是否在冷却时间内（防止重复触发）
+      const userState = await env.D1.prepare('SELECT last_verification_time FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      const lastVerificationTime = userState ? userState.last_verification_time : 0;
+      const cooldownSeconds = 5; // 冷却时间 5 秒
+      if (lastVerificationTime && (nowSeconds - lastVerificationTime) < cooldownSeconds) {
+        console.log(`User ${chatId} is in verification cooldown, skipping...`);
+        return;
+      }
+
       // 清空旧的验证码和过期时间
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
@@ -315,6 +328,11 @@ export default {
           .run();
       }
 
+      // 更新最后验证时间
+      await env.D1.prepare('UPDATE user_states SET last_verification_time = ? WHERE chat_id = ?')
+        .bind(nowSeconds, chatId)
+        .run();
+
       // 生成并发送新的验证问题
       await sendVerification(chatId);
     }
@@ -340,7 +358,7 @@ export default {
       // 创建按钮
       const buttons = optionArray.map((option) => ({
         text: `(${option})`,
-        callback_data: `verify_${chatId}_${option}_${option === correctResult ? 'correct' : 'wrong'}`,
+        callback_data: `verify_${chatId}_${option}_${option === correctResult ? 'correct' : 'wrong'}_${Date.now()}`,
       }));
 
       // 构造验证问题
@@ -422,7 +440,7 @@ export default {
 
       if (!data.startsWith('verify_')) return;
 
-      const [, userChatId, selectedAnswer, result] = data.split('_');
+      const [, userChatId, selectedAnswer, result, timestamp] = data.split('_');
       if (userChatId !== chatId) return;
 
       // 获取验证码和过期时间
@@ -461,10 +479,10 @@ export default {
       }
 
       // 检查答案是否正确
-      if (result === 'correct') {
+      if (result === 'correct' && selectedAnswer === storedCode) {
         // 答案正确，更新验证状态
         const verifiedExpiry = nowSeconds + 3600; // 验证有效期 1 小时
-        await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
+        await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, last_verification_time = NULL WHERE chat_id = ?')
           .bind(true, verifiedExpiry, chatId)
           .run();
 
