@@ -54,61 +54,8 @@ export default {
         return await registerWebhook(request);
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
-      } else if (url.pathname === '/initTables') {
-        return await initTables();
       }
       return new Response('Not Found', { status: 404 });
-    }
-
-    // 初始化数据库表（通过 /initTables 端点调用）
-    async function initTables() {
-      try {
-        console.log('Starting table initialization...');
-
-        // 创建 user_states 表
-        console.log('Creating user_states table...');
-        await env.D1.exec(`
-          CREATE TABLE IF NOT EXISTS user_states (
-            chat_id TEXT PRIMARY KEY,
-            is_blocked BOOLEAN DEFAULT FALSE,
-            is_verified BOOLEAN DEFAULT FALSE,
-            verified_expiry INTEGER,
-            verification_code TEXT,
-            code_expiry INTEGER,
-            last_verification_message_id TEXT,
-            is_first_verification BOOLEAN DEFAULT FALSE,
-            is_rate_limited BOOLEAN DEFAULT FALSE
-          )
-        `);
-        console.log('user_states table created successfully');
-
-        // 创建 message_rates 表
-        console.log('Creating message_rates table...');
-        await env.D1.exec(`
-          CREATE TABLE IF NOT EXISTS message_rates (
-            chat_id TEXT PRIMARY KEY,
-            message_count INTEGER DEFAULT 0,
-            window_start INTEGER
-          )
-        `);
-        console.log('message_rates table created successfully');
-
-        // 创建 chat_topic_mappings 表
-        console.log('Creating chat_topic_mappings table...');
-        await env.D1.exec(`
-          CREATE TABLE IF NOT EXISTS chat_topic_mappings (
-            chat_id TEXT PRIMARY KEY,
-            topic_id TEXT NOT NULL
-          )
-        `);
-        console.log('chat_topic_mappings table created successfully');
-
-        console.log('Database tables initialized successfully');
-        return new Response('Database tables initialized successfully', { status: 200 });
-      } catch (error) {
-        console.error('Error initializing database tables:', error);
-        return new Response(`Failed to initialize database tables: ${error.message}`, { status: 500 });
-      }
     }
 
     async function handleUpdate(update) {
