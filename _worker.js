@@ -97,18 +97,18 @@ export default {
         // 创建新表
         console.log('Creating new tables...');
 
-        // 创建 user_states 表
+        // 创建 user_states 表（将 BOOLEAN 替换为 INTEGER）
         await d1.exec(`
           CREATE TABLE user_states (
             chat_id TEXT PRIMARY KEY,
-            is_blocked BOOLEAN DEFAULT FALSE,
-            is_verified BOOLEAN DEFAULT FALSE,
+            is_blocked INTEGER DEFAULT 0,
+            is_verified INTEGER DEFAULT 0,
             verified_expiry INTEGER,
             verification_code TEXT,
             code_expiry INTEGER,
             last_verification_message_id TEXT,
-            is_first_verification BOOLEAN DEFAULT FALSE,
-            is_rate_limited BOOLEAN DEFAULT FALSE
+            is_first_verification INTEGER DEFAULT 0,
+            is_rate_limited INTEGER DEFAULT 0
           )
         `);
         console.log('user_states table created successfully');
@@ -174,7 +174,7 @@ export default {
       const userState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
-      const isBlocked = userState ? userState.is_blocked : false;
+      const isBlocked = userState ? userState.is_blocked : 0;
       if (isBlocked) {
         console.log(`User ${chatId} is blocked, ignoring message.`);
         return;
@@ -184,15 +184,15 @@ export default {
       const verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
-      let isVerified = verificationState ? verificationState.is_verified : false;
+      let isVerified = verificationState ? verificationState.is_verified : 0;
       const verifiedExpiry = verificationState ? verificationState.verified_expiry : null;
       const nowSeconds = Math.floor(Date.now() / 1000);
       if (verifiedExpiry && nowSeconds > verifiedExpiry) {
         // 验证状态已过期，重置为未验证
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
-          .bind(false, chatId)
+          .bind(0, chatId)
           .run();
-        isVerified = false;
+        isVerified = 0;
       }
       console.log(`User ${chatId} verification status: ${isVerified}`);
       if (!isVerified) {
@@ -206,7 +206,7 @@ export default {
       if (await checkMessageRate(chatId)) {
         console.log(`User ${chatId} exceeded message rate limit, resetting verification.`);
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL, is_rate_limited = ? WHERE chat_id = ?')
-          .bind(false, true, chatId)
+          .bind(0, 1, chatId)
           .run();
         const messageContent = text || '非文本消息';
         await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n信息过于频繁，请完成验证后发送信息`);
@@ -217,16 +217,16 @@ export default {
       // 处理客户消息
       if (text === '/start') {
         await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
-          .bind(chatId, true)
+          .bind(chatId, 1)
           .run();
         const verificationStateAgain = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
-        const isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : false;
+        const isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : 0;
         const verifiedExpiryAgain = verificationStateAgain ? verificationStateAgain.verified_expiry : null;
         if (verifiedExpiryAgain && nowSeconds > verifiedExpiryAgain) {
           await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
-            .bind(false, chatId)
+            .bind(0, chatId)
             .run();
         }
         if (isVerifiedAgain && (!verifiedExpiryAgain || nowSeconds <= verifiedExpiryAgain)) {
@@ -276,19 +276,19 @@ export default {
 
       if (text === '/block') {
         await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
-          .bind(privateChatId, true)
+          .bind(privateChatId, 1)
           .run();
         await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
       } else if (text === '/unblock') {
         await env.D1.prepare('UPDATE user_states SET is_blocked = ? WHERE chat_id = ?')
-          .bind(false, privateChatId)
+          .bind(0, privateChatId)
           .run();
         await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
       } else if (text === '/checkblock') {
         const userState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
           .bind(privateChatId)
           .first();
-        const isBlocked = userState ? userState.is_blocked : false;
+        const isBlocked = userState ? userState.is_blocked : 0;
         const status = isBlocked ? '是' : '否';
         await sendMessageToTopic(topicId, `用户 ${privateChatId} 是否在黑名单中：${status}`);
       }
@@ -464,20 +464,20 @@ export default {
         // 答案正确，更新验证状态
         const verifiedExpiry = nowSeconds + 3600; // 1 小时有效期
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
-          .bind(true, verifiedExpiry, chatId)
+          .bind(1, verifiedExpiry, chatId)
           .run();
 
         const userState = await env.D1.prepare('SELECT is_first_verification, is_rate_limited FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
-        const isFirstVerification = userState ? userState.is_first_verification : false;
-        const isRateLimited = userState ? userState.is_rate_limited : false;
+        const isFirstVerification = userState ? userState.is_first_verification : 0;
+        const isRateLimited = userState ? userState.is_rate_limited : 0;
 
         if (isFirstVerification) {
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！`);
           await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
-            .bind(false, chatId)
+            .bind(0, chatId)
             .run();
         } else {
           await sendMessageToUser(chatId, '验证成功！请重新发送您的消息');
@@ -485,7 +485,7 @@ export default {
 
         if (isRateLimited) {
           await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
-            .bind(false, chatId)
+            .bind(0, chatId)
             .run();
         }
       } else if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
