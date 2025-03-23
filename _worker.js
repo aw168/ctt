@@ -34,7 +34,9 @@ export default {
 
     // 自动清空并初始化数据库表（每次部署时执行）
     try {
+      console.log('Attempting to initialize database...');
       await initializeDatabase(env.D1);
+      console.log('Database initialization completed successfully');
     } catch (error) {
       console.error('Failed to initialize database:', error.message);
       return new Response(`Server configuration error: Failed to initialize database - ${error.message}`, { status: 500 });
@@ -62,6 +64,15 @@ export default {
         return await registerWebhook(request);
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
+      } else if (url.pathname === '/testDatabase') {
+        // 添加测试端点，用于手动测试数据库访问
+        try {
+          await initializeDatabase(env.D1);
+          return new Response('Database test successful: Tables created', { status: 200 });
+        } catch (error) {
+          console.error('Database test failed:', error.message);
+          return new Response(`Database test failed: ${error.message}`, { status: 500 });
+        }
       }
       return new Response('Not Found', { status: 404 });
     }
@@ -97,7 +108,8 @@ export default {
         // 创建新表
         console.log('Creating new tables...');
 
-        // 创建 user_states 表（将 BOOLEAN 替换为 INTEGER）
+        // 创建 user_states 表
+        console.log('Creating user_states table...');
         await d1.exec(`
           CREATE TABLE user_states (
             chat_id TEXT PRIMARY KEY,
@@ -114,6 +126,7 @@ export default {
         console.log('user_states table created successfully');
 
         // 创建 message_rates 表
+        console.log('Creating message_rates table...');
         await d1.exec(`
           CREATE TABLE message_rates (
             chat_id TEXT PRIMARY KEY,
@@ -124,6 +137,7 @@ export default {
         console.log('message_rates table created successfully');
 
         // 创建 chat_topic_mappings 表
+        console.log('Creating chat_topic_mappings table...');
         await d1.exec(`
           CREATE TABLE chat_topic_mappings (
             chat_id TEXT PRIMARY KEY,
