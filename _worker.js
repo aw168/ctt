@@ -3,10 +3,7 @@ const BOT_TOKEN = typeof BOT_TOKEN_ENV !== 'undefined' ? BOT_TOKEN_ENV : 'YOUR_B
 const GROUP_ID = typeof GROUP_ID_ENV !== 'undefined' ? GROUP_ID_ENV : 'YOUR_GROUP_CHAT_ID'; // 从环境变量获取
 const MAX_MESSAGES_PER_MINUTE = typeof MAX_MESSAGES_PER_MINUTE_ENV !== 'undefined' ? parseInt(MAX_MESSAGES_PER_MINUTE_ENV) : 40; // 消息频率限制，默认40条/分钟
 
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
-});
-
+// 主处理函数
 async function handleRequest(request) {
   const url = new URL(request.url);
   if (url.pathname === '/webhook') {
@@ -25,6 +22,13 @@ async function handleRequest(request) {
   }
   return new Response('Not Found', { status: 404 });
 }
+
+// 使用模块语法（Cloudflare Pages 要求）
+export default {
+  async fetch(request) {
+    return await handleRequest(request);
+  }
+};
 
 async function handleUpdate(update) {
   if (update.message) {
