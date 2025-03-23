@@ -71,42 +71,45 @@ export default {
     // 数据库初始化函数
     async function initializeDatabase(d1) {
       try {
-        console.log('Initializing database tables...');
+        console.log('Initializing database...');
 
-        // 创建 user_states 表
-        await d1.exec(`
-          CREATE TABLE IF NOT EXISTS user_states (
-            chat_id TEXT PRIMARY KEY,
-            is_verified BOOLEAN DEFAULT FALSE,
-            verified_expiry INTEGER,
-            verification_code TEXT,
-            code_expiry INTEGER,
-            is_blocked BOOLEAN DEFAULT FALSE,
-            is_rate_limited BOOLEAN DEFAULT FALSE,
-            is_first_verification BOOLEAN DEFAULT TRUE,
-            last_verification_message_id TEXT
-          )
-        `);
-        console.log('user_states table created or already exists');
+        // 清空数据库：删除所有表
+        console.log('Dropping existing tables...');
+        try {
+          await d1.exec('DROP TABLE IF EXISTS user_states');
+          console.log('Dropped user_states table');
+        } catch (dropError) {
+          console.warn('Error dropping user_states table:', dropError.message);
+        }
+
+        try {
+          await d1.exec('DROP TABLE IF EXISTS message_rates');
+          console.log('Dropped message_rates table');
+        } catch (dropError) {
+          console.warn('Error dropping message_rates table:', dropError.message);
+        }
+
+        try {
+          await d1.exec('DROP TABLE IF EXISTS chat_topic_mappings');
+          console.log('Dropped chat_topic_mappings table');
+        } catch (dropError) {
+          console.warn('Error dropping chat_topic_mappings table:', dropError.message);
+        }
+
+        // 创建新表
+        console.log('Creating new tables...');
+
+        // 创建 user_states 表（单行格式，避免换行问题）
+        await d1.exec('CREATE TABLE user_states (chat_id TEXT PRIMARY KEY, is_verified BOOLEAN DEFAULT FALSE, verified_expiry INTEGER, verification_code TEXT, code_expiry INTEGER, is_blocked BOOLEAN DEFAULT FALSE, is_rate_limited BOOLEAN DEFAULT FALSE, is_first_verification BOOLEAN DEFAULT TRUE, last_verification_message_id TEXT)');
+        console.log('user_states table created');
 
         // 创建 message_rates 表
-        await d1.exec(`
-          CREATE TABLE IF NOT EXISTS message_rates (
-            chat_id TEXT PRIMARY KEY,
-            message_count INTEGER DEFAULT 0,
-            window_start INTEGER
-          )
-        `);
-        console.log('message_rates table created or already exists');
+        await d1.exec('CREATE TABLE message_rates (chat_id TEXT PRIMARY KEY, message_count INTEGER DEFAULT 0, window_start INTEGER)');
+        console.log('message_rates table created');
 
         // 创建 chat_topic_mappings 表
-        await d1.exec(`
-          CREATE TABLE IF NOT EXISTS chat_topic_mappings (
-            chat_id TEXT PRIMARY KEY,
-            topic_id INTEGER UNIQUE
-          )
-        `);
-        console.log('chat_topic_mappings table created or already exists');
+        await d1.exec('CREATE TABLE chat_topic_mappings (chat_id TEXT PRIMARY KEY, topic_id INTEGER UNIQUE)');
+        console.log('chat_topic_mappings table created');
 
         console.log('Database tables initialized successfully');
       } catch (error) {
