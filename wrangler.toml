@@ -1,0 +1,22 @@
+name = "cfteletrans"
+compatibility_date = "2025-03-23"
+main = "_worker.js"  # 明确指定根目录的 _worker.js
+workers_dev = true
+
+# 添加 pages_build_output_dir 以适配 Cloudflare Pages
+pages_build_output_dir = "."
+
+# 明确指定 Worker 类型为 Service Worker 语法
+compatibility_flags = ["service_worker_syntax"]
+
+[vars]
+BOT_TOKEN_ENV = "YOUR_BOT_TOKEN"
+GROUP_ID_ENV = "YOUR_GROUP_CHAT_ID"
+MAX_MESSAGES_PER_MINUTE_ENV = "40"
+
+[[kv_namespaces]]
+binding = "TOPIC_KV"
+id = "YOUR_KV_NAMESPACE_ID"
+
+[build]
+command = ""
