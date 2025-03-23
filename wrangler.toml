@@ -1,13 +1,10 @@
 name = "cfteletrans"
 compatibility_date = "2025-03-23"
-main = "_worker.js"  # 明确指定根目录的 _worker.js
+main = "functions/_worker.js"  # 更新路径
 workers_dev = true
 
 # 添加 pages_build_output_dir 以适配 Cloudflare Pages
 pages_build_output_dir = "."
-
-# 明确指定 Worker 类型为 Service Worker 语法
-compatibility_flags = ["service_worker_syntax"]
 
 [vars]
 BOT_TOKEN_ENV = "YOUR_BOT_TOKEN"
