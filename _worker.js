@@ -1,18 +1,37 @@
 // 从环境变量中读取配置
-// 移除默认值，强制环境变量必须存在
+let BOT_TOKEN;
+let GROUP_ID;
+let MAX_MESSAGES_PER_MINUTE;
+
+// 调试环境变量加载
+console.log('BOT_TOKEN_ENV:', typeof BOT_TOKEN_ENV !== 'undefined' ? BOT_TOKEN_ENV : 'undefined');
+console.log('GROUP_ID_ENV:', typeof GROUP_ID_ENV !== 'undefined' ? GROUP_ID_ENV : 'undefined');
+console.log('MAX_MESSAGES_PER_MINUTE_ENV:', typeof MAX_MESSAGES_PER_MINUTE_ENV !== 'undefined' ? MAX_MESSAGES_PER_MINUTE_ENV : 'undefined');
+
 if (typeof BOT_TOKEN_ENV === 'undefined') {
-  throw new Error('BOT_TOKEN_ENV is not defined');
-}
-if (typeof GROUP_ID_ENV === 'undefined') {
-  throw new Error('GROUP_ID_ENV is not defined');
+  console.error('BOT_TOKEN_ENV is not defined');
+  BOT_TOKEN = null;
+} else {
+  BOT_TOKEN = BOT_TOKEN_ENV;
 }
 
-const BOT_TOKEN = BOT_TOKEN_ENV;
-const GROUP_ID = GROUP_ID_ENV;
-const MAX_MESSAGES_PER_MINUTE = typeof MAX_MESSAGES_PER_MINUTE_ENV !== 'undefined' ? parseInt(MAX_MESSAGES_PER_MINUTE_ENV) : 40; // 消息频率限制，默认40条/分钟
+if (typeof GROUP_ID_ENV === 'undefined') {
+  console.error('GROUP_ID_ENV is not defined');
+  GROUP_ID = null;
+} else {
+  GROUP_ID = GROUP_ID_ENV;
+}
+
+MAX_MESSAGES_PER_MINUTE = typeof MAX_MESSAGES_PER_MINUTE_ENV !== 'undefined' ? parseInt(MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
 // 主处理函数
 async function handleRequest(request) {
+  // 检查环境变量是否加载
+  if (!BOT_TOKEN || !GROUP_ID) {
+    console.error('Missing required environment variables');
+    return new Response('Server configuration error: Missing required environment variables', { status: 500 });
+  }
+
   const url = new URL(request.url);
   if (url.pathname === '/webhook') {
     try {
@@ -582,7 +601,7 @@ async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
 }
 
 async function registerWebhook(request) {
-  console.log('BOT_TOKEN in registerWebhook:', BOT_TOKEN); // 添加调试日志
+  console.log('BOT_TOKEN in registerWebhook:', BOT_TOKEN);
   const webhookUrl = `${new URL(request.url).origin}/webhook`;
   const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
     method: 'POST',
@@ -593,7 +612,7 @@ async function registerWebhook(request) {
 }
 
 async function unRegisterWebhook() {
-  console.log('BOT_TOKEN in unRegisterWebhook:', BOT_TOKEN); // 添加调试日志
+  console.log('BOT_TOKEN in unRegisterWebhook:', BOT_TOKEN);
   const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
