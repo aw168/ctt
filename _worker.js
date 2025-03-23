@@ -32,6 +32,9 @@ export default {
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
+    // 自动初始化数据库表
+    await initializeDatabase(env.D1);
+
     // 主处理函数
     async function handleRequest(request) {
       // 检查环境变量是否加载
@@ -58,6 +61,47 @@ export default {
       return new Response('Not Found', { status: 404 });
     }
 
+    // 数据库初始化函数
+    async function initializeDatabase(d1) {
+      try {
+        // 检查表是否存在并创建
+        await d1.exec(`
+          CREATE TABLE IF NOT EXISTS user_states (
+            chat_id TEXT PRIMARY KEY,
+            is_verified BOOLEAN DEFAULT FALSE,
+            verified_expiry INTEGER,
+            verification_code TEXT,
+            code_expiry INTEGER,
+            is_blocked BOOLEAN DEFAULT FALSE,
+            is_rate_limited BOOLEAN DEFAULT FALSE,
+            is_first_verification BOOLEAN DEFAULT TRUE,
+            last_verification_message_id TEXT
+          )
+        `);
+
+        await d1.exec(`
+          CREATE TABLE IF NOT EXISTS message_rates (
+            chat_id TEXT PRIMARY KEY,
+            message_count INTEGER DEFAULT 0,
+            window_start INTEGER
+          )
+        `);
+
+        await d1.exec(`
+          CREATE TABLE IF NOT EXISTS chat_topic_mappings (
+            chat_id TEXT PRIMARY KEY,
+            topic_id INTEGER UNIQUE
+          )
+        `);
+
+        console.log('Database tables initialized successfully');
+      } catch (error) {
+        console.error('Error initializing database:', error);
+        throw new Error('Database initialization failed');
+      }
+    }
+
+    // 其余函数保持不变
     async function handleUpdate(update) {
       if (update.message) {
         await onMessage(update.message);
@@ -71,25 +115,21 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
-      // 如果消息来自后台群组（客服回复或管理员命令）
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
           if (privateChatId) {
-            // 检查是否为管理员命令
             if (text.startsWith('/block') || text.startsWith('/unblock') || text.startsWith('/checkblock')) {
               await handleAdminCommand(message, topicId, privateChatId);
               return;
             }
-            // 普通客服回复
             await forwardMessageToPrivateChat(privateChatId, message);
           }
         }
         return;
       }
 
-      // 检查用户是否被拉黑
       const userState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -99,7 +139,6 @@ export default {
         return;
       }
 
-      // 检查用户是否已通过验证
       const verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -107,7 +146,6 @@ export default {
       const verifiedExpiry = verificationState ? verificationState.verified_expiry : null;
       const nowSeconds = Math.floor(Date.now() / 1000);
       if (verifiedExpiry && nowSeconds > verifiedExpiry) {
-        // 验证状态已过期，重置为未验证
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
           .bind(false, chatId)
           .run();
@@ -121,7 +159,6 @@ export default {
         return;
       }
 
-      // 检查消息频率（防刷）
       if (await checkMessageRate(chatId)) {
         console.log(`User ${chatId} exceeded message rate limit, resetting verification.`);
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL, is_rate_limited = ? WHERE chat_id = ?')
@@ -133,7 +170,6 @@ export default {
         return;
       }
 
-      // 处理客户消息
       if (text === '/start') {
         await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
           .bind(chatId, true)
@@ -149,12 +185,11 @@ export default {
             .run();
         }
         if (isVerifiedAgain && (!verifiedExpiryAgain || nowSeconds <= verifiedExpiryAgain)) {
-          // 如果已经验证过，直接发送欢迎消息
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
         } else {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，现在发送信息吧！");
-          await handleVerification(chatId, messageId); // 触发验证
+          await handleVerification(chatId, messageId);
         }
         return;
       }
@@ -186,7 +221,6 @@ export default {
       const text = message.text;
       const senderId = message.from.id.toString();
 
-      // 检查发送者是否为管理员
       const isAdmin = await checkIfAdmin(senderId);
       if (!isAdmin) {
         await sendMessageToTopic(topicId, '只有管理员可以使用此命令。');
@@ -237,7 +271,6 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
-      // 清理旧的验证码状态
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
         .run();
@@ -290,7 +323,7 @@ export default {
 
       const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const codeExpiry = nowSeconds + 300; // 5 分钟有效期
+      const codeExpiry = nowSeconds + 300;
       await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
         .bind(chatId, correctResult.toString(), codeExpiry)
         .run();
@@ -378,7 +411,7 @@ export default {
       }
 
       if (result === 'correct') {
-        const verifiedExpiry = nowSeconds + 3600; // 1 小时有效期
+        const verifiedExpiry = nowSeconds + 3600;
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
           .bind(true, verifiedExpiry, chatId)
           .run();
@@ -434,7 +467,7 @@ export default {
     async function checkMessageRate(chatId) {
       const key = chatId;
       const now = Date.now();
-      const window = 60 * 1000; // 1 分钟窗口
+      const window = 60 * 1000;
 
       const rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
         .bind(key)
