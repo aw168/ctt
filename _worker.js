@@ -32,6 +32,14 @@ export default {
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
+    // 初始化数据库（创建表）
+    try {
+      await initializeDatabase(env);
+    } catch (error) {
+      console.error('Failed to initialize database:', error);
+      return new Response('Server configuration error: Failed to initialize database. Please create tables manually.', { status: 500 });
+    }
+
     // 主处理函数
     async function handleRequest(request) {
       // 检查环境变量是否加载
@@ -56,6 +64,48 @@ export default {
         return await unRegisterWebhook();
       }
       return new Response('Not Found', { status: 404 });
+    }
+
+    // 初始化数据库表
+    async function initializeDatabase(env) {
+      try {
+        // 创建 user_states 表
+        await env.D1.exec(`
+          CREATE TABLE IF NOT EXISTS user_states (
+            chat_id TEXT PRIMARY KEY,
+            is_blocked BOOLEAN DEFAULT FALSE,
+            is_verified BOOLEAN DEFAULT FALSE,
+            verified_expiry INTEGER,
+            verification_code TEXT,
+            code_expiry INTEGER,
+            last_verification_message_id TEXT,
+            is_first_verification BOOLEAN DEFAULT FALSE,
+            is_rate_limited BOOLEAN DEFAULT FALSE
+          )
+        `);
+
+        // 创建 message_rates 表
+        await env.D1.exec(`
+          CREATE TABLE IF NOT EXISTS message_rates (
+            chat_id TEXT PRIMARY KEY,
+            message_count INTEGER DEFAULT 0,
+            window_start INTEGER
+          )
+        `);
+
+        // 创建 chat_topic_mappings 表
+        await env.D1.exec(`
+          CREATE TABLE IF NOT EXISTS chat_topic_mappings (
+            chat_id TEXT PRIMARY KEY,
+            topic_id TEXT NOT NULL
+          )
+        `);
+
+        console.log('Database tables initialized successfully');
+      } catch (error) {
+        console.error('Error initializing database tables:', error);
+        throw new Error('Failed to initialize database tables');
+      }
     }
 
     async function handleUpdate(update) {
