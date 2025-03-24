@@ -68,6 +68,30 @@ export default {
       return await unRegisterWebhook(env);
     } else if (url.pathname === '/initTables') {
       return await checkAndFixTables(env);
+    } else if (url.pathname === '/debug') {
+      // 调试端点：接收调试信息并推送到 https://ctt.pages.dev/check
+      try {
+        const debugData = await request.json();
+        const debugMessage = JSON.stringify(debugData, null, 2);
+        console.log('Debug data received:', debugMessage);
+
+        // 将调试信息推送到 https://ctt.pages.dev/check
+        const response = await fetch('https://ctt.pages.dev/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ debug: debugMessage }),
+        });
+
+        if (!response.ok) {
+          console.error('Failed to send debug data to https://ctt.pages.dev/check:', response.statusText);
+          return new Response('Failed to send debug data', { status: 500 });
+        }
+
+        return new Response('Debug data sent successfully', { status: 200 });
+      } catch (error) {
+        console.error('Error handling debug endpoint:', error);
+        return new Response('Error handling debug data', { status: 500 });
+      }
     }
 
     return new Response('Not Found', { status: 404 });
@@ -190,6 +214,21 @@ async function unRegisterWebhook(env) {
   } catch (error) {
     console.error('Error unregistering webhook:', error);
     return new Response(`Error unregistering webhook: ${error.message}`, { status: 500 });
+  }
+}
+
+async function sendDebugInfo(debugInfo, env) {
+  try {
+    const response = await fetch('https://<your-worker-url>.workers.dev/debug', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(debugInfo),
+    });
+    if (!response.ok) {
+      console.error('Failed to send debug info to /debug endpoint:', response.statusText);
+    }
+  } catch (error) {
+    console.error('Error sending debug info:', error);
   }
 }
 
@@ -375,7 +414,7 @@ async function handleAdminCommand(message, topicId, privateChatId, env) {
       debugMessage += `- 验证有效期 (verified_expiry): ${userState.verified_expiry || '无'} (${userState.verified_expiry && nowSeconds > userState.verified_expiry ? '已过期' : '未过期'})\n`;
       debugMessage += `- 当前验证码 (verification_code): ${userState.verification_code || '无'}\n`;
       debugMessage += `- 验证码有效期 (code_expiry): ${userState.code_expiry || '无'} (${userState.code_expiry && nowSeconds > userState.code_expiry ? '已过期' : '未过期'})\n`;
-      debugMessage += `- 最后验证码消息ID (last_verification_message_id): ${userState.last_verification_message_id || '无'}\n`;
+      debugMessage += `- 最后验证码消息ID (last_verification_message_id): ${userState.last_verification_message_id || '无'} (类型: ${typeof userState.last_verification_message_id})\n`;
       debugMessage += `- 是否首次验证 (is_first_verification): ${userState.is_first_verification ? '是' : '否'}\n`;
       debugMessage += `- 是否被限流 (is_rate_limited): ${userState.is_rate_limited ? '是' : '否'}\n`;
       debugMessage += `- 最后活动时间 (last_activity): ${userState.last_activity || '无'}\n`;
@@ -431,7 +470,16 @@ async function checkIfAdmin(userId, env) {
 }
 
 async function handleVerification(chatId, messageId, env) {
-  console.log(`Starting verification process for chatId ${chatId}`);
+  const debugInfo = {
+    timestamp: new Date().toISOString(),
+    chatId: chatId,
+    action: 'handleVerification',
+    messageId: messageId,
+  };
+
+  debugInfo.status = 'Starting verification process';
+  debugInfo.message = `Starting verification process for chatId ${chatId}`;
+  await sendDebugInfo(debugInfo, env);
   
   try {
     // 清理旧的验证码状态
@@ -450,10 +498,14 @@ async function handleVerification(chatId, messageId, env) {
             message_id: oldMessageId,
           }),
         });
-        console.log(`Deleted old verification message ${oldMessageId} for chatId ${chatId}`);
+        debugInfo.status = 'Deleted old verification message';
+        debugInfo.message = `Deleted old verification message ${oldMessageId} for chatId ${chatId}`;
+        await sendDebugInfo(debugInfo, env);
       } catch (error) {
-        // 忽略删除旧消息的错误，继续处理
-        console.error(`Failed to delete old verification message ${oldMessageId} for chatId ${chatId}:`, error);
+        debugInfo.status = 'Failed to delete old verification message';
+        debugInfo.message = `Failed to delete old verification message ${oldMessageId} for chatId ${chatId}: ${error.message}`;
+        await sendDebugInfo(debugInfo, env);
+        // 记录删除失败，但继续流程
       }
     }
 
@@ -464,6 +516,10 @@ async function handleVerification(chatId, messageId, env) {
     await sendVerification(chatId, env);
     
   } catch (error) {
+    debugInfo.status = 'Error in handleVerification';
+    debugInfo.message = `Error in handleVerification for chatId ${chatId}: ${error.message}`;
+    await sendDebugInfo(debugInfo, env);
+
     console.error(`Error in handleVerification for chatId ${chatId}:`, error);
     await sendMessageToUser(chatId, '验证流程出错，请稍后重试或联系管理员。', env);
   }
@@ -494,8 +550,20 @@ async function sendVerification(chatId, env) {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const codeExpiry = nowSeconds + 300; // 5 分钟有效期
   const verificationCode = correctResult.toString(); // 确保验证码是字符串
-  
-  console.log(`Generating verification for chatId ${chatId}: code=${verificationCode}, expiry=${codeExpiry}, now=${nowSeconds}`);
+
+  // 准备调试信息
+  const debugInfo = {
+    timestamp: new Date().toISOString(),
+    chatId: chatId,
+    action: 'sendVerification',
+    verificationCode: verificationCode,
+    codeExpiry: codeExpiry,
+    nowSeconds: nowSeconds,
+  };
+
+  debugInfo.status = 'Generating verification';
+  debugInfo.message = `Generating verification for chatId ${chatId}: code=${verificationCode}, expiry=${codeExpiry}, now=${nowSeconds}`;
+  await sendDebugInfo(debugInfo, env);
 
   try {
     // 首先清理旧的验证状态，避免干扰
@@ -514,12 +582,18 @@ async function sendVerification(chatId, env) {
       .first();
     
     if (!verificationCheck || verificationCheck.verification_code !== verificationCode) {
+      debugInfo.status = 'Failed to store verification code';
+      debugInfo.message = `Failed to store verification code for chatId ${chatId}: ${JSON.stringify(verificationCheck)}`;
+      await sendDebugInfo(debugInfo, env);
+
       console.error(`Failed to store verification code for chatId ${chatId}:`, verificationCheck);
       await sendMessageToUser(chatId, '存储验证码失败，请稍后重试。', env);
       return;
     }
     
-    console.log(`Verification code stored successfully for chatId ${chatId}:`, verificationCheck);
+    debugInfo.status = 'Verification code stored successfully';
+    debugInfo.message = `Verification code stored successfully for chatId ${chatId}: ${JSON.stringify(verificationCheck)}`;
+    await sendDebugInfo(debugInfo, env);
 
     // 发送验证消息
     const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -536,43 +610,61 @@ async function sendVerification(chatId, env) {
     
     const data = await response.json();
     if (!data.ok) {
+      debugInfo.status = 'Failed to send verification message';
+      debugInfo.message = `Failed to send verification message for chatId ${chatId}: ${data.description}`;
+      await sendDebugInfo(debugInfo, env);
+
       console.error(`Failed to send verification message: ${data.description}`);
       return;
     }
     
     const newMessageId = data.result.message_id.toString(); // 确保是字符串
     
-    // 更新验证消息ID
-    await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
-      .bind(newMessageId, chatId)
-      .run();
-    
-    // 验证更新是否成功
-    const messageIdCheck = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-      .bind(chatId)
-      .first();
-    
-    if (!messageIdCheck || messageIdCheck.last_verification_message_id !== newMessageId) {
-      console.error(`Failed to update last_verification_message_id for chatId ${chatId}`);
-      // 尝试重新更新
-      await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
-        .bind(newMessageId, chatId)
-        .run();
-      
-      // 再次验证
-      const retryCheck = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      
-      if (!retryCheck || retryCheck.last_verification_message_id !== newMessageId) {
-        console.error(`Failed to update last_verification_message_id after retry for chatId ${chatId}`);
-        await sendMessageToUser(chatId, '验证码发送成功，但系统记录出现问题。如验证失败，请重新发送消息获取新验证码。', env);
+    // 更新验证消息ID，添加重试机制
+    let updateSuccess = false;
+    for (let i = 0; i < 3; i++) {
+      try {
+        await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
+          .bind(newMessageId, chatId)
+          .run();
+        const messageIdCheck = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        if (messageIdCheck && messageIdCheck.last_verification_message_id === newMessageId) {
+          updateSuccess = true;
+          break;
+        }
+        debugInfo.status = 'Retry updating last_verification_message_id';
+        debugInfo.message = `Retry ${i + 1}: Failed to update last_verification_message_id for chatId ${chatId}, current value: ${messageIdCheck ? messageIdCheck.last_verification_message_id : 'null'}`;
+        await sendDebugInfo(debugInfo, env);
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 等待 1 秒后重试
+      } catch (error) {
+        debugInfo.status = 'Error updating last_verification_message_id';
+        debugInfo.message = `Retry ${i + 1}: Error updating last_verification_message_id for chatId ${chatId}: ${error.message}`;
+        await sendDebugInfo(debugInfo, env);
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 等待 1 秒后重试
       }
     }
+
+    if (!updateSuccess) {
+      debugInfo.status = 'Failed to update last_verification_message_id';
+      debugInfo.message = `Failed to update last_verification_message_id for chatId ${chatId} after 3 retries`;
+      await sendDebugInfo(debugInfo, env);
+
+      console.error(`Failed to update last_verification_message_id for chatId ${chatId} after 3 retries`);
+      await sendMessageToUser(chatId, '验证码发送成功，但系统记录出现问题。如验证失败，请重新发送消息获取新验证码。', env);
+    }
     
-    console.log(`Verification message sent for chatId ${chatId}, message_id: ${newMessageId}`);
+    debugInfo.status = 'Verification message sent';
+    debugInfo.message = `Verification message sent for chatId ${chatId}, message_id: ${newMessageId}`;
+    debugInfo.newMessageId = newMessageId;
+    await sendDebugInfo(debugInfo, env);
     
   } catch (error) {
+    debugInfo.status = 'Error in sendVerification';
+    debugInfo.message = `Error in sendVerification for chatId ${chatId}: ${error.message}`;
+    await sendDebugInfo(debugInfo, env);
+
     console.error("Error in sendVerification:", error);
     await sendMessageToUser(chatId, '发送验证码过程中出错，请稍后重试。', env);
   }
@@ -633,12 +725,32 @@ async function onCallbackQuery(callbackQuery, env) {
   const codeExpiry = verificationState ? Number(verificationState.code_expiry) : null; // 确保转换为数字
   const storedMessageId = verificationState ? String(verificationState.last_verification_message_id) : null; // 确保转换为字符串
   const nowSeconds = Math.floor(Date.now() / 1000);
-  
-  console.log(`Checking verification for chatId ${chatId}: storedCode=${storedCode}, codeExpiry=${codeExpiry}, nowSeconds=${nowSeconds}, storedMessageId=${storedMessageId}, messageId=${messageId}`);
+
+  // 准备调试信息
+  const debugInfo = {
+    timestamp: new Date().toISOString(),
+    chatId: chatId,
+    action: 'onCallbackQuery',
+    storedCode: storedCode,
+    codeExpiry: codeExpiry,
+    nowSeconds: nowSeconds,
+    storedMessageId: storedMessageId,
+    messageId: messageId,
+    messageIdType: typeof messageId,
+    storedMessageIdType: typeof storedMessageId,
+    selectedAnswer: selectedAnswer,
+  };
+
+  debugInfo.status = 'Checking verification';
+  debugInfo.message = `Checking verification for chatId ${chatId}: storedCode=${storedCode}, codeExpiry=${codeExpiry}, nowSeconds=${nowSeconds}, storedMessageId=${storedMessageId}, messageId=${messageId}`;
+  await sendDebugInfo(debugInfo, env);
 
   // 确保验证码存在且未过期
   if (!storedCode || !codeExpiry || nowSeconds > codeExpiry) {
-    console.log(`Verification expired or not found for chatId ${chatId}`);
+    debugInfo.status = 'Verification expired or not found';
+    debugInfo.message = `Verification expired or not found for chatId ${chatId}`;
+    await sendDebugInfo(debugInfo, env);
+
     await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。', env);
     // 清理过期的验证状态
     await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
@@ -661,7 +773,10 @@ async function onCallbackQuery(callbackQuery, env) {
 
   // 确保消息ID匹配 - 严格使用字符串比较
   if (storedMessageId && storedMessageId !== messageId) {
-    console.log(`Ignoring outdated verification message for chatId ${chatId}, current messageId: ${messageId}, storedMessageId: ${storedMessageId}`);
+    debugInfo.status = 'Ignoring outdated verification message';
+    debugInfo.message = `Ignoring outdated verification message for chatId ${chatId}, current messageId: ${messageId}, storedMessageId: ${storedMessageId}`;
+    await sendDebugInfo(debugInfo, env);
+
     await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -686,7 +801,9 @@ async function onCallbackQuery(callbackQuery, env) {
         .bind(true, verifiedExpiry, chatId)
         .run();
       
-      console.log(`Verification successful for chatId ${chatId}, verified until ${verifiedExpiry}`);
+      debugInfo.status = 'Verification successful';
+      debugInfo.message = `Verification successful for chatId ${chatId}, verified until ${verifiedExpiry}`;
+      await sendDebugInfo(debugInfo, env);
       
       // 验证更新是否成功
       const updatedState = await env.D1.prepare('SELECT is_verified FROM user_states WHERE chat_id = ?')
@@ -694,11 +811,19 @@ async function onCallbackQuery(callbackQuery, env) {
         .first();
         
       if (!updatedState || !updatedState.is_verified) {
+        debugInfo.status = 'Failed to update verification status';
+        debugInfo.message = `Failed to update verification status for chatId ${chatId}`;
+        await sendDebugInfo(debugInfo, env);
+
         console.error(`Failed to update verification status for chatId ${chatId}`);
         await sendMessageToUser(chatId, '验证状态更新失败，请联系管理员。', env);
         verificationSuccess = false;
       }
     } catch (error) {
+      debugInfo.status = 'Database error during verification';
+      debugInfo.message = `Database error during verification for chatId ${chatId}: ${error.message}`;
+      await sendDebugInfo(debugInfo, env);
+
       console.error(`Database error during verification for chatId ${chatId}:`, error);
       await sendMessageToUser(chatId, '验证处理过程中出错，请稍后重试。', env);
       verificationSuccess = false;
@@ -728,6 +853,10 @@ async function onCallbackQuery(callbackQuery, env) {
       }
     }
   } else {
+    debugInfo.status = 'Verification failed';
+    debugInfo.message = `Verification failed for chatId ${chatId}, selectedAnswer: ${selectedAnswer}, storedCode: ${storedCode}`;
+    await sendDebugInfo(debugInfo, env);
+
     await sendMessageToUser(chatId, '验证失败，请重新尝试。', env);
     await handleVerification(chatId, messageId, env);
   }
@@ -742,9 +871,13 @@ async function onCallbackQuery(callbackQuery, env) {
         message_id: messageId,
       }),
     });
-    console.log(`Deleted verification message ${messageId} for chatId ${chatId}`);
+    debugInfo.status = 'Deleted verification message';
+    debugInfo.message = `Deleted verification message ${messageId} for chatId ${chatId}`;
+    await sendDebugInfo(debugInfo, env);
   } catch (error) {
-    console.error("Error deleting verification message:", error);
+    debugInfo.status = 'Error deleting verification message';
+    debugInfo.message = `Error deleting verification message for chatId ${chatId}: ${error.message}`;
+    await sendDebugInfo(debugInfo, env);
     // 忽略删除消息失败，不影响主流程
   }
 
