@@ -57,7 +57,7 @@ export default {
         return await registerWebhook(request);
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
-      } else if (url.pathname === '/checkTables') {  // 新增端点用于手动触发检查
+      } else if (url.pathname === '/checkTables') {
         await checkAndRepairTables(env.D1);
         return new Response('Database tables checked and repaired', { status: 200 });
       }
@@ -139,7 +139,6 @@ export default {
             console.log(`Table ${tableName} checked and verified`);
           } catch (error) {
             console.error(`Error checking ${tableName}:`, error);
-            // 如果检查失败，尝试重建表
             console.log(`Attempting to recreate ${tableName}...`);
             await d1.exec(`DROP TABLE IF EXISTS ${tableName}`);
             await createTable(d1, tableName, structure);
@@ -176,21 +175,25 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
+      // 如果消息来自后台群组（客服回复或管理员命令）
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
           if (privateChatId) {
+            // 检查是否为管理员命令
             if (text.startsWith('/block') || text.startsWith('/unblock') || text.startsWith('/checkblock')) {
               await handleAdminCommand(message, topicId, privateChatId);
               return;
             }
+            // 普通客服回复
             await forwardMessageToPrivateChat(privateChatId, message);
           }
         }
         return;
       }
 
+      // 检查用户是否被拉黑
       const userState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -200,6 +203,7 @@ export default {
         return;
       }
 
+      // 检查用户是否已通过验证
       const verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -207,19 +211,56 @@ export default {
       const verifiedExpiry = verificationState ? verificationState.verified_expiry : null;
       const nowSeconds = Math.floor(Date.now() / 1000);
       if (verifiedExpiry && nowSeconds > verifiedExpiry) {
+        // 验证状态已过期，重置为未验证
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
           .bind(false, chatId)
           .run();
         isVerified = false;
       }
       console.log(`User ${chatId} verification status: ${isVerified}`);
+
+      // 处理 /start 命令，确保不转发
+      if (text === '/start') {
+        console.log(`Received /start command from ${chatId}, processing without forwarding...`);
+        await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
+          .bind(chatId, true)
+          .run();
+
+        // 再次检查验证状态
+        const verificationStateAgain = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        const isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : false;
+        const verifiedExpiryAgain = verificationStateAgain ? verificationStateAgain.verified_expiry : null;
+
+        if (verifiedExpiryAgain && nowSeconds > verifiedExpiryAgain) {
+          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
+            .bind(false, chatId)
+            .run();
+          isVerifiedAgain = false;
+        }
+
+        if (isVerifiedAgain && (!verifiedExpiryAgain || nowSeconds <= verifiedExpiryAgain)) {
+          // 如果已经验证过，直接发送欢迎消息和 start.md 内容
+          const successMessage = await getVerificationSuccessMessage();
+          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
+        } else {
+          // 未验证，发送欢迎消息并触发验证
+          await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
+          await handleVerification(chatId, messageId);
+        }
+        return; // 确保 /start 不被转发
+      }
+
+      // 如果用户未通过验证，提示并触发验证
       if (!isVerified) {
         const messageContent = text || '非文本消息';
-        await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n无法发送，请完成验证`);
+        await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n请先完成验证！`);
         await handleVerification(chatId, messageId);
         return;
       }
 
+      // 检查消息频率（防刷）
       if (await checkMessageRate(chatId)) {
         console.log(`User ${chatId} exceeded message rate limit, resetting verification.`);
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL, is_rate_limited = ? WHERE chat_id = ?')
@@ -231,30 +272,7 @@ export default {
         return;
       }
 
-      if (text === '/start') {
-        await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
-          .bind(chatId, true)
-          .run();
-        const verificationStateAgain = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        const isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : false;
-        const verifiedExpiryAgain = verificationStateAgain ? verificationStateAgain.verified_expiry : null;
-        if (verifiedExpiryAgain && nowSeconds > verifiedExpiryAgain) {
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
-            .bind(false, chatId)
-            .run();
-        }
-        if (isVerifiedAgain && (!verifiedExpiryAgain || nowSeconds <= verifiedExpiryAgain)) {
-          const successMessage = await getVerificationSuccessMessage();
-          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
-        } else {
-          await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，现在发送信息吧！");
-          await handleVerification(chatId, messageId);
-        }
-        return;
-      }
-
+      // 处理普通消息，转发到群组
       try {
         const userInfo = await getUserInfo(chatId);
         const userName = userInfo.username || userInfo.first_name;
@@ -332,6 +350,7 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
+      // 清理旧的验证码状态
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
         .run();
@@ -384,7 +403,7 @@ export default {
 
       const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const codeExpiry = nowSeconds + 300;
+      const codeExpiry = nowSeconds + 300; // 5 分钟有效期
       await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
         .bind(chatId, correctResult.toString(), codeExpiry)
         .run();
@@ -418,12 +437,12 @@ export default {
       try {
         const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/start.md');
         if (!response.ok) {
-          throw new Error(`Failed to fetch fraud.db: ${response.statusText}`);
+          throw new Error(`Failed to fetch start.md: ${response.statusText}`);
         }
         const message = await response.text();
         const trimmedMessage = message.trim();
         if (!trimmedMessage) {
-          throw new Error('fraud.db content is empty');
+          throw new Error('start.md content is empty');
         }
         return trimmedMessage;
       } catch (error) {
@@ -436,12 +455,12 @@ export default {
       try {
         const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
         if (!response.ok) {
-          throw new Error(`Failed to fetch notification.txt: ${response.statusText}`);
+          throw new Error(`Failed to fetch notification.md: ${response.statusText}`);
         }
         const content = await response.text();
         const trimmedContent = content.trim();
         if (!trimmedContent) {
-          throw new Error('notification.txt content is empty');
+          throw new Error('notification.md content is empty');
         }
         return trimmedContent;
       } catch (error) {
@@ -472,7 +491,7 @@ export default {
       }
 
       if (result === 'correct') {
-        const verifiedExpiry = nowSeconds + 3600;
+        const verifiedExpiry = nowSeconds + 3600; // 1 小时有效期
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
           .bind(true, verifiedExpiry, chatId)
           .run();
@@ -484,12 +503,14 @@ export default {
         const isRateLimited = userState ? userState.is_rate_limited : false;
 
         if (isFirstVerification) {
+          // 首次验证成功，发送 start.md 内容
           const successMessage = await getVerificationSuccessMessage();
-          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！`);
+          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
           await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
             .bind(false, chatId)
             .run();
         } else {
+          // 非首次验证，提示重新发送消息
           await sendMessageToUser(chatId, '验证成功！请重新发送您的消息');
         }
 
@@ -528,7 +549,7 @@ export default {
     async function checkMessageRate(chatId) {
       const key = chatId;
       const now = Date.now();
-      const window = 60 * 1000;
+      const window = 60 * 1000; // 1 分钟窗口
 
       const rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
         .bind(key)
