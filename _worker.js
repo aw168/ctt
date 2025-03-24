@@ -3,7 +3,6 @@ let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 
-// 调试环境变量加载
 export default {
   async fetch(request, env) {
     console.log('BOT_TOKEN_ENV:', env.BOT_TOKEN_ENV || 'undefined');
@@ -26,29 +25,122 @@ export default {
 
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
-    // 检查 D1 绑定
     if (!env.D1) {
       console.error('D1 database is not bound');
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
-    // 自动清空并初始化数据库表（每次部署时执行）
-    try {
-      console.log('Attempting to initialize database...');
-      await initializeDatabase(env.D1);
-      console.log('Database initialization completed successfully');
-    } catch (error) {
-      console.error('Failed to initialize database:', error.message);
-      return new Response(`Server configuration error: Failed to initialize database - ${error.message}`, { status: 500 });
+    async function checkAndFixTables() {
+      console.log('Checking database tables...');
+      
+      try {
+        const tableSchemas = {
+          'user_states': `
+            CREATE TABLE user_states (
+              chat_id TEXT PRIMARY KEY,
+              is_blocked BOOLEAN DEFAULT FALSE,
+              is_verified BOOLEAN DEFAULT FALSE,
+              verified_expiry INTEGER,
+              verification_code TEXT,
+              code_expiry INTEGER,
+              last_verification_message_id TEXT,
+              is_first_verification BOOLEAN DEFAULT FALSE,
+              is_rate_limited BOOLEAN DEFAULT FALSE,
+              last_activity INTEGER,  -- 新增: 跟踪用户最后活动时间
+              activity_count INTEGER DEFAULT 0  -- 新增: 跟踪用户活动次数
+            )
+          `,
+          'message_rates': `
+            CREATE TABLE message_rates (
+              chat_id TEXT PRIMARY KEY,
+              message_count INTEGER DEFAULT 0,
+              window_start INTEGER
+            )
+          `,
+          'chat_topic_mappings': `
+            CREATE TABLE chat_topic_mappings (
+              chat_id TEXT PRIMARY KEY,
+              topic_id TEXT NOT NULL
+            )
+          `
+        };
+        
+        const existingTablesResult = await env.D1.prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`
+        ).all();
+        const existingTables = existingTablesResult.results.map(row => row.name);
+        console.log('Existing tables:', existingTables);
+        
+        for (const [tableName, createTableSQL] of Object.entries(tableSchemas)) {
+          if (!existingTables.includes(tableName)) {
+            console.log(`Table ${tableName} does not exist. Creating...`);
+            await env.D1.exec(createTableSQL);
+            console.log(`Table ${tableName} created successfully.`);
+          } else {
+            const tableInfoResult = await env.D1.prepare(`PRAGMA table_info(${tableName})`).all();
+            const columns = tableInfoResult.results;
+            
+            const expectedColumns = createTableSQL
+              .match(/\(([^)]+)\)/)[1]
+              .split(',')
+              .map(col => col.trim().split(' ')[0]);
+            
+            const actualColumns = columns.map(col => col.name);
+            const missingColumns = expectedColumns.filter(col => !actualColumns.includes(col));
+            
+            if (missingColumns.length > 0) {
+              console.log(`Table ${tableName} is missing columns: ${missingColumns.join(', ')}. Recreating...`);
+              await env.D1.exec(`ALTER TABLE ${tableName} RENAME TO ${tableName}_old`);
+              await env.D1.exec(createTableSQL);
+              
+              const commonColumns = actualColumns.filter(col => expectedColumns.includes(col));
+              if (commonColumns.length > 0) {
+                await env.D1.exec(
+                  `INSERT INTO ${tableName} (${commonColumns.join(', ')}) 
+                   SELECT ${commonColumns.join(', ')} FROM ${tableName}_old`
+                );
+              }
+              
+              await env.D1.exec(`DROP TABLE ${tableName}_old`);
+              console.log(`Table ${tableName} recreated and data migrated.`);
+            }
+          }
+        }
+        
+        console.log('Database check completed successfully.');
+        return { success: true, message: 'Database check completed successfully.' };
+      } catch (error) {
+        console.error('Error checking/fixing database tables:', error);
+        return { success: false, message: `Error checking/fixing database tables: ${error.message}` };
+      }
     }
 
-    // 主处理函数
+    // 新增: 清理过期验证码的函数
+    async function cleanExpiredVerificationCodes() {
+      try {
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        await env.D1.prepare(`
+          UPDATE user_states 
+          SET verification_code = NULL, 
+              code_expiry = NULL,
+              last_verification_message_id = NULL
+          WHERE code_expiry IS NOT NULL 
+          AND code_expiry < ?
+        `).bind(nowSeconds).run();
+        console.log('Expired verification codes cleaned');
+      } catch (error) {
+        console.error('Error cleaning expired verification codes:', error);
+      }
+    }
+
     async function handleRequest(request) {
-      // 检查环境变量是否加载
       if (!BOT_TOKEN || !GROUP_ID) {
         console.error('Missing required environment variables');
         return new Response('Server configuration error: Missing required environment variables', { status: 500 });
       }
+
+      const dbCheckResult = await checkAndFixTables();
+      await cleanExpiredVerificationCodes(); // 在每次请求时清理过期验证码
 
       const url = new URL(request.url);
       if (url.pathname === '/webhook') {
@@ -64,93 +156,56 @@ export default {
         return await registerWebhook(request);
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
-      } else if (url.pathname === '/testDatabase') {
-        // 添加测试端点，用于手动测试数据库访问
-        try {
-          await initializeDatabase(env.D1);
-          return new Response('Database test successful: Tables created', { status: 200 });
-        } catch (error) {
-          console.error('Database test failed:', error.message);
-          return new Response(`Database test failed: ${error.message}`, { status: 500 });
-        }
+      } else if (url.pathname === '/initTables') {
+        return await initTables();
+      } else if (url.pathname === '/checkDb') {
+        const result = await checkAndFixTables();
+        return new Response(JSON.stringify(result), { 
+          status: result.success ? 200 : 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
       return new Response('Not Found', { status: 404 });
     }
 
-    // 自动清空并初始化数据库表
-    async function initializeDatabase(d1) {
+    async function initTables() {
       try {
-        console.log('Starting database initialization...');
-
-        // 清空数据库：删除所有表
-        console.log('Dropping existing tables...');
-        try {
-          await d1.exec('DROP TABLE IF EXISTS user_states');
-          console.log('Dropped user_states table');
-        } catch (dropError) {
-          console.warn('Error dropping user_states table:', dropError.message);
+        console.log('Starting table initialization...');
+        const result = await checkAndFixTables();
+        
+        if (result.success) {
+          return new Response('Database tables initialized successfully', { status: 200 });
+        } else {
+          return new Response(`Failed to initialize database tables: ${result.message}`, { status: 500 });
         }
-
-        try {
-          await d1.exec('DROP TABLE IF EXISTS message_rates');
-          console.log('Dropped message_rates table');
-        } catch (dropError) {
-          console.warn('Error dropping message_rates table:', dropError.message);
-        }
-
-        try {
-          await d1.exec('DROP TABLE IF EXISTS chat_topic_mappings');
-          console.log('Dropped chat_topic_mappings table');
-        } catch (dropError) {
-          console.warn('Error dropping chat_topic_mappings table:', dropError.message);
-        }
-
-        // 创建新表
-        console.log('Creating new tables...');
-
-        // 创建 user_states 表
-        console.log('Creating user_states table...');
-        await d1.exec(`
-          CREATE TABLE user_states (
-            chat_id TEXT PRIMARY KEY,
-            is_blocked INTEGER DEFAULT 0,
-            is_verified INTEGER DEFAULT 0,
-            verified_expiry INTEGER,
-            verification_code TEXT,
-            code_expiry INTEGER,
-            last_verification_message_id TEXT,
-            is_first_verification INTEGER DEFAULT 0,
-            is_rate_limited INTEGER DEFAULT 0
-          )
-        `);
-        console.log('user_states table created successfully');
-
-        // 创建 message_rates 表
-        console.log('Creating message_rates table...');
-        await d1.exec(`
-          CREATE TABLE message_rates (
-            chat_id TEXT PRIMARY KEY,
-            message_count INTEGER DEFAULT 0,
-            window_start INTEGER
-          )
-        `);
-        console.log('message_rates table created successfully');
-
-        // 创建 chat_topic_mappings 表
-        console.log('Creating chat_topic_mappings table...');
-        await d1.exec(`
-          CREATE TABLE chat_topic_mappings (
-            chat_id TEXT PRIMARY KEY,
-            topic_id TEXT NOT NULL
-          )
-        `);
-        console.log('chat_topic_mappings table created successfully');
-
-        console.log('Database tables initialized successfully');
       } catch (error) {
         console.error('Error initializing database tables:', error);
-        throw new Error(`Failed to initialize database tables: ${error.message}`);
+        return new Response(`Failed to initialize database tables: ${error.message}`, { status: 500 });
       }
+    }
+
+    // 新增: 计算动态会话过期时间
+    async function calculateSessionExpiry(chatId) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const userState = await env.D1.prepare('SELECT activity_count FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      
+      const activityCount = userState ? userState.activity_count : 0;
+      // 基础1小时 + 根据活跃度额外增加时间（每10次活动加1小时，最多加3小时）
+      const baseExpiry = 3600; // 1小时
+      const extraHours = Math.min(Math.floor(activityCount / 10), 3);
+      return nowSeconds + baseExpiry + (extraHours * 3600);
+    }
+
+    // 新增: 更新用户活动记录
+    async function updateUserActivity(chatId) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      await env.D1.prepare(`
+        INSERT OR REPLACE INTO user_states 
+        (chat_id, last_activity, activity_count) 
+        VALUES (?, ?, COALESCE((SELECT activity_count FROM user_states WHERE chat_id = ?) + 1, 1))
+      `).bind(chatId, nowSeconds, chatId).run();
     }
 
     async function handleUpdate(update) {
@@ -166,47 +221,44 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
-      // 如果消息来自后台群组（客服回复或管理员命令）
+      // 更新用户活动记录
+      await updateUserActivity(chatId);
+
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
           if (privateChatId) {
-            // 检查是否为管理员命令
             if (text.startsWith('/block') || text.startsWith('/unblock') || text.startsWith('/checkblock')) {
               await handleAdminCommand(message, topicId, privateChatId);
               return;
             }
-            // 普通客服回复
             await forwardMessageToPrivateChat(privateChatId, message);
           }
         }
         return;
       }
 
-      // 检查用户是否被拉黑
       const userState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
-      const isBlocked = userState ? userState.is_blocked : 0;
+      const isBlocked = userState ? userState.is_blocked : false;
       if (isBlocked) {
         console.log(`User ${chatId} is blocked, ignoring message.`);
         return;
       }
 
-      // 检查用户是否已通过验证
       const verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
-      let isVerified = verificationState ? verificationState.is_verified : 0;
+      let isVerified = verificationState ? verificationState.is_verified : false;
       const verifiedExpiry = verificationState ? verificationState.verified_expiry : null;
       const nowSeconds = Math.floor(Date.now() / 1000);
       if (verifiedExpiry && nowSeconds > verifiedExpiry) {
-        // 验证状态已过期，重置为未验证
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
-          .bind(0, chatId)
+          .bind(false, chatId)
           .run();
-        isVerified = 0;
+        isVerified = false;
       }
       console.log(`User ${chatId} verification status: ${isVerified}`);
       if (!isVerified) {
@@ -216,11 +268,10 @@ export default {
         return;
       }
 
-      // 检查消息频率（防刷）
       if (await checkMessageRate(chatId)) {
         console.log(`User ${chatId} exceeded message rate limit, resetting verification.`);
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL, is_rate_limited = ? WHERE chat_id = ?')
-          .bind(0, 1, chatId)
+          .bind(false, true, chatId)
           .run();
         const messageContent = text || '非文本消息';
         await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n信息过于频繁，请完成验证后发送信息`);
@@ -228,28 +279,26 @@ export default {
         return;
       }
 
-      // 处理客户消息
       if (text === '/start') {
         await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
-          .bind(chatId, 1)
+          .bind(chatId, true)
           .run();
         const verificationStateAgain = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
-        const isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : 0;
+        const isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : false;
         const verifiedExpiryAgain = verificationStateAgain ? verificationStateAgain.verified_expiry : null;
         if (verifiedExpiryAgain && nowSeconds > verifiedExpiryAgain) {
           await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
-            .bind(0, chatId)
+            .bind(false, chatId)
             .run();
         }
         if (isVerifiedAgain && (!verifiedExpiryAgain || nowSeconds <= verifiedExpiryAgain)) {
-          // 如果已经验证过，直接发送欢迎消息
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
         } else {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，现在发送信息吧！");
-          await handleVerification(chatId, messageId); // 触发验证
+          await handleVerification(chatId, messageId);
         }
         return;
       }
@@ -281,7 +330,6 @@ export default {
       const text = message.text;
       const senderId = message.from.id.toString();
 
-      // 检查发送者是否为管理员
       const isAdmin = await checkIfAdmin(senderId);
       if (!isAdmin) {
         await sendMessageToTopic(topicId, '只有管理员可以使用此命令。');
@@ -290,19 +338,19 @@ export default {
 
       if (text === '/block') {
         await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
-          .bind(privateChatId, 1)
+          .bind(privateChatId, true)
           .run();
         await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
       } else if (text === '/unblock') {
         await env.D1.prepare('UPDATE user_states SET is_blocked = ? WHERE chat_id = ?')
-          .bind(0, privateChatId)
+          .bind(false, privateChatId)
           .run();
         await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
       } else if (text === '/checkblock') {
         const userState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
           .bind(privateChatId)
           .first();
-        const isBlocked = userState ? userState.is_blocked : 0;
+        const isBlocked = userState ? userState.is_blocked : false;
         const status = isBlocked ? '是' : '否';
         await sendMessageToTopic(topicId, `用户 ${privateChatId} 是否在黑名单中：${status}`);
       }
@@ -332,7 +380,6 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
-      // 清理旧的验证码状态
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
         .run();
@@ -385,9 +432,9 @@ export default {
 
       const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const codeExpiry = nowSeconds + 300; // 5 分钟有效期
-      await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ? WHERE chat_id = ?')
-        .bind(correctResult.toString(), codeExpiry, chatId)
+      const codeExpiry = nowSeconds + 300;
+      await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
+        .bind(chatId, correctResult.toString(), codeExpiry)
         .run();
 
       try {
@@ -456,42 +503,42 @@ export default {
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
 
+      // 更新用户活动记录
+      await updateUserActivity(chatId);
+
       if (!data.startsWith('verify_')) return;
 
       const [, userChatId, selectedAnswer, result] = data.split('_');
       if (userChatId !== chatId) return;
 
-      // 获取验证码和过期时间
       const verificationState = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
       const storedCode = verificationState ? verificationState.verification_code : null;
       const codeExpiry = verificationState ? verificationState.code_expiry : null;
       const nowSeconds = Math.floor(Date.now() / 1000);
+      if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
+        await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
+        return;
+      }
 
-      // 调试日志
-      console.log(`Chat ID: ${chatId}, Selected Answer: ${selectedAnswer}, Result: ${result}`);
-      console.log(`Stored Code: ${storedCode}, Code Expiry: ${codeExpiry}, Now: ${nowSeconds}`);
-
-      // 检查答案是否正确
-      if (result === 'correct' && selectedAnswer === storedCode) {
-        // 答案正确，更新验证状态
-        const verifiedExpiry = nowSeconds + 3600; // 1 小时有效期
+      if (result === 'correct') {
+        const verifiedExpiry = await calculateSessionExpiry(chatId); // 使用动态计算的过期时间
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
-          .bind(1, verifiedExpiry, chatId)
+          .bind(true, verifiedExpiry, chatId)
           .run();
 
         const userState = await env.D1.prepare('SELECT is_first_verification, is_rate_limited FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
-        const isFirstVerification = userState ? userState.is_first_verification : 0;
-        const isRateLimited = userState ? userState.is_rate_limited : 0;
+        const isFirstVerification = userState ? userState.is_first_verification : false;
+        const isRateLimited = userState ? userState.is_rate_limited : false;
 
         if (isFirstVerification) {
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！`);
           await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
-            .bind(0, chatId)
+            .bind(false, chatId)
             .run();
         } else {
           await sendMessageToUser(chatId, '验证成功！请重新发送您的消息');
@@ -499,41 +546,14 @@ export default {
 
         if (isRateLimited) {
           await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
-            .bind(0, chatId)
+            .bind(false, chatId)
             .run();
         }
-      } else if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
-        // 验证码已过期
-        await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
-        // 删除旧的验证消息
-        try {
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: chatId,
-              message_id: messageId,
-            }),
-          });
-        } catch (error) {
-          console.error("Error deleting verification message:", error);
-        }
-        // 响应回调查询
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            callback_query_id: callbackQuery.id,
-          }),
-        });
-        return;
       } else {
-        // 答案错误，重新生成验证问题
         await sendMessageToUser(chatId, '验证失败，请重新尝试。');
         await handleVerification(chatId, messageId);
       }
 
-      // 删除旧的验证消息
       try {
         await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
           method: 'POST',
@@ -547,7 +567,6 @@ export default {
         console.error("Error deleting verification message:", error);
       }
 
-      // 响应回调查询
       await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -560,7 +579,7 @@ export default {
     async function checkMessageRate(chatId) {
       const key = chatId;
       const now = Date.now();
-      const window = 60 * 1000; // 1 分钟窗口
+      const window = 60 * 1000;
 
       const rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
         .bind(key)
