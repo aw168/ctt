@@ -3,7 +3,6 @@ let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 let isInitialized = false;
-let lastCleanTime = 0; // 用于控制清理频率
 
 export default {
   async fetch(request, env) {
@@ -63,6 +62,12 @@ export default {
         console.error('Error parsing request or handling update:', error);
         return new Response('Bad Request', { status: 400 });
       }
+    } else if (url.pathname === '/registerWebhook') {
+      return await registerWebhook(request, env);
+    } else if (url.pathname === '/unRegisterWebhook') {
+      return await unRegisterWebhook(env);
+    } else if (url.pathname === '/initTables') {
+      return await checkAndFixTables(env);
     }
 
     return new Response('Not Found', { status: 404 });
@@ -147,31 +152,6 @@ async function checkAndFixTables(env) {
   }
 }
 
-async function cleanExpiredVerificationCodes(env) {
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  // 每隔 60 秒执行一次清理
-  if (nowSeconds - lastCleanTime < 60) {
-    console.log('Skipping cleanExpiredVerificationCodes, too soon since last clean.');
-    return;
-  }
-  lastCleanTime = nowSeconds;
-
-  try {
-    console.log(`Cleaning expired verification codes at ${nowSeconds}...`);
-    const result = await env.D1.prepare(`
-      UPDATE user_states 
-      SET verification_code = NULL, 
-          code_expiry = NULL,
-          last_verification_message_id = NULL
-      WHERE code_expiry IS NOT NULL 
-      AND code_expiry < ?
-    `).bind(nowSeconds).run();
-    console.log('Expired verification codes cleaned:', result);
-  } catch (error) {
-    console.error('Error cleaning expired verification codes:', error);
-  }
-}
-
 async function registerWebhook(request, env) {
   console.log('BOT_TOKEN in registerWebhook:', BOT_TOKEN);
   const webhookUrl = `${new URL(request.url).origin}/webhook`;
@@ -193,6 +173,26 @@ async function registerWebhook(request, env) {
   }
 }
 
+async function unRegisterWebhook(env) {
+  console.log('BOT_TOKEN in unRegisterWebhook:', BOT_TOKEN);
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: '' }),
+    }).then(r => r.json());
+    if (response.ok) {
+      return new Response('Webhook removed', { status: 200 });
+    } else {
+      console.error('Failed to remove webhook:', response.description);
+      return new Response(`Failed to remove webhook: ${response.description}`, { status: 500 });
+    }
+  } catch (error) {
+    console.error('Error unregistering webhook:', error);
+    return new Response(`Error unregistering webhook: ${error.message}`, { status: 500 });
+  }
+}
+
 async function calculateSessionExpiry(chatId, env) {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const userState = await env.D1.prepare('SELECT activity_count FROM user_states WHERE chat_id = ?')
@@ -200,7 +200,7 @@ async function calculateSessionExpiry(chatId, env) {
     .first();
   
   const activityCount = userState ? userState.activity_count : 0;
-  const baseExpiry = 3600;
+  const baseExpiry = 3600; // 1 小时
   const extraHours = Math.min(Math.floor(activityCount / 10), 3);
   return nowSeconds + baseExpiry + (extraHours * 3600);
 }
@@ -215,8 +215,6 @@ async function updateUserActivity(chatId, env) {
 }
 
 async function handleUpdate(update, env) {
-  // 暂时禁用清理逻辑以排除干扰
-  // await cleanExpiredVerificationCodes(env);
   if (update.message) {
     await onMessage(update.message, env);
   } else if (update.callback_query) {
@@ -279,15 +277,7 @@ async function onMessage(message, env) {
     await sendMessageToUser(chatId, `${welcomeMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`, env);
 
     if (!isVerified) {
-      const existingCode = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      const codeExpiry = existingCode ? existingCode.code_expiry : null;
-      if (!codeExpiry || nowSeconds > codeExpiry) {
-        await handleVerification(chatId, messageId, env);
-      } else {
-        await sendMessageToUser(chatId, '请先完成现有验证！', env);
-      }
+      await handleVerification(chatId, messageId, env);
     }
     return;
   }
@@ -295,16 +285,7 @@ async function onMessage(message, env) {
   if (!isVerified) {
     const messageContent = text || '非文本消息';
     await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n无法发送，请完成验证`, env);
-
-    const existingCode = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
-      .bind(chatId)
-      .first();
-    const codeExpiry = existingCode ? existingCode.code_expiry : null;
-    if (!codeExpiry || nowSeconds > codeExpiry) {
-      await handleVerification(chatId, messageId, env);
-    } else {
-      await sendMessageToUser(chatId, '请先完成现有验证！', env);
-    }
+    await handleVerification(chatId, messageId, env);
     return;
   }
 
@@ -315,16 +296,7 @@ async function onMessage(message, env) {
       .run();
     const messageContent = text || '非文本消息';
     await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n信息过于频繁，请完成验证后发送信息`, env);
-
-    const existingCode = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
-      .bind(chatId)
-      .first();
-    const codeExpiry = existingCode ? existingCode.code_expiry : null;
-    if (!codeExpiry || nowSeconds > codeExpiry) {
-      await handleVerification(chatId, messageId, env);
-    } else {
-      await sendMessageToUser(chatId, '请先完成现有验证！', env);
-    }
+    await handleVerification(chatId, messageId, env);
     return;
   }
 
@@ -405,6 +377,12 @@ async function checkIfAdmin(userId, env) {
 }
 
 async function handleVerification(chatId, messageId, env) {
+  // 清理旧的验证码状态
+  console.log(`Cleaning old verification state for chatId ${chatId}`);
+  await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
+    .bind(chatId)
+    .run();
+
   const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
     .bind(chatId)
     .first();
@@ -419,6 +397,7 @@ async function handleVerification(chatId, messageId, env) {
           message_id: lastVerificationMessageId,
         }),
       });
+      console.log(`Deleted old verification message ${lastVerificationMessageId} for chatId ${chatId}`);
     } catch (error) {
       console.error("Error deleting old verification message:", error);
     }
@@ -453,7 +432,7 @@ async function sendVerification(chatId, env) {
 
   const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const codeExpiry = nowSeconds + 600; // 10分钟
+  const codeExpiry = nowSeconds + 600; // 延长到 10 分钟
   console.log(`Generating verification for chatId ${chatId}: code=${correctResult}, expiry=${codeExpiry}, now=${nowSeconds}`);
 
   // 插入验证码
@@ -465,7 +444,8 @@ async function sendVerification(chatId, env) {
     console.log('Insert verification code result:', insertResult);
   } catch (error) {
     console.error(`Failed to insert verification code for chatId ${chatId}:`, error);
-    throw new Error(`Failed to insert verification code for chatId ${chatId}`);
+    await sendMessageToUser(chatId, '生成验证码失败，请稍后重试。', env);
+    return;
   }
 
   // 验证是否成功写入
@@ -474,7 +454,8 @@ async function sendVerification(chatId, env) {
     .first();
   if (!verificationCheck || verificationCheck.verification_code !== correctResult.toString() || verificationCheck.code_expiry !== codeExpiry) {
     console.error(`Failed to store verification code for chatId ${chatId}:`, verificationCheck);
-    throw new Error(`Failed to store verification code for chatId ${chatId}`);
+    await sendMessageToUser(chatId, '存储验证码失败，请稍后重试。', env);
+    return;
   }
   console.log(`Verification code stored successfully for chatId ${chatId}:`, verificationCheck);
 
@@ -501,6 +482,7 @@ async function sendVerification(chatId, env) {
     console.log('Update last_verification_message_id result:', updateResult);
   } catch (error) {
     console.error("Error sending verification message:", error);
+    await sendMessageToUser(chatId, '发送验证码失败，请稍后重试。', env);
   }
 }
 
@@ -563,6 +545,7 @@ async function onCallbackQuery(callbackQuery, env) {
   if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
     console.log(`Verification expired or not found for chatId ${chatId}`);
     await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。', env);
+    await handleVerification(chatId, messageId, env); // 重新生成验证码
     return;
   }
 
