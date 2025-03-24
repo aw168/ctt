@@ -222,7 +222,7 @@ async function onMessage(message, env) {
     if (topicId) {
       const privateChatId = await getPrivateChatId(topicId, env);
       if (privateChatId) {
-        if (text.startsWith('/block') || text.startsWith('/unblock') || text.startsWith('/checkblock')) {
+        if (text.startsWith('/block') || text.startsWith('/unblock') || text.startsWith('/checkblock') || text.startsWith('/check')) {
           await handleAdminCommand(message, topicId, privateChatId, env);
           return;
         }
@@ -347,6 +347,63 @@ async function handleAdminCommand(message, topicId, privateChatId, env) {
     const isBlocked = userState ? userState.is_blocked : false;
     const status = isBlocked ? '是' : '否';
     await sendMessageToTopic(topicId, `用户 ${privateChatId} 是否在黑名单中：${status}`, env);
+  } else if (text === '/check') {
+    // 获取用户状态
+    const userState = await env.D1.prepare(`
+      SELECT is_blocked, is_verified, verified_expiry, verification_code, code_expiry, 
+             last_verification_message_id, is_first_verification, is_rate_limited, 
+             last_activity, activity_count, last_verification_time 
+      FROM user_states 
+      WHERE chat_id = ?
+    `).bind(privateChatId).first();
+
+    // 获取消息频率
+    const messageRate = await env.D1.prepare(`
+      SELECT message_count, window_start 
+      FROM message_rates 
+      WHERE chat_id = ?
+    `).bind(privateChatId).first();
+
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    let debugMessage = `用户 ${privateChatId} 状态信息：\n\n`;
+
+    // 用户状态信息
+    debugMessage += `**用户状态 (user_states):**\n`;
+    if (userState) {
+      debugMessage += `- 是否被拉黑 (is_blocked): ${userState.is_blocked ? '是' : '否'}\n`;
+      debugMessage += `- 是否已验证 (is_verified): ${userState.is_verified ? '是' : '否'}\n`;
+      debugMessage += `- 验证有效期 (verified_expiry): ${userState.verified_expiry || '无'} (${userState.verified_expiry && nowSeconds > userState.verified_expiry ? '已过期' : '未过期'})\n`;
+      debugMessage += `- 当前验证码 (verification_code): ${userState.verification_code || '无'}\n`;
+      debugMessage += `- 验证码有效期 (code_expiry): ${userState.code_expiry || '无'} (${userState.code_expiry && nowSeconds > userState.code_expiry ? '已过期' : '未过期'})\n`;
+      debugMessage += `- 最后验证码消息ID (last_verification_message_id): ${userState.last_verification_message_id || '无'}\n`;
+      debugMessage += `- 是否首次验证 (is_first_verification): ${userState.is_first_verification ? '是' : '否'}\n`;
+      debugMessage += `- 是否被限流 (is_rate_limited): ${userState.is_rate_limited ? '是' : '否'}\n`;
+      debugMessage += `- 最后活动时间 (last_activity): ${userState.last_activity || '无'}\n`;
+      debugMessage += `- 活动次数 (activity_count): ${userState.activity_count || 0}\n`;
+      debugMessage += `- 最后生成验证码时间 (last_verification_time): ${userState.last_verification_time || '无'}\n`;
+    } else {
+      debugMessage += `未找到用户状态记录。\n`;
+    }
+
+    // 消息频率信息
+    debugMessage += `\n**消息频率 (message_rates):**\n`;
+    if (messageRate) {
+      const windowStart = messageRate.window_start || 0;
+      const messageCount = messageRate.message_count || 0;
+      const window = 60 * 1000; // 1 分钟窗口
+      const windowEnd = windowStart + window;
+      const currentTime = Date.now();
+      debugMessage += `- 消息计数 (message_count): ${messageCount}\n`;
+      debugMessage += `- 窗口开始时间 (window_start): ${windowStart}\n`;
+      debugMessage += `- 窗口是否有效: ${currentTime <= windowEnd ? '是' : '否'}\n`;
+    } else {
+      debugMessage += `未找到消息频率记录。\n`;
+    }
+
+    // 当前时间
+    debugMessage += `\n**当前时间:** ${nowSeconds} (${new Date(nowSeconds * 1000).toISOString()})\n`;
+
+    await sendMessageToTopic(topicId, debugMessage, env);
   }
 }
 
