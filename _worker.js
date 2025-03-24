@@ -428,7 +428,7 @@ async function sendVerification(chatId, env) {
 
   const buttons = optionArray.map((option) => ({
     text: `(${option})`,
-    callback_data: `verify_${chatId}_${option}`, // 移除 correct/wrong 标记
+    callback_data: `verify_${chatId}_${option}`,
   }));
 
   const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
@@ -531,7 +531,7 @@ async function onCallbackQuery(callbackQuery, env) {
 
   if (!data.startsWith('verify_')) return;
 
-  const [, userChatId, selectedAnswer] = data.split('_'); // 移除 result 字段
+  const [, userChatId, selectedAnswer] = data.split('_');
   if (userChatId !== chatId) return;
 
   const verificationState = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
@@ -542,7 +542,7 @@ async function onCallbackQuery(callbackQuery, env) {
   const nowSeconds = Math.floor(Date.now() / 1000);
   console.log(`Checking verification for chatId ${chatId}: storedCode=${storedCode}, codeExpiry=${codeExpiry}, nowSeconds=${nowSeconds}`);
 
-  if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
+  if (!storedCode || (codeExpiry && (nowSeconds + 5) > codeExpiry)) { // 增加 5 秒容错
     console.log(`Verification expired or not found for chatId ${chatId}`);
     await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。', env);
     await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
@@ -558,6 +558,18 @@ async function onCallbackQuery(callbackQuery, env) {
       .bind(true, verifiedExpiry, chatId)
       .run();
     console.log(`Verification successful for chatId ${chatId}, verified until ${verifiedExpiry}`);
+
+    // 立即再次查询数据库，确保状态已经更新
+    const updatedState = await env.D1.prepare('SELECT is_verified FROM user_states WHERE chat_id = ?')
+      .bind(chatId)
+      .first();
+    if (updatedState && updatedState.is_verified) {
+      console.log(`Verification status updated successfully for chatId ${chatId}`);
+    } else {
+      console.error(`Failed to update verification status for chatId ${chatId}`);
+      await sendMessageToUser(chatId, '验证状态更新失败，请联系管理员。', env);
+      return;
+    }
 
     const userState = await env.D1.prepare('SELECT is_first_verification, is_rate_limited FROM user_states WHERE chat_id = ?')
       .bind(chatId)
