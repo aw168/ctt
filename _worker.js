@@ -68,29 +68,22 @@ export default {
       return await unRegisterWebhook(env);
     } else if (url.pathname === '/initTables') {
       return await checkAndFixTables(env);
-    } else if (url.pathname === '/debug') {
-      // 调试端点：接收调试信息并推送到 https://ctt.pages.dev/check
+    } else if (url.pathname === '/checkLogs') {
       try {
-        const debugData = await request.json();
-        const debugMessage = JSON.stringify(debugData, null, 2);
-        console.log('Debug data received:', debugMessage);
-
-        // 将调试信息推送到 https://ctt.pages.dev/check
-        const response = await fetch('https://ctt.pages.dev/check', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ debug: debugMessage }),
-        });
-
-        if (!response.ok) {
-          console.error('Failed to send debug data to https://ctt.pages.dev/check:', response.statusText);
-          return new Response('Failed to send debug data', { status: 500 });
+        const logs = await env.D1.prepare('SELECT * FROM debug_logs ORDER BY timestamp DESC LIMIT 50').all();
+        if (!logs.success) {
+          console.error('Failed to query debug_logs:', logs.error);
+          return new Response(`Failed to query debug_logs: ${logs.error}`, { status: 500 });
         }
-
-        return new Response('Debug data sent successfully', { status: 200 });
+        if (!logs.results || logs.results.length === 0) {
+          return new Response('No debug logs found.', { status: 200 });
+        }
+        return new Response(JSON.stringify(logs.results, null, 2), {
+          headers: { 'Content-Type': 'application/json' },
+        });
       } catch (error) {
-        console.error('Error handling debug endpoint:', error);
-        return new Response('Error handling debug data', { status: 500 });
+        console.error('Error fetching debug logs:', error);
+        return new Response(`Error fetching debug logs: ${error.message}`, { status: 500 });
       }
     }
 
@@ -105,7 +98,8 @@ async function checkAndFixTables(env) {
     const tableSchemas = {
       'user_states': 'CREATE TABLE user_states (chat_id TEXT PRIMARY KEY, is_blocked BOOLEAN DEFAULT FALSE, is_verified BOOLEAN DEFAULT FALSE, verified_expiry INTEGER, verification_code TEXT, code_expiry INTEGER, last_verification_message_id TEXT, is_first_verification BOOLEAN DEFAULT FALSE, is_rate_limited BOOLEAN DEFAULT FALSE, last_activity INTEGER, activity_count INTEGER DEFAULT 0, last_verification_time INTEGER)',
       'message_rates': 'CREATE TABLE message_rates (chat_id TEXT PRIMARY KEY, message_count INTEGER DEFAULT 0, window_start INTEGER)',
-      'chat_topic_mappings': 'CREATE TABLE chat_topic_mappings (chat_id TEXT PRIMARY KEY, topic_id TEXT NOT NULL)'
+      'chat_topic_mappings': 'CREATE TABLE chat_topic_mappings (chat_id TEXT PRIMARY KEY, topic_id TEXT NOT NULL)',
+      'debug_logs': 'CREATE TABLE debug_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, chat_id TEXT, debug_info TEXT)'
     };
     
     console.log('Attempting to query existing tables...');
@@ -168,6 +162,16 @@ async function checkAndFixTables(env) {
       }
     }
     
+    // 额外验证 debug_logs 表是否存在
+    const debugLogsCheck = await env.D1.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name = 'debug_logs'`
+    ).all();
+    if (!debugLogsCheck.results || debugLogsCheck.results.length === 0) {
+      console.error('debug_logs table was not created successfully.');
+      throw new Error('debug_logs table was not created successfully.');
+    }
+    console.log('debug_logs table verified successfully.');
+
     console.log('Database check completed successfully.');
     return { success: true, message: 'Database check completed successfully.' };
   } catch (error) {
@@ -219,26 +223,57 @@ async function unRegisterWebhook(env) {
 
 async function sendDebugInfo(debugInfo, env) {
   try {
-    const response = await fetch('https://<your-worker-url>.workers.dev/debug', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(debugInfo),
-    });
-    if (!response.ok) {
-      console.error('Failed to send debug info to /debug endpoint:', response.statusText);
+    const result = await env.D1.prepare('INSERT INTO debug_logs (timestamp, chat_id, debug_info) VALUES (?, ?, ?)')
+      .bind(debugInfo.timestamp, debugInfo.chatId || 'unknown', JSON.stringify(debugInfo))
+      .run();
+    if (!result.success) {
+      console.error('Failed to insert debug info into debug_logs:', result.error);
+      throw new Error(`Failed to insert debug info: ${result.error}`);
     }
+    console.log(`Debug info inserted successfully for chatId ${debugInfo.chatId}`);
   } catch (error) {
-    console.error('Error sending debug info:', error);
+    console.error('Error storing debug info in D1:', error);
+    // 尝试将错误信息也记录到数据库
+    try {
+      await env.D1.prepare('INSERT INTO debug_logs (timestamp, chat_id, debug_info) VALUES (?, ?, ?)')
+        .bind(new Date().toISOString(), debugInfo.chatId || 'unknown', JSON.stringify({ error: `Failed to store debug info: ${error.message}` }))
+        .run();
+    } catch (innerError) {
+      console.error('Failed to log error in debug_logs:', innerError);
+    }
   }
 }
 
 async function updateUserActivity(chatId, env) {
   const nowSeconds = Math.floor(Date.now() / 1000);
-  await env.D1.prepare(`
-    INSERT OR REPLACE INTO user_states 
-    (chat_id, last_activity, activity_count) 
-    VALUES (?, ?, COALESCE((SELECT activity_count FROM user_states WHERE chat_id = ?) + 1, 1))
-  `).bind(chatId, nowSeconds, chatId).run();
+  const debugInfo = {
+    timestamp: new Date().toISOString(),
+    chatId: chatId,
+    action: 'updateUserActivity',
+    nowSeconds: nowSeconds,
+  };
+
+  try {
+    const result = await env.D1.prepare(`
+      INSERT OR REPLACE INTO user_states 
+      (chat_id, last_activity, activity_count) 
+      VALUES (?, ?, COALESCE((SELECT activity_count FROM user_states WHERE chat_id = ?) + 1, 1))
+    `).bind(chatId, nowSeconds, chatId).run();
+    if (!result.success) {
+      debugInfo.status = 'Failed to update user activity';
+      debugInfo.message = `Failed to update user activity for chatId ${chatId}: ${result.error}`;
+      await sendDebugInfo(debugInfo, env);
+      throw new Error(`Failed to update user activity: ${result.error}`);
+    }
+    debugInfo.status = 'User activity updated';
+    debugInfo.message = `User activity updated for chatId ${chatId}`;
+    await sendDebugInfo(debugInfo, env);
+  } catch (error) {
+    debugInfo.status = 'Error updating user activity';
+    debugInfo.message = `Error updating user activity for chatId ${chatId}: ${error.message}`;
+    await sendDebugInfo(debugInfo, env);
+    throw error;
+  }
 }
 
 async function handleUpdate(update, env) {
@@ -566,15 +601,43 @@ async function sendVerification(chatId, env) {
   await sendDebugInfo(debugInfo, env);
 
   try {
+    // 确保 user_states 表中存在该用户的记录
+    const userExists = await env.D1.prepare('SELECT chat_id FROM user_states WHERE chat_id = ?')
+      .bind(chatId)
+      .first();
+    if (!userExists) {
+      const insertResult = await env.D1.prepare('INSERT INTO user_states (chat_id) VALUES (?)')
+        .bind(chatId)
+        .run();
+      if (!insertResult.success) {
+        debugInfo.status = 'Failed to initialize user state';
+        debugInfo.message = `Failed to initialize user state for chatId ${chatId}: ${insertResult.error}`;
+        await sendDebugInfo(debugInfo, env);
+        throw new Error(`Failed to initialize user state: ${insertResult.error}`);
+      }
+    }
+
     // 首先清理旧的验证状态，避免干扰
-    await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
+    const clearResult = await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
       .bind(chatId)
       .run();
-    
+    if (!clearResult.success) {
+      debugInfo.status = 'Failed to clear old verification state';
+      debugInfo.message = `Failed to clear old verification state for chatId ${chatId}: ${clearResult.error}`;
+      await sendDebugInfo(debugInfo, env);
+      throw new Error(`Failed to clear old verification state: ${clearResult.error}`);
+    }
+
     // 插入新的验证码
-    await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_time = ? WHERE chat_id = ?')
+    const updateResult = await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_time = ? WHERE chat_id = ?')
       .bind(verificationCode, codeExpiry, nowSeconds, chatId)
       .run();
+    if (!updateResult.success) {
+      debugInfo.status = 'Failed to store verification code';
+      debugInfo.message = `Failed to store verification code for chatId ${chatId}: ${updateResult.error}`;
+      await sendDebugInfo(debugInfo, env);
+      throw new Error(`Failed to store verification code: ${updateResult.error}`);
+    }
     
     // 验证是否成功写入
     const verificationCheck = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
@@ -582,11 +645,11 @@ async function sendVerification(chatId, env) {
       .first();
     
     if (!verificationCheck || verificationCheck.verification_code !== verificationCode) {
-      debugInfo.status = 'Failed to store verification code';
-      debugInfo.message = `Failed to store verification code for chatId ${chatId}: ${JSON.stringify(verificationCheck)}`;
+      debugInfo.status = 'Verification code not stored correctly';
+      debugInfo.message = `Verification code not stored correctly for chatId ${chatId}: ${JSON.stringify(verificationCheck)}`;
       await sendDebugInfo(debugInfo, env);
 
-      console.error(`Failed to store verification code for chatId ${chatId}:`, verificationCheck);
+      console.error(`Verification code not stored correctly for chatId ${chatId}:`, verificationCheck);
       await sendMessageToUser(chatId, '存储验证码失败，请稍后重试。', env);
       return;
     }
@@ -624,9 +687,16 @@ async function sendVerification(chatId, env) {
     let updateSuccess = false;
     for (let i = 0; i < 3; i++) {
       try {
-        await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
+        const messageIdUpdateResult = await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
           .bind(newMessageId, chatId)
           .run();
+        if (!messageIdUpdateResult.success) {
+          debugInfo.status = 'Failed to update last_verification_message_id';
+          debugInfo.message = `Retry ${i + 1}: Failed to update last_verification_message_id for chatId ${chatId}: ${messageIdUpdateResult.error}`;
+          await sendDebugInfo(debugInfo, env);
+          throw new Error(`Failed to update last_verification_message_id: ${messageIdUpdateResult.error}`);
+        }
+
         const messageIdCheck = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
@@ -647,7 +717,7 @@ async function sendVerification(chatId, env) {
     }
 
     if (!updateSuccess) {
-      debugInfo.status = 'Failed to update last_verification_message_id';
+      debugInfo.status = 'Failed to update last_verification_message_id after retries';
       debugInfo.message = `Failed to update last_verification_message_id for chatId ${chatId} after 3 retries`;
       await sendDebugInfo(debugInfo, env);
 
@@ -753,9 +823,14 @@ async function onCallbackQuery(callbackQuery, env) {
 
     await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。', env);
     // 清理过期的验证状态
-    await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
+    const clearResult = await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
       .bind(chatId)
       .run();
+    if (!clearResult.success) {
+      debugInfo.status = 'Failed to clear expired verification state';
+      debugInfo.message = `Failed to clear expired verification state for chatId ${chatId}: ${clearResult.error}`;
+      await sendDebugInfo(debugInfo, env);
+    }
     await handleVerification(chatId, messageId, env);
     
     // 回应回调查询
@@ -797,9 +872,15 @@ async function onCallbackQuery(callbackQuery, env) {
     
     // 使用事务确保状态更新的一致性
     try {
-      await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, last_verification_time = NULL WHERE chat_id = ?')
+      const updateResult = await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, last_verification_time = NULL WHERE chat_id = ?')
         .bind(true, verifiedExpiry, chatId)
         .run();
+      if (!updateResult.success) {
+        debugInfo.status = 'Failed to update verification status';
+        debugInfo.message = `Failed to update verification status for chatId ${chatId}: ${updateResult.error}`;
+        await sendDebugInfo(debugInfo, env);
+        throw new Error(`Failed to update verification status: ${updateResult.error}`);
+      }
       
       debugInfo.status = 'Verification successful';
       debugInfo.message = `Verification successful for chatId ${chatId}, verified until ${verifiedExpiry}`;
@@ -811,11 +892,11 @@ async function onCallbackQuery(callbackQuery, env) {
         .first();
         
       if (!updatedState || !updatedState.is_verified) {
-        debugInfo.status = 'Failed to update verification status';
-        debugInfo.message = `Failed to update verification status for chatId ${chatId}`;
+        debugInfo.status = 'Verification status not updated correctly';
+        debugInfo.message = `Verification status not updated correctly for chatId ${chatId}: ${JSON.stringify(updatedState)}`;
         await sendDebugInfo(debugInfo, env);
 
-        console.error(`Failed to update verification status for chatId ${chatId}`);
+        console.error(`Verification status not updated correctly for chatId ${chatId}`);
         await sendMessageToUser(chatId, '验证状态更新失败，请联系管理员。', env);
         verificationSuccess = false;
       }
