@@ -25,9 +25,10 @@ export default {
 
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
+    // 改进: 更详细的数据库绑定检查
     if (!env.D1) {
-      console.error('D1 database is not bound');
-      return new Response('Server configuration error: D1 database is not bound', { status: 500 });
+      console.error('D1 database is not bound. Please check your Worker environment configuration.');
+      return new Response('Server configuration error: D1 database is not bound. Please check your Worker environment configuration.', { status: 500 });
     }
 
     async function checkAndFixTables() {
@@ -46,8 +47,8 @@ export default {
               last_verification_message_id TEXT,
               is_first_verification BOOLEAN DEFAULT FALSE,
               is_rate_limited BOOLEAN DEFAULT FALSE,
-              last_activity INTEGER,  -- 新增: 跟踪用户最后活动时间
-              activity_count INTEGER DEFAULT 0  -- 新增: 跟踪用户活动次数
+              last_activity INTEGER,
+              activity_count INTEGER DEFAULT 0
             )
           `,
           'message_rates': `
@@ -65,19 +66,34 @@ export default {
           `
         };
         
+        // 改进: 更详细的日志
+        console.log('Attempting to query existing tables...');
         const existingTablesResult = await env.D1.prepare(
           `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`
         ).all();
+        if (!existingTablesResult.success) {
+          console.error('Failed to query existing tables:', existingTablesResult.error);
+          throw new Error(`Failed to query existing tables: ${existingTablesResult.error}`);
+        }
         const existingTables = existingTablesResult.results.map(row => row.name);
         console.log('Existing tables:', existingTables);
         
         for (const [tableName, createTableSQL] of Object.entries(tableSchemas)) {
           if (!existingTables.includes(tableName)) {
             console.log(`Table ${tableName} does not exist. Creating...`);
-            await env.D1.exec(createTableSQL);
+            const createResult = await env.D1.exec(createTableSQL);
+            if (createResult.error) {
+              console.error(`Failed to create table ${tableName}:`, createResult.error);
+              throw new Error(`Failed to create table ${tableName}: ${createResult.error}`);
+            }
             console.log(`Table ${tableName} created successfully.`);
           } else {
+            console.log(`Table ${tableName} exists. Checking structure...`);
             const tableInfoResult = await env.D1.prepare(`PRAGMA table_info(${tableName})`).all();
+            if (!tableInfoResult.success) {
+              console.error(`Failed to get table info for ${tableName}:`, tableInfoResult.error);
+              throw new Error(`Failed to get table info for ${tableName}: ${tableInfoResult.error}`);
+            }
             const columns = tableInfoResult.results;
             
             const expectedColumns = createTableSQL
@@ -103,6 +119,8 @@ export default {
               
               await env.D1.exec(`DROP TABLE ${tableName}_old`);
               console.log(`Table ${tableName} recreated and data migrated.`);
+            } else {
+              console.log(`Table ${tableName} exists and has all required columns.`);
             }
           }
         }
@@ -115,7 +133,6 @@ export default {
       }
     }
 
-    // 新增: 清理过期验证码的函数
     async function cleanExpiredVerificationCodes() {
       try {
         const nowSeconds = Math.floor(Date.now() / 1000);
@@ -140,7 +157,10 @@ export default {
       }
 
       const dbCheckResult = await checkAndFixTables();
-      await cleanExpiredVerificationCodes(); // 在每次请求时清理过期验证码
+      if (!dbCheckResult.success) {
+        return new Response(dbCheckResult.message, { status: 500 });
+      }
+      await cleanExpiredVerificationCodes();
 
       const url = new URL(request.url);
       if (url.pathname === '/webhook') {
@@ -184,7 +204,6 @@ export default {
       }
     }
 
-    // 新增: 计算动态会话过期时间
     async function calculateSessionExpiry(chatId) {
       const nowSeconds = Math.floor(Date.now() / 1000);
       const userState = await env.D1.prepare('SELECT activity_count FROM user_states WHERE chat_id = ?')
@@ -192,13 +211,11 @@ export default {
         .first();
       
       const activityCount = userState ? userState.activity_count : 0;
-      // 基础1小时 + 根据活跃度额外增加时间（每10次活动加1小时，最多加3小时）
-      const baseExpiry = 3600; // 1小时
+      const baseExpiry = 3600;
       const extraHours = Math.min(Math.floor(activityCount / 10), 3);
       return nowSeconds + baseExpiry + (extraHours * 3600);
     }
 
-    // 新增: 更新用户活动记录
     async function updateUserActivity(chatId) {
       const nowSeconds = Math.floor(Date.now() / 1000);
       await env.D1.prepare(`
@@ -221,7 +238,6 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
-      // 更新用户活动记录
       await updateUserActivity(chatId);
 
       if (chatId === GROUP_ID) {
@@ -503,7 +519,6 @@ export default {
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
 
-      // 更新用户活动记录
       await updateUserActivity(chatId);
 
       if (!data.startsWith('verify_')) return;
@@ -523,7 +538,7 @@ export default {
       }
 
       if (result === 'correct') {
-        const verifiedExpiry = await calculateSessionExpiry(chatId); // 使用动态计算的过期时间
+        const verifiedExpiry = await calculateSessionExpiry(chatId);
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
           .bind(true, verifiedExpiry, chatId)
           .run();
