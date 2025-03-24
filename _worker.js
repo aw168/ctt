@@ -193,18 +193,6 @@ async function unRegisterWebhook(env) {
   }
 }
 
-async function calculateSessionExpiry(chatId, env) {
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const userState = await env.D1.prepare('SELECT activity_count FROM user_states WHERE chat_id = ?')
-    .bind(chatId)
-    .first();
-  
-  const activityCount = userState ? userState.activity_count : 0;
-  const baseExpiry = 3600; // 1 小时
-  const extraHours = Math.min(Math.floor(activityCount / 10), 3);
-  return nowSeconds + baseExpiry + (extraHours * 3600);
-}
-
 async function updateUserActivity(chatId, env) {
   const nowSeconds = Math.floor(Date.now() / 1000);
   await env.D1.prepare(`
@@ -428,7 +416,7 @@ async function sendVerification(chatId, env) {
 
   const buttons = optionArray.map((option) => ({
     text: `(${option})`,
-    callback_data: `verify_${chatId}_${option}`,
+    callback_data: `verify_${chatId}_${option}`, // 移除 correct/wrong 标记
   }));
 
   const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
@@ -531,7 +519,7 @@ async function onCallbackQuery(callbackQuery, env) {
 
   if (!data.startsWith('verify_')) return;
 
-  const [, userChatId, selectedAnswer] = data.split('_');
+  const [, userChatId, selectedAnswer] = data.split('_'); // 移除 result 字段
   if (userChatId !== chatId) return;
 
   const verificationState = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
