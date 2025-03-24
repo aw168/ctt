@@ -230,14 +230,14 @@ export default {
         const verificationStateAgain = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
-        const isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : false;
+        let isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : false; // Changed to let
         const verifiedExpiryAgain = verificationStateAgain ? verificationStateAgain.verified_expiry : null;
 
         if (verifiedExpiryAgain && nowSeconds > verifiedExpiryAgain) {
           await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
             .bind(false, chatId)
             .run();
-          isVerifiedAgain = false;
+          isVerifiedAgain = false; // Now this reassignment is allowed
         }
 
         if (isVerifiedAgain && (!verifiedExpiryAgain || nowSeconds <= verifiedExpiryAgain)) {
