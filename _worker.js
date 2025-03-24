@@ -3,112 +3,140 @@ let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 
-// 自动初始化数据库表
-async function initTablesIfNeeded(env) {
-  try {
-    console.log('Starting table initialization...');
-
-    // 创建 user_states 表
-    await env.D1.exec(`
-      CREATE TABLE IF NOT EXISTS user_states (
-        chat_id TEXT PRIMARY KEY,
-        is_blocked BOOLEAN DEFAULT FALSE,
-        is_verified BOOLEAN DEFAULT FALSE,
-        verified_expiry INTEGER,
-        verification_code TEXT,
-        code_expiry INTEGER,
-        last_verification_message_id TEXT,
-        is_first_verification BOOLEAN DEFAULT FALSE,
-        is_rate_limited BOOLEAN DEFAULT FALSE
-      )
-    `);
-
-    // 创建 message_rates 表
-    await env.D1.exec(`
-      CREATE TABLE IF NOT EXISTS message_rates (
-        chat_id TEXT PRIMARY KEY,
-        message_count INTEGER DEFAULT 0,
-        window_start INTEGER
-      )
-    `);
-
-    // 创建 chat_topic_mappings 表
-    await env.D1.exec(`
-      CREATE TABLE IF NOT EXISTS chat_topic_mappings (
-        chat_id TEXT PRIMARY KEY,
-        topic_id TEXT NOT NULL
-      )
-    `);
-
-    console.log('Database tables initialized successfully');
-  } catch (error) {
-    console.error('Error initializing database tables:', error);
-    throw error;
-  }
-}
-
-// 自动注册 Webhook
-async function registerWebhookAutomatically(env, request) {
-  const webhookUrl = `${new URL(request.url).origin}/webhook`;
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN_ENV}/setWebhook`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: webhookUrl }),
-    });
-    const data = await response.json();
-    if (data.ok) {
-      console.log('Webhook set successfully');
-    } else {
-      console.error('Failed to set webhook:', data.description);
-      throw new Error(`Failed to set webhook: ${data.description}`);
-    }
-  } catch (error) {
-    console.error('Error setting webhook:', error);
-    throw error;
-  }
-}
-
-// 在 Worker 脚本加载时执行初始化（仅在部署时运行一次）
-let initializationPromise = null;
-
 export default {
   async fetch(request, env) {
-    // 初始化环境变量
-    BOT_TOKEN = env.BOT_TOKEN_ENV;
-    GROUP_ID = env.GROUP_ID_ENV;
+    console.log('BOT_TOKEN_ENV:', env.BOT_TOKEN_ENV || 'undefined');
+    console.log('GROUP_ID_ENV:', env.GROUP_ID_ENV || 'undefined');
+    console.log('MAX_MESSAGES_PER_MINUTE_ENV:', env.MAX_MESSAGES_PER_MINUTE_ENV || 'undefined');
+
+    if (!env.BOT_TOKEN_ENV) {
+      console.error('BOT_TOKEN_ENV is not defined');
+      BOT_TOKEN = null;
+    } else {
+      BOT_TOKEN = env.BOT_TOKEN_ENV;
+    }
+
+    if (!env.GROUP_ID_ENV) {
+      console.error('GROUP_ID_ENV is not defined');
+      GROUP_ID = null;
+    } else {
+      GROUP_ID = env.GROUP_ID_ENV;
+    }
+
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
-    // 检查 D1 绑定
     if (!env.D1) {
-      console.error('D1 database is not bound');
-      return new Response('Server configuration error: D1 database is not bound', { status: 500 });
+      console.error('D1 database is not bound. Please check your Worker environment configuration.');
+      return new Response('Server configuration error: D1 database is not bound. Please check your Worker environment configuration.', { status: 500 });
     }
 
-    // 在第一次请求时执行初始化，并缓存 Promise 以避免重复执行
-    if (!initializationPromise) {
-      initializationPromise = Promise.all([
-        initTablesIfNeeded(env),
-        registerWebhookAutomatically(env, request),
-      ]).catch((error) => {
-        console.error('Initialization failed:', error);
-        throw error;
-      });
+    async function checkAndFixTables() {
+      console.log('Checking database tables...');
+      
+      try {
+        // 改进: 使用单行 SQL 语句，移除多余换行符和空格
+        const tableSchemas = {
+          'user_states': 'CREATE TABLE user_states (chat_id TEXT PRIMARY KEY, is_blocked BOOLEAN DEFAULT FALSE, is_verified BOOLEAN DEFAULT FALSE, verified_expiry INTEGER, verification_code TEXT, code_expiry INTEGER, last_verification_message_id TEXT, is_first_verification BOOLEAN DEFAULT FALSE, is_rate_limited BOOLEAN DEFAULT FALSE, last_activity INTEGER, activity_count INTEGER DEFAULT 0)',
+          'message_rates': 'CREATE TABLE message_rates (chat_id TEXT PRIMARY KEY, message_count INTEGER DEFAULT 0, window_start INTEGER)',
+          'chat_topic_mappings': 'CREATE TABLE chat_topic_mappings (chat_id TEXT PRIMARY KEY, topic_id TEXT NOT NULL)'
+        };
+        
+        console.log('Attempting to query existing tables...');
+        const existingTablesResult = await env.D1.prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`
+        ).all();
+        if (!existingTablesResult.success) {
+          console.error('Failed to query existing tables:', existingTablesResult.error);
+          throw new Error(`Failed to query existing tables: ${existingTablesResult.error}`);
+        }
+        const existingTables = existingTablesResult.results.map(row => row.name);
+        console.log('Existing tables:', existingTables);
+        
+        for (const [tableName, createTableSQL] of Object.entries(tableSchemas)) {
+          if (!existingTables.includes(tableName)) {
+            console.log(`Table ${tableName} does not exist. Creating...`);
+            console.log(`Executing SQL: ${createTableSQL}`); // 改进: 打印完整 SQL 语句
+            const createResult = await env.D1.exec(createTableSQL);
+            if (createResult.error) {
+              console.error(`Failed to create table ${tableName}:`, createResult.error);
+              throw new Error(`Failed to create table ${tableName}: ${createResult.error}`);
+            }
+            console.log(`Table ${tableName} created successfully.`);
+          } else {
+            console.log(`Table ${tableName} exists. Checking structure...`);
+            const tableInfoResult = await env.D1.prepare(`PRAGMA table_info(${tableName})`).all();
+            if (!tableInfoResult.success) {
+              console.error(`Failed to get table info for ${tableName}:`, tableInfoResult.error);
+              throw new Error(`Failed to get table info for ${tableName}: ${tableInfoResult.error}`);
+            }
+            const columns = tableInfoResult.results;
+            
+            const expectedColumns = createTableSQL
+              .match(/\(([^)]+)\)/)[1]
+              .split(',')
+              .map(col => col.trim().split(' ')[0]);
+            
+            const actualColumns = columns.map(col => col.name);
+            const missingColumns = expectedColumns.filter(col => !actualColumns.includes(col));
+            
+            if (missingColumns.length > 0) {
+              console.log(`Table ${tableName} is missing columns: ${missingColumns.join(', ')}. Recreating...`);
+              await env.D1.exec(`ALTER TABLE ${tableName} RENAME TO ${tableName}_old`);
+              console.log(`Executing SQL for recreate: ${createTableSQL}`);
+              await env.D1.exec(createTableSQL);
+              
+              const commonColumns = actualColumns.filter(col => expectedColumns.includes(col));
+              if (commonColumns.length > 0) {
+                await env.D1.exec(
+                  `INSERT INTO ${tableName} (${commonColumns.join(', ')}) 
+                   SELECT ${commonColumns.join(', ')} FROM ${tableName}_old`
+                );
+              }
+              
+              await env.D1.exec(`DROP TABLE ${tableName}_old`);
+              console.log(`Table ${tableName} recreated and data migrated.`);
+            } else {
+              console.log(`Table ${tableName} exists and has all required columns.`);
+            }
+          }
+        }
+        
+        console.log('Database check completed successfully.');
+        return { success: true, message: 'Database check completed successfully.' };
+      } catch (error) {
+        console.error('Error checking/fixing database tables:', error);
+        return { success: false, message: `Error checking/fixing database tables: ${error.message}` };
+      }
     }
 
-    // 等待初始化完成
-    try {
-      await initializationPromise;
-    } catch (error) {
-      return new Response('Server initialization failed', { status: 500 });
+    async function cleanExpiredVerificationCodes() {
+      try {
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        await env.D1.prepare(`
+          UPDATE user_states 
+          SET verification_code = NULL, 
+              code_expiry = NULL,
+              last_verification_message_id = NULL
+          WHERE code_expiry IS NOT NULL 
+          AND code_expiry < ?
+        `).bind(nowSeconds).run();
+        console.log('Expired verification codes cleaned');
+      } catch (error) {
+        console.error('Error cleaning expired verification codes:', error);
+      }
     }
 
-    // 主处理函数
     async function handleRequest(request) {
       if (!BOT_TOKEN || !GROUP_ID) {
         console.error('Missing required environment variables');
         return new Response('Server configuration error: Missing required environment variables', { status: 500 });
       }
+
+      const dbCheckResult = await checkAndFixTables();
+      if (!dbCheckResult.success) {
+        return new Response(dbCheckResult.message, { status: 500 });
+      }
+      await cleanExpiredVerificationCodes();
 
       const url = new URL(request.url);
       if (url.pathname === '/webhook') {
@@ -120,8 +148,57 @@ export default {
           console.error('Error parsing request or handling update:', error);
           return new Response('Bad Request', { status: 400 });
         }
+      } else if (url.pathname === '/registerWebhook') {
+        return await registerWebhook(request);
+      } else if (url.pathname === '/unRegisterWebhook') {
+        return await unRegisterWebhook();
+      } else if (url.pathname === '/initTables') {
+        return await initTables();
+      } else if (url.pathname === '/checkDb') {
+        const result = await checkAndFixTables();
+        return new Response(JSON.stringify(result), { 
+          status: result.success ? 200 : 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
       return new Response('Not Found', { status: 404 });
+    }
+
+    async function initTables() {
+      try {
+        console.log('Starting table initialization...');
+        const result = await checkAndFixTables();
+        
+        if (result.success) {
+          return new Response('Database tables initialized successfully', { status: 200 });
+        } else {
+          return new Response(`Failed to initialize database tables: ${result.message}`, { status: 500 });
+        }
+      } catch (error) {
+        console.error('Error initializing database tables:', error);
+        return new Response(`Failed to initialize database tables: ${error.message}`, { status: 500 });
+      }
+    }
+
+    async function calculateSessionExpiry(chatId) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const userState = await env.D1.prepare('SELECT activity_count FROM user_states WHERE chatStates chat_id = ?')
+        .bind(chatId)
+        .first();
+      
+      const activityCount = userState ? userState.activity_count : 0;
+      const baseExpiry = 3600;
+      const extraHours = Math.min(Math.floor(activityCount / 10), 3);
+      return nowSeconds + baseExpiry + (extraHours * 3600);
+    }
+
+    async function updateUserActivity(chatId) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      await env.D1.prepare(`
+        INSERT OR REPLACE INTO user_states 
+        (chat_id, last_activity, activity_count) 
+        VALUES (?, ?, COALESCE((SELECT activity_count FROM user_states WHERE chat_id = ?) + 1, 1))
+      `).bind(chatId, nowSeconds, chatId).run();
     }
 
     async function handleUpdate(update) {
@@ -136,6 +213,8 @@ export default {
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
+
+      await updateUserActivity(chatId);
 
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
@@ -345,7 +424,7 @@ export default {
 
       const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const codeExpiry = nowSeconds + 300; // 5 分钟有效期
+      const codeExpiry = nowSeconds + 300;
       await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
         .bind(chatId, correctResult.toString(), codeExpiry)
         .run();
@@ -416,6 +495,8 @@ export default {
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
 
+      await updateUserActivity(chatId);
+
       if (!data.startsWith('verify_')) return;
 
       const [, userChatId, selectedAnswer, result] = data.split('_');
@@ -433,7 +514,7 @@ export default {
       }
 
       if (result === 'correct') {
-        const verifiedExpiry = nowSeconds + 3600; // 1 小时有效期
+        const verifiedExpiry = await calculateSessionExpiry(chatId);
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
           .bind(true, verifiedExpiry, chatId)
           .run();
@@ -489,7 +570,7 @@ export default {
     async function checkMessageRate(chatId) {
       const key = chatId;
       const now = Date.now();
-      const window = 60 * 1000; // 1 分钟窗口
+      const window = 60 * 1000;
 
       const rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
         .bind(key)
@@ -698,6 +779,27 @@ export default {
         }
       }
       throw new Error(`Failed to fetch ${url} after ${retries} retries`);
+    }
+
+    async function registerWebhook(request) {
+      console.log('BOT_TOKEN in registerWebhook:', BOT_TOKEN);
+      const webhookUrl = `${new URL(request.url).origin}/webhook`;
+      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: webhookUrl }),
+      }).then(r => r.json());
+      return new Response(response.ok ? 'Webhook set successfully' : JSON.stringify(response, null, 2));
+    }
+
+    async function unRegisterWebhook() {
+      console.log('BOT_TOKEN in unRegisterWebhook:', BOT_TOKEN);
+      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: '' }),
+      }).then(r => r.json());
+      return new Response(response.ok ? 'Webhook removed' : JSON.stringify(response, null, 2));
     }
 
     try {
