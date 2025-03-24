@@ -6,9 +6,9 @@ let MAX_MESSAGES_PER_MINUTE;
 // 自动初始化数据库表
 async function initTablesIfNeeded(env) {
   try {
-    console.log('Checking and initializing database tables...');
+    console.log('Starting table initialization...');
 
-    // 创建或覆盖 user_states 表
+    // 创建 user_states 表
     await env.D1.exec(`
       CREATE TABLE IF NOT EXISTS user_states (
         chat_id TEXT PRIMARY KEY,
@@ -23,7 +23,7 @@ async function initTablesIfNeeded(env) {
       )
     `);
 
-    // 创建或覆盖 message_rates 表
+    // 创建 message_rates 表
     await env.D1.exec(`
       CREATE TABLE IF NOT EXISTS message_rates (
         chat_id TEXT PRIMARY KEY,
@@ -32,7 +32,7 @@ async function initTablesIfNeeded(env) {
       )
     `);
 
-    // 创建或覆盖 chat_topic_mappings 表
+    // 创建 chat_topic_mappings 表
     await env.D1.exec(`
       CREATE TABLE IF NOT EXISTS chat_topic_mappings (
         chat_id TEXT PRIMARY KEY,
@@ -40,16 +40,16 @@ async function initTablesIfNeeded(env) {
       )
     `);
 
-    console.log('Database tables checked and initialized successfully');
+    console.log('Database tables initialized successfully');
   } catch (error) {
     console.error('Error initializing database tables:', error);
-    throw error; // 如果初始化失败，抛出错误以便在部署时捕获
+    throw error;
   }
 }
 
 // 自动注册 Webhook
 async function registerWebhookAutomatically(env, request) {
-  const webhookUrl = `${new URL(request.url).origin}/webhook`; // 动态获取 Worker URL
+  const webhookUrl = `${new URL(request.url).origin}/webhook`;
   try {
     const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN_ENV}/setWebhook`, {
       method: 'POST',
@@ -61,10 +61,11 @@ async function registerWebhookAutomatically(env, request) {
       console.log('Webhook set successfully');
     } else {
       console.error('Failed to set webhook:', data.description);
+      throw new Error(`Failed to set webhook: ${data.description}`);
     }
   } catch (error) {
     console.error('Error setting webhook:', error);
-    throw error; // 如果注册失败，抛出错误以便在部署时捕获
+    throw error;
   }
 }
 
@@ -74,24 +75,8 @@ let initializationPromise = null;
 export default {
   async fetch(request, env) {
     // 初始化环境变量
-    console.log('BOT_TOKEN_ENV:', env.BOT_TOKEN_ENV || 'undefined');
-    console.log('GROUP_ID_ENV:', env.GROUP_ID_ENV || 'undefined');
-    console.log('MAX_MESSAGES_PER_MINUTE_ENV:', env.MAX_MESSAGES_PER_MINUTE_ENV || 'undefined');
-
-    if (!env.BOT_TOKEN_ENV) {
-      console.error('BOT_TOKEN_ENV is not defined');
-      BOT_TOKEN = null;
-    } else {
-      BOT_TOKEN = env.BOT_TOKEN_ENV;
-    }
-
-    if (!env.GROUP_ID_ENV) {
-      console.error('GROUP_ID_ENV is not defined');
-      GROUP_ID = null;
-    } else {
-      GROUP_ID = env.GROUP_ID_ENV;
-    }
-
+    BOT_TOKEN = env.BOT_TOKEN_ENV;
+    GROUP_ID = env.GROUP_ID_ENV;
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
     // 检查 D1 绑定
@@ -107,7 +92,7 @@ export default {
         registerWebhookAutomatically(env, request),
       ]).catch((error) => {
         console.error('Initialization failed:', error);
-        throw error; // 如果初始化失败，抛出错误
+        throw error;
       });
     }
 
