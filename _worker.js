@@ -213,7 +213,7 @@ async function handleUpdate(update, env) {
 async function onMessage(message, env) {
   const chatId = message.chat.id.toString();
   const text = message.text || '';
-  const messageId = message.message_id;
+  const messageId = message.message_id.toString(); // 确保消息 ID 是字符串
 
   await updateUserActivity(chatId, env);
 
@@ -245,11 +245,11 @@ async function onMessage(message, env) {
     .bind(chatId)
     .first();
   let isVerified = verificationState ? verificationState.is_verified : false;
-  const verifiedExpiry = verificationState ? verificationState.verified_expiry : null;
-  const lastVerificationTime = verificationState ? verificationState.last_verification_time : 0;
+  const verifiedExpiry = verificationState ? Number(verificationState.verified_expiry) : null;
+  const lastVerificationTime = verificationState ? Number(verificationState.last_verification_time) : 0;
   const nowSeconds = Math.floor(Date.now() / 1000);
 
-  if (verifiedExpiry && nowSeconds > Number(verifiedExpiry)) {
+  if (verifiedExpiry && nowSeconds > verifiedExpiry) {
     console.log(`Verification expired for chatId ${chatId}, resetting is_verified.`);
     await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
       .bind(false, chatId)
@@ -431,40 +431,42 @@ async function checkIfAdmin(userId, env) {
 }
 
 async function handleVerification(chatId, messageId, env) {
-  // 清理旧的验证码状态
-  console.log(`Cleaning old verification state for chatId ${chatId}`);
-  const oldState = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-    .bind(chatId)
-    .first();
-  const oldMessageId = oldState ? oldState.last_verification_message_id : null;
+  console.log(`Starting verification process for chatId ${chatId}`);
+  
+  try {
+    // 清理旧的验证码状态
+    const oldState = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
+      .bind(chatId)
+      .first();
+    const oldMessageId = oldState && oldState.last_verification_message_id ? oldState.last_verification_message_id : null;
 
-  if (oldMessageId) {
-    try {
-      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: oldMessageId,
-        }),
-      });
-      console.log(`Deleted old verification message ${oldMessageId} for chatId ${chatId}`);
-    } catch (error) {
-      console.error(`Failed to delete old verification message ${oldMessageId} for chatId ${chatId}:`, error);
+    if (oldMessageId) {
+      try {
+        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: oldMessageId,
+          }),
+        });
+        console.log(`Deleted old verification message ${oldMessageId} for chatId ${chatId}`);
+      } catch (error) {
+        // 忽略删除旧消息的错误，继续处理
+        console.error(`Failed to delete old verification message ${oldMessageId} for chatId ${chatId}:`, error);
+      }
     }
+
+    // 确保记录生成验证码的时间
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    
+    // 生成并发送新验证码
+    await sendVerification(chatId, env);
+    
+  } catch (error) {
+    console.error(`Error in handleVerification for chatId ${chatId}:`, error);
+    await sendMessageToUser(chatId, '验证流程出错，请稍后重试或联系管理员。', env);
   }
-
-  await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
-    .bind(chatId)
-    .run();
-
-  // 记录生成验证码的时间
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  await env.D1.prepare('UPDATE user_states SET last_verification_time = ? WHERE chat_id = ?')
-    .bind(nowSeconds, chatId)
-    .run();
-
-  await sendVerification(chatId, env);
 }
 
 async function sendVerification(chatId, env) {
@@ -491,32 +493,35 @@ async function sendVerification(chatId, env) {
   const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
   const nowSeconds = Math.floor(Date.now() / 1000);
   const codeExpiry = nowSeconds + 300; // 5 分钟有效期
-  console.log(`Generating verification for chatId ${chatId}: code=${correctResult}, expiry=${codeExpiry}, now=${nowSeconds}`);
+  const verificationCode = correctResult.toString(); // 确保验证码是字符串
+  
+  console.log(`Generating verification for chatId ${chatId}: code=${verificationCode}, expiry=${codeExpiry}, now=${nowSeconds}`);
 
-  // 插入验证码
   try {
-    await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ? WHERE chat_id = ?')
-      .bind(correctResult.toString(), codeExpiry, chatId)
+    // 首先清理旧的验证状态，避免干扰
+    await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
+      .bind(chatId)
       .run();
-    console.log(`Verification code ${correctResult} stored for chatId ${chatId}`);
-  } catch (error) {
-    console.error(`Failed to insert verification code for chatId ${chatId}:`, error);
-    await sendMessageToUser(chatId, '生成验证码失败，请稍后重试。', env);
-    return;
-  }
+    
+    // 插入新的验证码
+    await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_time = ? WHERE chat_id = ?')
+      .bind(verificationCode, codeExpiry, nowSeconds, chatId)
+      .run();
+    
+    // 验证是否成功写入
+    const verificationCheck = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
+      .bind(chatId)
+      .first();
+    
+    if (!verificationCheck || verificationCheck.verification_code !== verificationCode) {
+      console.error(`Failed to store verification code for chatId ${chatId}:`, verificationCheck);
+      await sendMessageToUser(chatId, '存储验证码失败，请稍后重试。', env);
+      return;
+    }
+    
+    console.log(`Verification code stored successfully for chatId ${chatId}:`, verificationCheck);
 
-  // 验证是否成功写入
-  const verificationCheck = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
-    .bind(chatId)
-    .first();
-  if (!verificationCheck || verificationCheck.verification_code !== correctResult.toString() || verificationCheck.code_expiry !== codeExpiry) {
-    console.error(`Failed to store verification code for chatId ${chatId}:`, verificationCheck);
-    await sendMessageToUser(chatId, '存储验证码失败，请稍后重试。', env);
-    return;
-  }
-  console.log(`Verification code stored successfully for chatId ${chatId}:`, verificationCheck);
-
-  try {
+    // 发送验证消息
     const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -528,47 +533,48 @@ async function sendVerification(chatId, env) {
         },
       }),
     });
+    
     const data = await response.json();
     if (!data.ok) {
       console.error(`Failed to send verification message: ${data.description}`);
       return;
     }
-    const newMessageId = data.result.message_id.toString();
     
-    // 确保 last_verification_message_id 更新成功，添加重试机制
-    let updateSuccess = false;
-    for (let i = 0; i < 3; i++) {
-      try {
-        await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
-          .bind(newMessageId, chatId)
-          .run();
-        const messageIdCheck = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        if (messageIdCheck && messageIdCheck.last_verification_message_id === newMessageId) {
-          updateSuccess = true;
-          break;
-        }
-        console.warn(`Retry ${i + 1}: Failed to update last_verification_message_id for chatId ${chatId}, current value: ${messageIdCheck ? messageIdCheck.last_verification_message_id : 'null'}`);
-        await new Promise(resolve => setTimeout(resolve, 1000)); // 等待 1 秒后重试
-      } catch (error) {
-        console.error(`Retry ${i + 1}: Error updating last_verification_message_id for chatId ${chatId}:`, error);
-        await new Promise(resolve => setTimeout(resolve, 1000)); // 等待 1 秒后重试
+    const newMessageId = data.result.message_id.toString(); // 确保是字符串
+    
+    // 更新验证消息ID
+    await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
+      .bind(newMessageId, chatId)
+      .run();
+    
+    // 验证更新是否成功
+    const messageIdCheck = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
+      .bind(chatId)
+      .first();
+    
+    if (!messageIdCheck || messageIdCheck.last_verification_message_id !== newMessageId) {
+      console.error(`Failed to update last_verification_message_id for chatId ${chatId}`);
+      // 尝试重新更新
+      await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
+        .bind(newMessageId, chatId)
+        .run();
+      
+      // 再次验证
+      const retryCheck = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      
+      if (!retryCheck || retryCheck.last_verification_message_id !== newMessageId) {
+        console.error(`Failed to update last_verification_message_id after retry for chatId ${chatId}`);
+        await sendMessageToUser(chatId, '验证码发送成功，但系统记录出现问题。如验证失败，请重新发送消息获取新验证码。', env);
       }
     }
-
-    if (!updateSuccess) {
-      console.error(`Failed to update last_verification_message_id for chatId ${chatId} after 3 retries`);
-      await sendMessageToUser(chatId, '系统错误：无法更新验证码消息，请联系管理员。', env);
-      await sendMessageToTopic(GROUP_ID, `警告：用户 ${chatId} 的 last_verification_message_id 更新失败，请检查数据库状态。`, env);
-      return;
-    }
-
+    
     console.log(`Verification message sent for chatId ${chatId}, message_id: ${newMessageId}`);
-    console.log(`last_verification_message_id updated successfully for chatId ${chatId}: ${newMessageId}`);
+    
   } catch (error) {
-    console.error("Error sending verification message:", error);
-    await sendMessageToUser(chatId, '发送验证码失败，请稍后重试。', env);
+    console.error("Error in sendVerification:", error);
+    await sendMessageToUser(chatId, '发送验证码过程中出错，请稍后重试。', env);
   }
 }
 
@@ -611,7 +617,7 @@ async function getNotificationContent() {
 async function onCallbackQuery(callbackQuery, env) {
   const chatId = callbackQuery.message.chat.id.toString();
   const data = callbackQuery.data;
-  const messageId = callbackQuery.message.message_id;
+  const messageId = callbackQuery.message.message_id.toString(); // 确保一开始就是字符串类型
 
   await updateUserActivity(chatId, env);
 
@@ -624,35 +630,38 @@ async function onCallbackQuery(callbackQuery, env) {
     .bind(chatId)
     .first();
   const storedCode = verificationState ? verificationState.verification_code : null;
-  const codeExpiry = verificationState ? verificationState.code_expiry : null;
-  const storedMessageId = verificationState ? verificationState.last_verification_message_id : null;
+  const codeExpiry = verificationState ? Number(verificationState.code_expiry) : null; // 确保转换为数字
+  const storedMessageId = verificationState ? String(verificationState.last_verification_message_id) : null; // 确保转换为字符串
   const nowSeconds = Math.floor(Date.now() / 1000);
   
-  console.log(`Checking verification for chatId ${chatId}: storedCode=${storedCode}, codeExpiry=${codeExpiry}, nowSeconds=${nowSeconds}, storedMessageId=${storedMessageId}, messageId=${messageId}, messageIdType=${typeof messageId}, storedMessageIdType=${typeof storedMessageId}`);
+  console.log(`Checking verification for chatId ${chatId}: storedCode=${storedCode}, codeExpiry=${codeExpiry}, nowSeconds=${nowSeconds}, storedMessageId=${storedMessageId}, messageId=${messageId}`);
 
-  // Double check codeExpiry is a number before comparison
-  const codeExpiryNum = Number(codeExpiry);
-  
-  if (!storedCode || (codeExpiryNum && nowSeconds > codeExpiryNum)) {
+  // 确保验证码存在且未过期
+  if (!storedCode || !codeExpiry || nowSeconds > codeExpiry) {
     console.log(`Verification expired or not found for chatId ${chatId}`);
     await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。', env);
+    // 清理过期的验证状态
     await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
       .bind(chatId)
       .run();
     await handleVerification(chatId, messageId, env);
+    
+    // 回应回调查询
+    await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        callback_query_id: callbackQuery.id,
+        text: '验证码已过期，已发送新验证码',
+        show_alert: true,
+      }),
+    });
     return;
   }
 
-  // Convert both to strings to ensure consistent comparison
-  const currentMessageIdStr = String(messageId);
-  const storedMessageIdStr = String(storedMessageId);
-  
-  // Log comparison values
-  console.log(`Message ID comparison for chatId ${chatId}: current=${currentMessageIdStr}, stored=${storedMessageIdStr}, equal=${currentMessageIdStr === storedMessageIdStr}`);
-  
-  // If current message is not the latest verification message, ignore
-  if (storedMessageIdStr && storedMessageIdStr !== currentMessageIdStr) {
-    console.log(`Ignoring outdated verification message for chatId ${chatId}, current messageId: ${currentMessageIdStr}, storedMessageId: ${storedMessageIdStr}`);
+  // 确保消息ID匹配 - 严格使用字符串比较
+  if (storedMessageId && storedMessageId !== messageId) {
+    console.log(`Ignoring outdated verification message for chatId ${chatId}, current messageId: ${messageId}, storedMessageId: ${storedMessageId}`);
     await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -665,50 +674,65 @@ async function onCallbackQuery(callbackQuery, env) {
     return;
   }
 
+  // 处理验证结果
+  let verificationSuccess = false;
   if (selectedAnswer === storedCode) {
+    verificationSuccess = true;
     const verifiedExpiry = nowSeconds + 3600; // 1 小时有效期
-    await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, last_verification_time = NULL WHERE chat_id = ?')
-      .bind(true, verifiedExpiry, chatId)
-      .run();
-    console.log(`Verification successful for chatId ${chatId}, verified until ${verifiedExpiry}`);
-
-    const updatedState = await env.D1.prepare('SELECT is_verified FROM user_states WHERE chat_id = ?')
-      .bind(chatId)
-      .first();
-    if (updatedState && updatedState.is_verified) {
-      console.log(`Verification status updated successfully for chatId ${chatId}`);
-    } else {
-      console.error(`Failed to update verification status for chatId ${chatId}`);
-      await sendMessageToUser(chatId, '验证状态更新失败，请联系管理员。', env);
-      return;
-    }
-
-    const userState = await env.D1.prepare('SELECT is_first_verification, is_rate_limited FROM user_states WHERE chat_id = ?')
-      .bind(chatId)
-      .first();
-    const isFirstVerification = userState ? userState.is_first_verification : false;
-    const isRateLimited = userState ? userState.is_rate_limited : false;
-
-    if (isFirstVerification) {
-      const successMessage = await getVerificationSuccessMessage();
-      await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！`, env);
-      await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
-        .bind(false, chatId)
+    
+    // 使用事务确保状态更新的一致性
+    try {
+      await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, last_verification_time = NULL WHERE chat_id = ?')
+        .bind(true, verifiedExpiry, chatId)
         .run();
-    } else {
-      await sendMessageToUser(chatId, '验证成功！请重新发送您的消息', env);
+      
+      console.log(`Verification successful for chatId ${chatId}, verified until ${verifiedExpiry}`);
+      
+      // 验证更新是否成功
+      const updatedState = await env.D1.prepare('SELECT is_verified FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+        
+      if (!updatedState || !updatedState.is_verified) {
+        console.error(`Failed to update verification status for chatId ${chatId}`);
+        await sendMessageToUser(chatId, '验证状态更新失败，请联系管理员。', env);
+        verificationSuccess = false;
+      }
+    } catch (error) {
+      console.error(`Database error during verification for chatId ${chatId}:`, error);
+      await sendMessageToUser(chatId, '验证处理过程中出错，请稍后重试。', env);
+      verificationSuccess = false;
     }
+    
+    if (verificationSuccess) {
+      const userState = await env.D1.prepare('SELECT is_first_verification, is_rate_limited FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      const isFirstVerification = userState ? userState.is_first_verification : false;
+      const isRateLimited = userState ? userState.is_rate_limited : false;
 
-    if (isRateLimited) {
-      await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
-        .bind(false, chatId)
-        .run();
+      if (isFirstVerification) {
+        const successMessage = await getVerificationSuccessMessage();
+        await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！`, env);
+        await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
+          .bind(false, chatId)
+          .run();
+      } else {
+        await sendMessageToUser(chatId, '验证成功！请重新发送您的消息', env);
+      }
+
+      if (isRateLimited) {
+        await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
+          .bind(false, chatId)
+          .run();
+      }
     }
   } else {
     await sendMessageToUser(chatId, '验证失败，请重新尝试。', env);
     await handleVerification(chatId, messageId, env);
   }
 
+  // 尝试删除验证消息
   try {
     await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
       method: 'POST',
@@ -721,15 +745,56 @@ async function onCallbackQuery(callbackQuery, env) {
     console.log(`Deleted verification message ${messageId} for chatId ${chatId}`);
   } catch (error) {
     console.error("Error deleting verification message:", error);
+    // 忽略删除消息失败，不影响主流程
   }
 
+  // 回应回调查询
   await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       callback_query_id: callbackQuery.id,
+      text: verificationSuccess ? '验证成功' : '验证失败',
     }),
   });
+}
+
+async function checkUserVerificationState(chatId, env) {
+  try {
+    const state = await env.D1.prepare(`
+      SELECT 
+        is_verified, 
+        verified_expiry, 
+        verification_code, 
+        code_expiry, 
+        last_verification_message_id,
+        last_verification_time
+      FROM user_states 
+      WHERE chat_id = ?
+    `).bind(chatId).first();
+    
+    if (!state) {
+      return { exists: false, message: "用户状态记录不存在" };
+    }
+    
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const verificationStatus = {
+      exists: true,
+      is_verified: state.is_verified || false,
+      verified_expiry: state.verified_expiry || null,
+      verification_code: state.verification_code || null,
+      code_expiry: state.code_expiry || null,
+      last_verification_message_id: state.last_verification_message_id || null,
+      last_verification_time: state.last_verification_time || null,
+      is_verification_expired: state.code_expiry ? nowSeconds > Number(state.code_expiry) : true,
+      is_verified_expired: state.verified_expiry ? nowSeconds > Number(state.verified_expiry) : true
+    };
+    
+    return verificationStatus;
+  } catch (error) {
+    console.error("Error checking user verification state:", error);
+    return { error: error.message };
+  }
 }
 
 async function checkMessageRate(chatId, env) {
