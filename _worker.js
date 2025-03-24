@@ -428,12 +428,12 @@ async function sendVerification(chatId, env) {
 
   const buttons = optionArray.map((option) => ({
     text: `(${option})`,
-    callback_data: `verify_${chatId}_${option}_${option === correctResult ? 'correct' : 'wrong'}`,
+    callback_data: `verify_${chatId}_${option}`, // 移除 correct/wrong 标记
   }));
 
   const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const codeExpiry = nowSeconds + 300; // 5 分钟有效期，与参考代码保持一致
+  const codeExpiry = nowSeconds + 300; // 5 分钟有效期
   console.log(`Generating verification for chatId ${chatId}: code=${correctResult}, expiry=${codeExpiry}, now=${nowSeconds}`);
 
   // 插入验证码
@@ -531,7 +531,7 @@ async function onCallbackQuery(callbackQuery, env) {
 
   if (!data.startsWith('verify_')) return;
 
-  const [, userChatId, selectedAnswer, result] = data.split('_');
+  const [, userChatId, selectedAnswer] = data.split('_'); // 移除 result 字段
   if (userChatId !== chatId) return;
 
   const verificationState = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
@@ -545,12 +545,15 @@ async function onCallbackQuery(callbackQuery, env) {
   if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
     console.log(`Verification expired or not found for chatId ${chatId}`);
     await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。', env);
+    await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
+      .bind(chatId)
+      .run();
     await handleVerification(chatId, messageId, env); // 重新生成验证码
     return;
   }
 
-  if (result === 'correct') {
-    const verifiedExpiry = nowSeconds + 3600; // 1 小时有效期，与参考代码保持一致
+  if (selectedAnswer === storedCode) {
+    const verifiedExpiry = nowSeconds + 3600; // 1 小时有效期
     await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
       .bind(true, verifiedExpiry, chatId)
       .run();
