@@ -25,7 +25,6 @@ export default {
 
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
-    // 改进: 更详细的数据库绑定检查
     if (!env.D1) {
       console.error('D1 database is not bound. Please check your Worker environment configuration.');
       return new Response('Server configuration error: D1 database is not bound. Please check your Worker environment configuration.', { status: 500 });
@@ -35,38 +34,13 @@ export default {
       console.log('Checking database tables...');
       
       try {
+        // 改进: 使用单行 SQL 语句，移除多余换行符和空格
         const tableSchemas = {
-          'user_states': `
-            CREATE TABLE user_states (
-              chat_id TEXT PRIMARY KEY,
-              is_blocked BOOLEAN DEFAULT FALSE,
-              is_verified BOOLEAN DEFAULT FALSE,
-              verified_expiry INTEGER,
-              verification_code TEXT,
-              code_expiry INTEGER,
-              last_verification_message_id TEXT,
-              is_first_verification BOOLEAN DEFAULT FALSE,
-              is_rate_limited BOOLEAN DEFAULT FALSE,
-              last_activity INTEGER,
-              activity_count INTEGER DEFAULT 0
-            )
-          `,
-          'message_rates': `
-            CREATE TABLE message_rates (
-              chat_id TEXT PRIMARY KEY,
-              message_count INTEGER DEFAULT 0,
-              window_start INTEGER
-            )
-          `,
-          'chat_topic_mappings': `
-            CREATE TABLE chat_topic_mappings (
-              chat_id TEXT PRIMARY KEY,
-              topic_id TEXT NOT NULL
-            )
-          `
+          'user_states': 'CREATE TABLE user_states (chat_id TEXT PRIMARY KEY, is_blocked BOOLEAN DEFAULT FALSE, is_verified BOOLEAN DEFAULT FALSE, verified_expiry INTEGER, verification_code TEXT, code_expiry INTEGER, last_verification_message_id TEXT, is_first_verification BOOLEAN DEFAULT FALSE, is_rate_limited BOOLEAN DEFAULT FALSE, last_activity INTEGER, activity_count INTEGER DEFAULT 0)',
+          'message_rates': 'CREATE TABLE message_rates (chat_id TEXT PRIMARY KEY, message_count INTEGER DEFAULT 0, window_start INTEGER)',
+          'chat_topic_mappings': 'CREATE TABLE chat_topic_mappings (chat_id TEXT PRIMARY KEY, topic_id TEXT NOT NULL)'
         };
         
-        // 改进: 更详细的日志
         console.log('Attempting to query existing tables...');
         const existingTablesResult = await env.D1.prepare(
           `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`
@@ -81,6 +55,7 @@ export default {
         for (const [tableName, createTableSQL] of Object.entries(tableSchemas)) {
           if (!existingTables.includes(tableName)) {
             console.log(`Table ${tableName} does not exist. Creating...`);
+            console.log(`Executing SQL: ${createTableSQL}`); // 改进: 打印完整 SQL 语句
             const createResult = await env.D1.exec(createTableSQL);
             if (createResult.error) {
               console.error(`Failed to create table ${tableName}:`, createResult.error);
@@ -107,6 +82,7 @@ export default {
             if (missingColumns.length > 0) {
               console.log(`Table ${tableName} is missing columns: ${missingColumns.join(', ')}. Recreating...`);
               await env.D1.exec(`ALTER TABLE ${tableName} RENAME TO ${tableName}_old`);
+              console.log(`Executing SQL for recreate: ${createTableSQL}`);
               await env.D1.exec(createTableSQL);
               
               const commonColumns = actualColumns.filter(col => expectedColumns.includes(col));
@@ -206,7 +182,7 @@ export default {
 
     async function calculateSessionExpiry(chatId) {
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const userState = await env.D1.prepare('SELECT activity_count FROM user_states WHERE chat_id = ?')
+      const userState = await env.D1.prepare('SELECT activity_count FROM user_states WHERE chatStates chat_id = ?')
         .bind(chatId)
         .first();
       
