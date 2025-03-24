@@ -3,6 +3,7 @@ let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 
+// 调试环境变量加载
 export default {
   async fetch(request, env) {
     console.log('BOT_TOKEN_ENV:', env.BOT_TOKEN_ENV || 'undefined');
@@ -25,118 +26,22 @@ export default {
 
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
+    // 检查 D1 绑定
     if (!env.D1) {
-      console.error('D1 database is not bound. Please check your Worker environment configuration.');
-      return new Response('Server configuration error: D1 database is not bound. Please check your Worker environment configuration.', { status: 500 });
+      console.error('D1 database is not bound');
+      return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
-    async function checkAndFixTables() {
-      console.log('Checking database tables...');
-      
-      try {
-        // 改进: 使用单行 SQL 语句，移除多余换行符和空格
-        const tableSchemas = {
-          'user_states': 'CREATE TABLE user_states (chat_id TEXT PRIMARY KEY, is_blocked BOOLEAN DEFAULT FALSE, is_verified BOOLEAN DEFAULT FALSE, verified_expiry INTEGER, verification_code TEXT, code_expiry INTEGER, last_verification_message_id TEXT, is_first_verification BOOLEAN DEFAULT FALSE, is_rate_limited BOOLEAN DEFAULT FALSE, last_activity INTEGER, activity_count INTEGER DEFAULT 0)',
-          'message_rates': 'CREATE TABLE message_rates (chat_id TEXT PRIMARY KEY, message_count INTEGER DEFAULT 0, window_start INTEGER)',
-          'chat_topic_mappings': 'CREATE TABLE chat_topic_mappings (chat_id TEXT PRIMARY KEY, topic_id TEXT NOT NULL)'
-        };
-        
-        console.log('Attempting to query existing tables...');
-        const existingTablesResult = await env.D1.prepare(
-          `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`
-        ).all();
-        if (!existingTablesResult.success) {
-          console.error('Failed to query existing tables:', existingTablesResult.error);
-          throw new Error(`Failed to query existing tables: ${existingTablesResult.error}`);
-        }
-        const existingTables = existingTablesResult.results.map(row => row.name);
-        console.log('Existing tables:', existingTables);
-        
-        for (const [tableName, createTableSQL] of Object.entries(tableSchemas)) {
-          if (!existingTables.includes(tableName)) {
-            console.log(`Table ${tableName} does not exist. Creating...`);
-            console.log(`Executing SQL: ${createTableSQL}`); // 改进: 打印完整 SQL 语句
-            const createResult = await env.D1.exec(createTableSQL);
-            if (createResult.error) {
-              console.error(`Failed to create table ${tableName}:`, createResult.error);
-              throw new Error(`Failed to create table ${tableName}: ${createResult.error}`);
-            }
-            console.log(`Table ${tableName} created successfully.`);
-          } else {
-            console.log(`Table ${tableName} exists. Checking structure...`);
-            const tableInfoResult = await env.D1.prepare(`PRAGMA table_info(${tableName})`).all();
-            if (!tableInfoResult.success) {
-              console.error(`Failed to get table info for ${tableName}:`, tableInfoResult.error);
-              throw new Error(`Failed to get table info for ${tableName}: ${tableInfoResult.error}`);
-            }
-            const columns = tableInfoResult.results;
-            
-            const expectedColumns = createTableSQL
-              .match(/\(([^)]+)\)/)[1]
-              .split(',')
-              .map(col => col.trim().split(' ')[0]);
-            
-            const actualColumns = columns.map(col => col.name);
-            const missingColumns = expectedColumns.filter(col => !actualColumns.includes(col));
-            
-            if (missingColumns.length > 0) {
-              console.log(`Table ${tableName} is missing columns: ${missingColumns.join(', ')}. Recreating...`);
-              await env.D1.exec(`ALTER TABLE ${tableName} RENAME TO ${tableName}_old`);
-              console.log(`Executing SQL for recreate: ${createTableSQL}`);
-              await env.D1.exec(createTableSQL);
-              
-              const commonColumns = actualColumns.filter(col => expectedColumns.includes(col));
-              if (commonColumns.length > 0) {
-                await env.D1.exec(
-                  `INSERT INTO ${tableName} (${commonColumns.join(', ')}) 
-                   SELECT ${commonColumns.join(', ')} FROM ${tableName}_old`
-                );
-              }
-              
-              await env.D1.exec(`DROP TABLE ${tableName}_old`);
-              console.log(`Table ${tableName} recreated and data migrated.`);
-            } else {
-              console.log(`Table ${tableName} exists and has all required columns.`);
-            }
-          }
-        }
-        
-        console.log('Database check completed successfully.');
-        return { success: true, message: 'Database check completed successfully.' };
-      } catch (error) {
-        console.error('Error checking/fixing database tables:', error);
-        return { success: false, message: `Error checking/fixing database tables: ${error.message}` };
-      }
-    }
+    // 在每次部署时自动检查和修复数据库表
+    await checkAndRepairTables(env.D1);
 
-    async function cleanExpiredVerificationCodes() {
-      try {
-        const nowSeconds = Math.floor(Date.now() / 1000);
-        await env.D1.prepare(`
-          UPDATE user_states 
-          SET verification_code = NULL, 
-              code_expiry = NULL,
-              last_verification_message_id = NULL
-          WHERE code_expiry IS NOT NULL 
-          AND code_expiry < ?
-        `).bind(nowSeconds).run();
-        console.log('Expired verification codes cleaned');
-      } catch (error) {
-        console.error('Error cleaning expired verification codes:', error);
-      }
-    }
-
+    // 主处理函数
     async function handleRequest(request) {
+      // 检查环境变量是否加载
       if (!BOT_TOKEN || !GROUP_ID) {
         console.error('Missing required environment variables');
         return new Response('Server configuration error: Missing required environment variables', { status: 500 });
       }
-
-      const dbCheckResult = await checkAndFixTables();
-      if (!dbCheckResult.success) {
-        return new Response(dbCheckResult.message, { status: 500 });
-      }
-      await cleanExpiredVerificationCodes();
 
       const url = new URL(request.url);
       if (url.pathname === '/webhook') {
@@ -152,53 +57,110 @@ export default {
         return await registerWebhook(request);
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
-      } else if (url.pathname === '/initTables') {
-        return await initTables();
-      } else if (url.pathname === '/checkDb') {
-        const result = await checkAndFixTables();
-        return new Response(JSON.stringify(result), { 
-          status: result.success ? 200 : 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
+      } else if (url.pathname === '/checkTables') {  // 新增端点用于手动触发检查
+        await checkAndRepairTables(env.D1);
+        return new Response('Database tables checked and repaired', { status: 200 });
       }
       return new Response('Not Found', { status: 404 });
     }
 
-    async function initTables() {
+    // 检查和修复数据库表结构
+    async function checkAndRepairTables(d1) {
       try {
-        console.log('Starting table initialization...');
-        const result = await checkAndFixTables();
-        
-        if (result.success) {
-          return new Response('Database tables initialized successfully', { status: 200 });
-        } else {
-          return new Response(`Failed to initialize database tables: ${result.message}`, { status: 500 });
+        console.log('Checking and repairing database tables...');
+
+        // 定义期望的表结构
+        const expectedTables = {
+          user_states: {
+            columns: {
+              chat_id: 'TEXT PRIMARY KEY',
+              is_blocked: 'BOOLEAN DEFAULT FALSE',
+              is_verified: 'BOOLEAN DEFAULT FALSE',
+              verified_expiry: 'INTEGER',
+              verification_code: 'TEXT',
+              code_expiry: 'INTEGER',
+              last_verification_message_id: 'TEXT',
+              is_first_verification: 'BOOLEAN DEFAULT FALSE',
+              is_rate_limited: 'BOOLEAN DEFAULT FALSE'
+            }
+          },
+          message_rates: {
+            columns: {
+              chat_id: 'TEXT PRIMARY KEY',
+              message_count: 'INTEGER DEFAULT 0',
+              window_start: 'INTEGER'
+            }
+          },
+          chat_topic_mappings: {
+            columns: {
+              chat_id: 'TEXT PRIMARY KEY',
+              topic_id: 'TEXT NOT NULL'
+            }
+          }
+        };
+
+        // 检查每个表
+        for (const [tableName, structure] of Object.entries(expectedTables)) {
+          try {
+            // 检查表是否存在
+            const tableInfo = await d1.prepare(
+              `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`
+            ).bind(tableName).first();
+
+            if (!tableInfo) {
+              console.log(`Table ${tableName} not found, creating...`);
+              await createTable(d1, tableName, structure);
+              continue;
+            }
+
+            // 检查表结构
+            const columnsResult = await d1.prepare(
+              `PRAGMA table_info(${tableName})`
+            ).all();
+            
+            const currentColumns = new Map(
+              columnsResult.results.map(col => [col.name, {
+                type: col.type,
+                notnull: col.notnull,
+                dflt_value: col.dflt_value
+              }])
+            );
+
+            // 检查缺失的列
+            for (const [colName, colDef] of Object.entries(structure.columns)) {
+              if (!currentColumns.has(colName)) {
+                console.log(`Adding missing column ${colName} to ${tableName}`);
+                const columnParts = colDef.split(' ');
+                const addColumnSQL = `ALTER TABLE ${tableName} ADD COLUMN ${colName} ${columnParts.slice(1).join(' ')}`;
+                await d1.exec(addColumnSQL);
+              }
+            }
+
+            console.log(`Table ${tableName} checked and verified`);
+          } catch (error) {
+            console.error(`Error checking ${tableName}:`, error);
+            // 如果检查失败，尝试重建表
+            console.log(`Attempting to recreate ${tableName}...`);
+            await d1.exec(`DROP TABLE IF EXISTS ${tableName}`);
+            await createTable(d1, tableName, structure);
+          }
         }
+
+        console.log('Database tables check and repair completed');
       } catch (error) {
-        console.error('Error initializing database tables:', error);
-        return new Response(`Failed to initialize database tables: ${error.message}`, { status: 500 });
+        console.error('Error in checkAndRepairTables:', error);
+        throw error;
       }
     }
 
-    async function calculateSessionExpiry(chatId) {
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      const userState = await env.D1.prepare('SELECT activity_count FROM user_states WHERE chatStates chat_id = ?')
-        .bind(chatId)
-        .first();
-      
-      const activityCount = userState ? userState.activity_count : 0;
-      const baseExpiry = 3600;
-      const extraHours = Math.min(Math.floor(activityCount / 10), 3);
-      return nowSeconds + baseExpiry + (extraHours * 3600);
-    }
-
-    async function updateUserActivity(chatId) {
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      await env.D1.prepare(`
-        INSERT OR REPLACE INTO user_states 
-        (chat_id, last_activity, activity_count) 
-        VALUES (?, ?, COALESCE((SELECT activity_count FROM user_states WHERE chat_id = ?) + 1, 1))
-      `).bind(chatId, nowSeconds, chatId).run();
+    // 创建表的辅助函数
+    async function createTable(d1, tableName, structure) {
+      const columnsDef = Object.entries(structure.columns)
+        .map(([name, def]) => `${name} ${def}`)
+        .join(', ');
+      const createSQL = `CREATE TABLE ${tableName} (${columnsDef})`;
+      await d1.exec(createSQL);
+      console.log(`Table ${tableName} created successfully`);
     }
 
     async function handleUpdate(update) {
@@ -213,8 +175,6 @@ export default {
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
-
-      await updateUserActivity(chatId);
 
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
@@ -495,8 +455,6 @@ export default {
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
 
-      await updateUserActivity(chatId);
-
       if (!data.startsWith('verify_')) return;
 
       const [, userChatId, selectedAnswer, result] = data.split('_');
@@ -514,7 +472,7 @@ export default {
       }
 
       if (result === 'correct') {
-        const verifiedExpiry = await calculateSessionExpiry(chatId);
+        const verifiedExpiry = nowSeconds + 3600;
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
           .bind(true, verifiedExpiry, chatId)
           .run();
