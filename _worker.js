@@ -3,6 +3,10 @@ let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 
+// 全局变量，用于控制清理频率
+let lastCleanupTime = 0;
+const CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 分钟（单位：毫秒）
+
 // 调试环境变量加载
 export default {
   async fetch(request, env) {
@@ -34,6 +38,9 @@ export default {
 
     // 在每次部署时自动检查和修复数据库表
     await checkAndRepairTables(env.D1);
+
+    // 清理过期的验证码缓存（基于时间间隔）
+    await cleanExpiredVerificationCodes(env.D1);
 
     // 主处理函数
     async function handleRequest(request) {
@@ -162,19 +169,25 @@ export default {
       console.log(`Table ${tableName} created successfully`);
     }
 
-    // 定时任务：清理过期的验证码缓存
-    async function scheduled(event, env, ctx) {
-      console.log('Running scheduled task to clean expired verification codes...');
+    // 清理过期的验证码缓存
+    async function cleanExpiredVerificationCodes(d1) {
+      const now = Date.now();
+      // 仅在超过清理间隔时执行清理
+      if (now - lastCleanupTime < CLEANUP_INTERVAL) {
+        return;
+      }
+
+      console.log('Running task to clean expired verification codes...');
       try {
-        const nowSeconds = Math.floor(Date.now() / 1000);
-        const expiredCodes = await env.D1.prepare(
+        const nowSeconds = Math.floor(now / 1000);
+        const expiredCodes = await d1.prepare(
           'SELECT chat_id FROM user_states WHERE code_expiry IS NOT NULL AND code_expiry < ?'
         ).bind(nowSeconds).all();
 
         if (expiredCodes.results.length > 0) {
           console.log(`Found ${expiredCodes.results.length} expired verification codes. Cleaning up...`);
           for (const { chat_id } of expiredCodes.results) {
-            await env.D1.prepare(
+            await d1.prepare(
               'UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?'
             ).bind(chat_id).run();
             console.log(`Cleaned expired verification code for chat_id: ${chat_id}`);
@@ -182,8 +195,9 @@ export default {
         } else {
           console.log('No expired verification codes found.');
         }
+        lastCleanupTime = now; // 更新最后清理时间
       } catch (error) {
-        console.error('Error in scheduled task for cleaning expired verification codes:', error);
+        console.error('Error cleaning expired verification codes:', error);
       }
     }
 
@@ -629,7 +643,8 @@ export default {
 
       const notificationContent = await getNotificationContent();
 
-      const pinnedMessage = `昵称: ${nickname}\n用户名: ${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+      // 修改用户名格式为 "用户名: @userName"
+      const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
       const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
       const messageId = messageResponse.result.message_id;
       await pinMessage(topicId, messageId);
@@ -808,55 +823,5 @@ export default {
       console.error('Unhandled error in fetch handler:', error);
       return new Response('Internal Server Error', { status: 500 });
     }
-  },
-
-  // 添加 scheduled 方法以支持定时任务
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      (async () => {
-        console.log('BOT_TOKEN_ENV:', env.BOT_TOKEN_ENV || 'undefined');
-        console.log('GROUP_ID_ENV:', env.GROUP_ID_ENV || 'undefined');
-        console.log('MAX_MESSAGES_PER_MINUTE_ENV:', env.MAX_MESSAGES_PER_MINUTE_ENV || 'undefined');
-
-        if (!env.BOT_TOKEN_ENV) {
-          console.error('BOT_TOKEN_ENV is not defined');
-          BOT_TOKEN = null;
-        } else {
-          BOT_TOKEN = env.BOT_TOKEN_ENV;
-        }
-
-        if (!env.GROUP_ID_ENV) {
-          console.error('GROUP_ID_ENV is not defined');
-          GROUP_ID = null;
-        } else {
-          GROUP_ID = env.GROUP_ID_ENV;
-        }
-
-        MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
-
-        if (!env.D1) {
-          console.error('D1 database is not bound');
-          return;
-        }
-
-        // 定时清理过期的验证码
-        const nowSeconds = Math.floor(Date.now() / 1000);
-        const expiredCodes = await env.D1.prepare(
-          'SELECT chat_id FROM user_states WHERE code_expiry IS NOT NULL AND code_expiry < ?'
-        ).bind(nowSeconds).all();
-
-        if (expiredCodes.results.length > 0) {
-          console.log(`Found ${expiredCodes.results.length} expired verification codes. Cleaning up...`);
-          for (const { chat_id } of expiredCodes.results) {
-            await env.D1.prepare(
-              'UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?'
-            ).bind(chat_id).run();
-            console.log(`Cleaned expired verification code for chat_id: ${chat_id}`);
-          }
-        } else {
-          console.log('No expired verification codes found.');
-        }
-      })()
-    );
   }
 };
