@@ -162,6 +162,31 @@ export default {
       console.log(`Table ${tableName} created successfully`);
     }
 
+    // 定时任务：清理过期的验证码缓存
+    async function scheduled(event, env, ctx) {
+      console.log('Running scheduled task to clean expired verification codes...');
+      try {
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const expiredCodes = await env.D1.prepare(
+          'SELECT chat_id FROM user_states WHERE code_expiry IS NOT NULL AND code_expiry < ?'
+        ).bind(nowSeconds).all();
+
+        if (expiredCodes.results.length > 0) {
+          console.log(`Found ${expiredCodes.results.length} expired verification codes. Cleaning up...`);
+          for (const { chat_id } of expiredCodes.results) {
+            await env.D1.prepare(
+              'UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?'
+            ).bind(chat_id).run();
+            console.log(`Cleaned expired verification code for chat_id: ${chat_id}`);
+          }
+        } else {
+          console.log('No expired verification codes found.');
+        }
+      } catch (error) {
+        console.error('Error in scheduled task for cleaning expired verification codes:', error);
+      }
+    }
+
     async function handleUpdate(update) {
       if (update.message) {
         await onMessage(update.message);
@@ -230,18 +255,18 @@ export default {
         const verificationStateAgain = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
-        let isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : false; // Changed to let
+        let isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : false;
         const verifiedExpiryAgain = verificationStateAgain ? verificationStateAgain.verified_expiry : null;
 
         if (verifiedExpiryAgain && nowSeconds > verifiedExpiryAgain) {
           await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
             .bind(false, chatId)
             .run();
-          isVerifiedAgain = false; // Now this reassignment is allowed
+          isVerifiedAgain = false;
         }
 
         if (isVerifiedAgain && (!verifiedExpiryAgain || nowSeconds <= verifiedExpiryAgain)) {
-          // 如果已经验证过，直接发送欢迎消息和 start.md 内容
+          // 如果已经验证过，直接发送 start.md 内容
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
         } else {
@@ -499,20 +524,16 @@ export default {
         const userState = await env.D1.prepare('SELECT is_first_verification, is_rate_limited FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
-        const isFirstVerification = userState ? userState.is_first_verification : false;
         const isRateLimited = userState ? userState.is_rate_limited : false;
 
-        if (isFirstVerification) {
-          // 首次验证成功，发送 start.md 内容
-          const successMessage = await getVerificationSuccessMessage();
-          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
-          await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
-            .bind(false, chatId)
-            .run();
-        } else {
-          // 非首次验证，提示重新发送消息
-          await sendMessageToUser(chatId, '验证成功！请重新发送您的消息');
-        }
+        // 无论是否首次验证，只要通过验证就发送 start.md 内容
+        const successMessage = await getVerificationSuccessMessage();
+        await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
+
+        // 更新首次验证状态
+        await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
+          .bind(false, chatId)
+          .run();
 
         if (isRateLimited) {
           await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
@@ -787,5 +808,55 @@ export default {
       console.error('Unhandled error in fetch handler:', error);
       return new Response('Internal Server Error', { status: 500 });
     }
+  },
+
+  // 添加 scheduled 方法以支持定时任务
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      (async () => {
+        console.log('BOT_TOKEN_ENV:', env.BOT_TOKEN_ENV || 'undefined');
+        console.log('GROUP_ID_ENV:', env.GROUP_ID_ENV || 'undefined');
+        console.log('MAX_MESSAGES_PER_MINUTE_ENV:', env.MAX_MESSAGES_PER_MINUTE_ENV || 'undefined');
+
+        if (!env.BOT_TOKEN_ENV) {
+          console.error('BOT_TOKEN_ENV is not defined');
+          BOT_TOKEN = null;
+        } else {
+          BOT_TOKEN = env.BOT_TOKEN_ENV;
+        }
+
+        if (!env.GROUP_ID_ENV) {
+          console.error('GROUP_ID_ENV is not defined');
+          GROUP_ID = null;
+        } else {
+          GROUP_ID = env.GROUP_ID_ENV;
+        }
+
+        MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
+
+        if (!env.D1) {
+          console.error('D1 database is not bound');
+          return;
+        }
+
+        // 定时清理过期的验证码
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const expiredCodes = await env.D1.prepare(
+          'SELECT chat_id FROM user_states WHERE code_expiry IS NOT NULL AND code_expiry < ?'
+        ).bind(nowSeconds).all();
+
+        if (expiredCodes.results.length > 0) {
+          console.log(`Found ${expiredCodes.results.length} expired verification codes. Cleaning up...`);
+          for (const { chat_id } of expiredCodes.results) {
+            await env.D1.prepare(
+              'UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?'
+            ).bind(chat_id).run();
+            console.log(`Cleaned expired verification code for chat_id: ${chat_id}`);
+          }
+        } else {
+          console.log('No expired verification codes found.');
+        }
+      })()
+    );
   }
 };
