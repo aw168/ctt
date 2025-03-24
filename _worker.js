@@ -383,6 +383,7 @@ async function handleVerification(chatId, messageId, env) {
     .bind(chatId)
     .run();
 
+  // 删除旧的验证码消息
   const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
     .bind(chatId)
     .first();
@@ -432,16 +433,15 @@ async function sendVerification(chatId, env) {
 
   const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const codeExpiry = nowSeconds + 600; // 延长到 10 分钟
+  const codeExpiry = nowSeconds + 300; // 5 分钟有效期，与参考代码保持一致
   console.log(`Generating verification for chatId ${chatId}: code=${correctResult}, expiry=${codeExpiry}, now=${nowSeconds}`);
 
   // 插入验证码
-  let insertResult;
   try {
-    insertResult = await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
+    await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
       .bind(chatId, correctResult.toString(), codeExpiry)
       .run();
-    console.log('Insert verification code result:', insertResult);
+    console.log(`Verification code ${correctResult} stored for chatId ${chatId}`);
   } catch (error) {
     console.error(`Failed to insert verification code for chatId ${chatId}:`, error);
     await sendMessageToUser(chatId, '生成验证码失败，请稍后重试。', env);
@@ -476,10 +476,10 @@ async function sendVerification(chatId, env) {
       console.error(`Failed to send verification message: ${data.description}`);
       return;
     }
-    const updateResult = await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
+    await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
       .bind(data.result.message_id.toString(), chatId)
       .run();
-    console.log('Update last_verification_message_id result:', updateResult);
+    console.log(`Verification message sent for chatId ${chatId}, message_id: ${data.result.message_id}`);
   } catch (error) {
     console.error("Error sending verification message:", error);
     await sendMessageToUser(chatId, '发送验证码失败，请稍后重试。', env);
@@ -550,11 +550,11 @@ async function onCallbackQuery(callbackQuery, env) {
   }
 
   if (result === 'correct') {
-    const verifiedExpiry = await calculateSessionExpiry(chatId, env);
-    const updateResult = await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
+    const verifiedExpiry = nowSeconds + 3600; // 1 小时有效期，与参考代码保持一致
+    await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
       .bind(true, verifiedExpiry, chatId)
       .run();
-    console.log('Update verification status result:', updateResult);
+    console.log(`Verification successful for chatId ${chatId}, verified until ${verifiedExpiry}`);
 
     const userState = await env.D1.prepare('SELECT is_first_verification, is_rate_limited FROM user_states WHERE chat_id = ?')
       .bind(chatId)
@@ -591,6 +591,7 @@ async function onCallbackQuery(callbackQuery, env) {
         message_id: messageId,
       }),
     });
+    console.log(`Deleted verification message ${messageId} for chatId ${chatId}`);
   } catch (error) {
     console.error("Error deleting verification message:", error);
   }
