@@ -2,7 +2,7 @@
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
-let isInitialized = false; // 用于标记是否已完成初始化
+let isInitialized = false;
 
 export default {
   async fetch(request, env) {
@@ -36,7 +36,6 @@ export default {
       return new Response('Server configuration error: Missing required environment variables', { status: 500 });
     }
 
-    // 自动初始化数据库表和注册 Webhook
     if (!isInitialized) {
       console.log('Performing initialization...');
       const dbCheckResult = await checkAndFixTables(env);
@@ -53,7 +52,6 @@ export default {
       console.log('Initialization completed successfully.');
     }
 
-    // 处理请求
     const url = new URL(request.url);
     if (url.pathname === '/webhook') {
       try {
@@ -151,7 +149,8 @@ async function checkAndFixTables(env) {
 async function cleanExpiredVerificationCodes(env) {
   try {
     const nowSeconds = Math.floor(Date.now() / 1000);
-    await env.D1.prepare(`
+    console.log(`Cleaning expired verification codes at ${nowSeconds}...`);
+    const result = await env.D1.prepare(`
       UPDATE user_states 
       SET verification_code = NULL, 
           code_expiry = NULL,
@@ -159,7 +158,7 @@ async function cleanExpiredVerificationCodes(env) {
       WHERE code_expiry IS NOT NULL 
       AND code_expiry < ?
     `).bind(nowSeconds).run();
-    console.log('Expired verification codes cleaned');
+    console.log('Expired verification codes cleaned:', result);
   } catch (error) {
     console.error('Error cleaning expired verification codes:', error);
   }
@@ -261,7 +260,6 @@ async function onMessage(message, env) {
   }
   console.log(`User ${chatId} verification status: ${isVerified}`);
 
-  // 处理 /start 指令
   if (text === '/start') {
     await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
       .bind(chatId, true)
@@ -270,7 +268,6 @@ async function onMessage(message, env) {
     const welcomeMessage = await getVerificationSuccessMessage();
     await sendMessageToUser(chatId, `${welcomeMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`, env);
 
-    // 检查是否需要生成验证码
     if (!isVerified) {
       const existingCode = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
@@ -285,7 +282,6 @@ async function onMessage(message, env) {
     return;
   }
 
-  // 非 /start 消息，检查验证状态
   if (!isVerified) {
     const messageContent = text || '非文本消息';
     await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n无法发送，请完成验证`, env);
@@ -399,7 +395,6 @@ async function checkIfAdmin(userId, env) {
 }
 
 async function handleVerification(chatId, messageId, env) {
-  // 删除旧的验证码消息
   const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
     .bind(chatId)
     .first();
@@ -422,7 +417,6 @@ async function handleVerification(chatId, messageId, env) {
       .run();
   }
 
-  // 生成新验证码
   await sendVerification(chatId, env);
 }
 
@@ -449,10 +443,13 @@ async function sendVerification(chatId, env) {
 
   const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const codeExpiry = nowSeconds + 300;
-  await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
+  const codeExpiry = nowSeconds + 600; // 延长到10分钟
+  console.log(`Generating verification for chatId ${chatId}: code=${correctResult}, expiry=${codeExpiry}, now=${nowSeconds}`);
+
+  const insertResult = await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
     .bind(chatId, correctResult.toString(), codeExpiry)
     .run();
+  console.log('Insert verification code result:', insertResult);
 
   try {
     const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -471,9 +468,10 @@ async function sendVerification(chatId, env) {
       console.error(`Failed to send verification message: ${data.description}`);
       return;
     }
-    await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
+    const updateResult = await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
       .bind(data.result.message_id.toString(), chatId)
       .run();
+    console.log('Update last_verification_message_id result:', updateResult);
   } catch (error) {
     console.error("Error sending verification message:", error);
   }
@@ -533,16 +531,20 @@ async function onCallbackQuery(callbackQuery, env) {
   const storedCode = verificationState ? verificationState.verification_code : null;
   const codeExpiry = verificationState ? verificationState.code_expiry : null;
   const nowSeconds = Math.floor(Date.now() / 1000);
+  console.log(`Checking verification for chatId ${chatId}: storedCode=${storedCode}, codeExpiry=${codeExpiry}, nowSeconds=${nowSeconds}`);
+
   if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
+    console.log(`Verification expired or not found for chatId ${chatId}`);
     await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。', env);
     return;
   }
 
   if (result === 'correct') {
     const verifiedExpiry = await calculateSessionExpiry(chatId, env);
-    await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
+    const updateResult = await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
       .bind(true, verifiedExpiry, chatId)
       .run();
+    console.log('Update verification status result:', updateResult);
 
     const userState = await env.D1.prepare('SELECT is_first_verification, is_rate_limited FROM user_states WHERE chat_id = ?')
       .bind(chatId)
