@@ -249,7 +249,7 @@ async function onMessage(message, env) {
   const lastVerificationTime = verificationState ? verificationState.last_verification_time : 0;
   const nowSeconds = Math.floor(Date.now() / 1000);
 
-  if (verifiedExpiry && nowSeconds > verifiedExpiry) {
+  if (verifiedExpiry && nowSeconds > Number(verifiedExpiry)) {
     console.log(`Verification expired for chatId ${chatId}, resetting is_verified.`);
     await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
       .bind(false, chatId)
@@ -627,9 +627,13 @@ async function onCallbackQuery(callbackQuery, env) {
   const codeExpiry = verificationState ? verificationState.code_expiry : null;
   const storedMessageId = verificationState ? verificationState.last_verification_message_id : null;
   const nowSeconds = Math.floor(Date.now() / 1000);
-  console.log(`Checking verification for chatId ${chatId}: storedCode=${storedCode}, codeExpiry=${codeExpiry}, nowSeconds=${nowSeconds}, storedMessageId=${storedMessageId}`);
+  
+  console.log(`Checking verification for chatId ${chatId}: storedCode=${storedCode}, codeExpiry=${codeExpiry}, nowSeconds=${nowSeconds}, storedMessageId=${storedMessageId}, messageId=${messageId}, messageIdType=${typeof messageId}, storedMessageIdType=${typeof storedMessageId}`);
 
-  if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
+  // Double check codeExpiry is a number before comparison
+  const codeExpiryNum = Number(codeExpiry);
+  
+  if (!storedCode || (codeExpiryNum && nowSeconds > codeExpiryNum)) {
     console.log(`Verification expired or not found for chatId ${chatId}`);
     await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。', env);
     await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
@@ -639,9 +643,16 @@ async function onCallbackQuery(callbackQuery, env) {
     return;
   }
 
-  // 如果当前消息不是最新的验证码消息，忽略
-  if (storedMessageId && storedMessageId !== messageId.toString()) {
-    console.log(`Ignoring outdated verification message for chatId ${chatId}, current messageId: ${messageId}, storedMessageId: ${storedMessageId}`);
+  // Convert both to strings to ensure consistent comparison
+  const currentMessageIdStr = String(messageId);
+  const storedMessageIdStr = String(storedMessageId);
+  
+  // Log comparison values
+  console.log(`Message ID comparison for chatId ${chatId}: current=${currentMessageIdStr}, stored=${storedMessageIdStr}, equal=${currentMessageIdStr === storedMessageIdStr}`);
+  
+  // If current message is not the latest verification message, ignore
+  if (storedMessageIdStr && storedMessageIdStr !== currentMessageIdStr) {
+    console.log(`Ignoring outdated verification message for chatId ${chatId}, current messageId: ${currentMessageIdStr}, storedMessageId: ${storedMessageIdStr}`);
     await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
