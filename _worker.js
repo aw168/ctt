@@ -3,6 +3,7 @@ let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 let isInitialized = false;
+let lastCleanTime = 0; // 用于控制清理频率
 
 export default {
   async fetch(request, env) {
@@ -147,8 +148,15 @@ async function checkAndFixTables(env) {
 }
 
 async function cleanExpiredVerificationCodes(env) {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  // 每隔 60 秒执行一次清理
+  if (nowSeconds - lastCleanTime < 60) {
+    console.log('Skipping cleanExpiredVerificationCodes, too soon since last clean.');
+    return;
+  }
+  lastCleanTime = nowSeconds;
+
   try {
-    const nowSeconds = Math.floor(Date.now() / 1000);
     console.log(`Cleaning expired verification codes at ${nowSeconds}...`);
     const result = await env.D1.prepare(`
       UPDATE user_states 
@@ -443,13 +451,24 @@ async function sendVerification(chatId, env) {
 
   const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const codeExpiry = nowSeconds + 600; // 延长到10分钟
+  const codeExpiry = nowSeconds + 600; // 10分钟
   console.log(`Generating verification for chatId ${chatId}: code=${correctResult}, expiry=${codeExpiry}, now=${nowSeconds}`);
 
+  // 插入验证码
   const insertResult = await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
     .bind(chatId, correctResult.toString(), codeExpiry)
     .run();
   console.log('Insert verification code result:', insertResult);
+
+  // 验证是否成功写入
+  const verificationCheck = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
+    .bind(chatId)
+    .first();
+  if (!verificationCheck || verificationCheck.verification_code !== correctResult.toString() || verificationCheck.code_expiry !== codeExpiry) {
+    console.error(`Failed to store verification code for chatId ${chatId}:`, verificationCheck);
+    throw new Error(`Failed to store verification code for chatId ${chatId}`);
+  }
+  console.log(`Verification code stored successfully for chatId ${chatId}:`, verificationCheck);
 
   try {
     const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
