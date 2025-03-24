@@ -5,7 +5,7 @@ let MAX_MESSAGES_PER_MINUTE;
 
 // 全局变量，用于控制清理频率
 let lastCleanupTime = 0;
-const CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 分钟（单位：毫秒）
+const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
 
 // 调试环境变量加载
 export default {
