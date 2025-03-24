@@ -98,7 +98,7 @@
 
 ### 部署到Cloudflare pages
 
-#### **fork本项目**！！！
+#### **首先 fork本项目**！！！
 
 #### 步骤 1：创建pages项目
 1. 登录[Cloudflare仪表板](https://dash.cloudflare.com/)。
