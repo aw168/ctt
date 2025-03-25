@@ -123,8 +123,8 @@ export default {
               chat_id: 'TEXT PRIMARY KEY',
               message_count: 'INTEGER DEFAULT 0',
               window_start: 'INTEGER',
-              start_count: 'INTEGER DEFAULT 0', // 新增字段，用于跟踪 /start 命令的频率
-              start_window_start: 'INTEGER' // 新增字段，用于跟踪 /start 命令的时间窗口
+              start_count: 'INTEGER DEFAULT 0',
+              start_window_start: 'INTEGER'
             }
           },
           chat_topic_mappings: {
@@ -262,7 +262,7 @@ export default {
       }
 
       // 检查用户是否被拉黑
-      const userState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
+      const userState = await env.D1.prepare('SELECT is_blocked, is_verified, verified_expiry, is_first_verification FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
       const isBlocked = userState ? userState.is_blocked : false;
@@ -270,6 +270,11 @@ export default {
         console.log(`User ${chatId} is blocked, ignoring message.`);
         return;
       }
+
+      // 检查用户是否已经验证且验证未过期
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const isVerified = userState && userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+      const isFirstVerification = userState ? userState.is_first_verification : true;
 
       // 处理 /start 命令，确保不转发
       if (text === '/start') {
@@ -282,25 +287,36 @@ export default {
           return;
         }
 
-        await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
-          .bind(chatId, true)
-          .run();
+        // 如果用户尚未有记录，初始化 is_first_verification 为 true
+        if (!userState) {
+          await env.D1.prepare('INSERT INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
+            .bind(chatId, true)
+            .run();
+        }
 
-        const firstVerificationState = await env.D1.prepare('SELECT is_first_verification FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        const isFirstVerification = firstVerificationState ? firstVerificationState.is_first_verification : true;
+        // 如果用户已经验证且验证未过期，直接发送欢迎消息
+        if (isVerified) {
+          const successMessage = await getVerificationSuccessMessage();
+          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
+          return;
+        }
 
+        // 如果是首次验证，触发验证流程
         if (isFirstVerification) {
-          // 首次使用，发送欢迎消息并触发验证
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
           await handleVerification(chatId, messageId);
         } else {
-          // 非首次使用，直接发送欢迎消息
-          const successMessage = await getVerificationSuccessMessage();
-          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
+          // 如果不是首次验证但验证已过期，触发新的验证
+          await sendMessageToUser(chatId, "您的验证已过期，请重新验证以继续使用！");
+          await handleVerification(chatId, messageId);
         }
         return; // 确保 /start 不被转发
+      }
+
+      // 如果用户未验证且不是首次验证（可能是验证过期），需要重新验证
+      if (!isVerified) {
+        await sendMessageToUser(chatId, "您尚未完成验证或验证已过期，请使用 /start 命令重新验证！");
+        return;
       }
 
       // 检查消息频率（防刷）
@@ -339,7 +355,6 @@ export default {
       }
     }
 
-    // 新增函数：检查 /start 命令的频率
     async function checkStartCommandRate(chatId) {
       const key = chatId;
       const now = Date.now();
@@ -677,7 +692,6 @@ export default {
 
       const notificationContent = await getNotificationContent();
 
-      // 修改用户名格式为 "用户名: @userName"
       const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
       const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
       const messageId = messageResponse.result.message_id;
