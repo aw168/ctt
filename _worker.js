@@ -115,8 +115,7 @@ export default {
               code_expiry: 'INTEGER',
               last_verification_message_id: 'TEXT',
               is_first_verification: 'BOOLEAN DEFAULT FALSE',
-              is_rate_limited: 'BOOLEAN DEFAULT FALSE',
-              last_start_timestamp: 'INTEGER' // 新增字段，用于记录最后一次 /start 命令的时间戳
+              is_rate_limited: 'BOOLEAN DEFAULT FALSE'
             }
           },
           message_rates: {
@@ -273,25 +272,8 @@ export default {
       // 处理 /start 命令，确保不转发
       if (text === '/start') {
         console.log(`Received /start command from ${chatId}, processing without forwarding...`);
-
-        // 检查上一次 /start 命令的时间
-        const userData = await env.D1.prepare('SELECT last_start_timestamp FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        const nowSeconds = Math.floor(Date.now() / 1000);
-        const lastStartTimestamp = userData ? userData.last_start_timestamp : 0;
-        const timeSinceLastStart = nowSeconds - lastStartTimestamp;
-
-        // 如果距离上一次 /start 命令不到 5 分钟 (300 秒)，则提示用户稍后再试
-        if (lastStartTimestamp && timeSinceLastStart < 300) {
-          const remainingSeconds = 300 - timeSinceLastStart;
-          await sendMessageToUser(chatId, `请等待 ${remainingSeconds} 秒后再尝试 /start 命令。`);
-          return;
-        }
-
-        // 更新 last_start_timestamp
-        await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification, last_start_timestamp) VALUES (?, ?, ?)')
-          .bind(chatId, true, nowSeconds)
+        await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
+          .bind(chatId, true)
           .run();
 
         const firstVerificationState = await env.D1.prepare('SELECT is_first_verification FROM user_states WHERE chat_id = ?')
@@ -313,7 +295,7 @@ export default {
 
       // 检查消息频率（防刷）
       if (await checkMessageRate(chatId)) {
-        console.log(`User ${checkMessageRate} exceeded message rate limit, requiring verification.`);
+        console.log(`User ${chatId} exceeded message rate limit, requiring verification.`);
         await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
           .bind(true, chatId)
           .run();
@@ -401,15 +383,24 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
-      // 清理旧的验证码状态
+      // 检查是否已经有一个未过期的验证码
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const verificationState = await env.D1.prepare('SELECT code_expiry, last_verification_message_id FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+
+      if (verificationState && verificationState.code_expiry && nowSeconds < verificationState.code_expiry) {
+        // 如果存在未过期的验证码，提示用户完成现有验证
+        await sendMessageToUser(chatId, "您已经有一个未完成的验证，请先完成当前的验证！");
+        return;
+      }
+
+      // 清理旧的验证码状态和消息
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
         .run();
 
-      const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      const lastVerificationMessageId = lastVerification ? lastVerification.last_verification_message_id : null;
+      const lastVerificationMessageId = verificationState ? verificationState.last_verification_message_id : null;
       if (lastVerificationMessageId) {
         try {
           await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
@@ -428,6 +419,7 @@ export default {
           .run();
       }
 
+      // 发送新的验证码
       await sendVerification(chatId);
     }
 
