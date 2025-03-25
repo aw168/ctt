@@ -3,9 +3,10 @@ let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 
-// 全局变量，用于控制清理频率
+// 全局变量，用于控制清理频率和 webhook 初始化
 let lastCleanupTime = 0;
-const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
+const CLEANUP_INTERVAL= 24 * 60 * 60 * 1000; // 24 小时
+let isWebhookInitialized = false; // 用于标记 webhook 是否已初始化
 
 // 调试环境变量加载
 export default {
@@ -39,6 +40,12 @@ export default {
     // 在每次部署时自动检查和修复数据库表
     await checkAndRepairTables(env.D1);
 
+    // 自动注册 webhook（仅在首次启动时执行）
+    if (!isWebhookInitialized && BOT_TOKEN) {
+      await autoRegisterWebhook(request);
+      isWebhookInitialized = true; // 标记为已初始化，避免重复注册
+    }
+
     // 清理过期的验证码缓存（基于时间间隔）
     await cleanExpiredVerificationCodes(env.D1);
 
@@ -61,7 +68,7 @@ export default {
           return new Response('Bad Request', { status: 400 });
         }
       } else if (url.pathname === '/registerWebhook') {
-        return await registerWebhook(request);
+        return await registerWebhook(request); // 保留手动注册接口以备不时之需
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
       } else if (url.pathname === '/checkTables') {
@@ -69,6 +76,26 @@ export default {
         return new Response('Database tables checked and repaired', { status: 200 });
       }
       return new Response('Not Found', { status: 404 });
+    }
+
+    // 自动注册 webhook 的函数
+    async function autoRegisterWebhook(request) {
+      console.log('Attempting to auto-register webhook...');
+      const webhookUrl = `${new URL(request.url).origin}/webhook`;
+      try {
+        const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: webhookUrl }),
+        }).then(r => r.json());
+        if (response.ok) {
+          console.log('Webhook auto-registered successfully');
+        } else {
+          console.error('Webhook auto-registration failed:', JSON.stringify(response, null, 2));
+        }
+      } catch (error) {
+        console.error('Error during webhook auto-registration:', error);
+      }
     }
 
     // 检查和修复数据库表结构
@@ -87,7 +114,7 @@ export default {
               verification_code: 'TEXT',
               code_expiry: 'INTEGER',
               last_verification_message_id: 'TEXT',
-              is_first_verification: 'BOOLEAN DEFAULT FALSE',
+              is_first_verification: 'BOOLEAN DEFAULT TRUE', // 修改为TRUE表示首次需要验证
               is_rate_limited: 'BOOLEAN DEFAULT FALSE'
             }
           },
@@ -242,12 +269,13 @@ export default {
         return;
       }
 
-      // 检查用户是否已通过验证
-      const verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
+      // 检查用户验证状态
+      const verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry, is_first_verification FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
       let isVerified = verificationState ? verificationState.is_verified : false;
       const verifiedExpiry = verificationState ? verificationState.verified_expiry : null;
+      const isFirstVerification = verificationState ? verificationState.is_first_verification : true;
       const nowSeconds = Math.floor(Date.now() / 1000);
       if (verifiedExpiry && nowSeconds > verifiedExpiry) {
         // 验证状态已过期，重置为未验证
@@ -256,7 +284,7 @@ export default {
           .run();
         isVerified = false;
       }
-      console.log(`User ${chatId} verification status: ${isVerified}`);
+      console.log(`User ${chatId} verification status: ${isVerified}, isFirstVerification: ${isFirstVerification}`);
 
       // 处理 /start 命令，确保不转发
       if (text === '/start') {
@@ -265,48 +293,35 @@ export default {
           .bind(chatId, true)
           .run();
 
-        // 再次检查验证状态
-        const verificationStateAgain = await env.D1.prepare('SELECT is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        let isVerifiedAgain = verificationStateAgain ? verificationStateAgain.is_verified : false;
-        const verifiedExpiryAgain = verificationStateAgain ? verificationStateAgain.verified_expiry : null;
-
-        if (verifiedExpiryAgain && nowSeconds > verifiedExpiryAgain) {
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
-            .bind(false, chatId)
-            .run();
-          isVerifiedAgain = false;
-        }
-
-        if (isVerifiedAgain && (!verifiedExpiryAgain || nowSeconds <= verifiedExpiryAgain)) {
+        if (isVerified && (!verifiedExpiry || nowSeconds <= verifiedExpiry)) {
           // 如果已经验证过，直接发送 start.md 内容
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
-        } else {
-          // 未验证，发送欢迎消息并触发验证
+        } else if (isFirstVerification) {
+          // 首次使用，触发验证
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
           await handleVerification(chatId, messageId);
         }
         return; // 确保 /start 不被转发
       }
 
-      // 如果用户未通过验证，提示并触发验证
-      if (!isVerified) {
-        const messageContent = text || '非文本消息';
-        await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n请先完成验证！`);
-        await handleVerification(chatId, messageId);
-        return;
-      }
-
       // 检查消息频率（防刷）
-      if (await checkMessageRate(chatId)) {
-        console.log(`User ${chatId} exceeded message rate limit, resetting verification.`);
+      const isRateLimited = await checkMessageRate(chatId);
+      if (isRateLimited) {
+        console.log(`User ${chatId} exceeded message rate limit, triggering verification.`);
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL, is_rate_limited = ? WHERE chat_id = ?')
           .bind(false, true, chatId)
           .run();
         const messageContent = text || '非文本消息';
         await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n信息过于频繁，请完成验证后发送信息`);
+        await handleVerification(chatId, messageId);
+        return;
+      }
+
+      // 仅在首次使用时检查验证状态
+      if (!isVerified && isFirstVerification) {
+        const messageContent = text || '非文本消息';
+        await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n请先完成验证后再发送此信息！`);
         await handleVerification(chatId, messageId);
         return;
       }
@@ -329,6 +344,13 @@ export default {
           await sendMessageToTopic(topicId, formattedMessage);
         } else {
           await copyMessageToTopic(topicId, message);
+        }
+
+        // 如果是首次验证通过，更新状态
+        if (isFirstVerification) {
+          await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
+            .bind(false, chatId)
+            .run();
         }
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
@@ -663,7 +685,7 @@ export default {
         .bind(topicId)
         .first();
       return mapping ? mapping.chat_id : null;
-    }
+ ├─    }
 
     async function sendMessageToTopic(topicId, text) {
       console.log("Sending message to topic:", topicId, text);
