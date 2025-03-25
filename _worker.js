@@ -115,7 +115,8 @@ export default {
               code_expiry: 'INTEGER',
               last_verification_message_id: 'TEXT',
               is_first_verification: 'BOOLEAN DEFAULT FALSE',
-              is_rate_limited: 'BOOLEAN DEFAULT FALSE'
+              is_rate_limited: 'BOOLEAN DEFAULT FALSE',
+              last_start_timestamp: 'INTEGER' // 新增字段，用于记录最后一次 /start 命令的时间戳
             }
           },
           message_rates: {
@@ -272,8 +273,25 @@ export default {
       // 处理 /start 命令，确保不转发
       if (text === '/start') {
         console.log(`Received /start command from ${chatId}, processing without forwarding...`);
-        await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
-          .bind(chatId, true)
+
+        // 检查上一次 /start 命令的时间
+        const userData = await env.D1.prepare('SELECT last_start_timestamp FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const lastStartTimestamp = userData ? userData.last_start_timestamp : 0;
+        const timeSinceLastStart = nowSeconds - lastStartTimestamp;
+
+        // 如果距离上一次 /start 命令不到 5 分钟 (300 秒)，则提示用户稍后再试
+        if (lastStartTimestamp && timeSinceLastStart < 300) {
+          const remainingSeconds = 300 - timeSinceLastStart;
+          await sendMessageToUser(chatId, `请等待 ${remainingSeconds} 秒后再尝试 /start 命令。`);
+          return;
+        }
+
+        // 更新 last_start_timestamp
+        await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification, last_start_timestamp) VALUES (?, ?, ?)')
+          .bind(chatId, true, nowSeconds)
           .run();
 
         const firstVerificationState = await env.D1.prepare('SELECT is_first_verification FROM user_states WHERE chat_id = ?')
@@ -295,7 +313,7 @@ export default {
 
       // 检查消息频率（防刷）
       if (await checkMessageRate(chatId)) {
-        console.log(`User ${chatId} exceeded message rate limit, requiring verification.`);
+        console.log(`User ${checkMessageRate} exceeded message rate limit, requiring verification.`);
         await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
           .bind(true, chatId)
           .run();
