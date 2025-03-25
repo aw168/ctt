@@ -411,19 +411,27 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
+      // 检查是否已有未处理的验证码
+      const verificationState = await env.D1.prepare('SELECT code_expiry, last_verification_message_id FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const codeExpiry = verificationState ? verificationState.code_expiry : null;
+      const lastVerificationMessageId = verificationState ? verificationState.last_verification_message_id : null;
+
+      // 如果存在未过期的验证码，直接返回，避免重复发送
+      if (codeExpiry && nowSeconds < codeExpiry) {
+        console.log(`Verification already in progress for chat_id: ${chatId}, expiry: ${codeExpiry}`);
+        return;
+      }
+
       // 清理旧的验证码状态
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
         .run();
 
-      // 获取并删除旧的验证码消息
-      const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      const lastVerificationMessageId = lastVerification ? lastVerification.last_verification_message_id : null;
-
+      // 删除旧的验证码消息
       if (lastVerificationMessageId) {
-        let deleteSuccess = false;
         try {
           const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
             method: 'POST',
@@ -436,25 +444,18 @@ export default {
           const data = await response.json();
           if (data.ok) {
             console.log(`Successfully deleted old verification message for chat_id: ${chatId}, message_id: ${lastVerificationMessageId}`);
-            deleteSuccess = true;
           } else {
             console.error(`Failed to delete old verification message: ${data.description}`);
           }
         } catch (error) {
           console.error(`Error deleting old verification message for chat_id: ${chatId}, message_id: ${lastVerificationMessageId}:`, error);
         }
-
-        // 无论删除是否成功，都清理数据库中的记录
-        await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
-          .bind(chatId)
-          .run();
-
-        // 如果删除失败，发送提示消息
-        if (!deleteSuccess) {
-          await sendMessageToUser(chatId, "无法删除旧验证码消息，请手动删除后再试。");
-          return; // 避免发送新的验证码消息
-        }
       }
+
+      // 无论删除是否成功，都清理数据库中的记录
+      await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
+        .bind(chatId)
+        .run();
 
       // 发送新的验证码
       await sendVerification(chatId);
@@ -813,7 +814,7 @@ export default {
       }
     }
 
-    async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
+    async function fetchWithRetry(url, options, retries = 3, backoff = 500) { // 减少 backoff 时间以提高响应速度
       for (let i = 0; i < retries; i++) {
         try {
           const response = await fetch(url, options);
@@ -832,6 +833,8 @@ export default {
             console.error(`Failed to fetch ${url} after ${retries} retries:`, error);
             throw error;
           }
+          const delay = backoff * Math.pow(2, i);
+          await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
       throw new Error(`Failed to fetch ${url} after ${retries} retries`);
