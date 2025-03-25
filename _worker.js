@@ -114,7 +114,7 @@ export default {
               verification_code: 'TEXT',
               code_expiry: 'INTEGER',
               last_verification_message_id: 'TEXT',
-              is_first_verification: 'BOOLEAN DEFAULT TRUE', // 修改为TRUE表示首次需要验证
+              is_first_verification: 'BOOLEAN DEFAULT TRUE',
               is_rate_limited: 'BOOLEAN DEFAULT FALSE'
             }
           },
@@ -199,7 +199,6 @@ export default {
     // 清理过期的验证码缓存
     async function cleanExpiredVerificationCodes(d1) {
       const now = Date.now();
-      // 仅在超过清理间隔时执行清理
       if (now - lastCleanupTime < CLEANUP_INTERVAL) {
         return;
       }
@@ -222,7 +221,7 @@ export default {
         } else {
           console.log('No expired verification codes found.');
         }
-        lastCleanupTime = now; // 更新最后清理时间
+        lastCleanupTime = now;
       } catch (error) {
         console.error('Error cleaning expired verification codes:', error);
       }
@@ -247,62 +246,55 @@ export default {
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
           if (privateChatId) {
-            // 检查是否为管理员命令
             if (text.startsWith('/block') || text.startsWith('/unblock') || text.startsWith('/checkblock')) {
               await handleAdminCommand(message, topicId, privateChatId);
               return;
             }
-            // 普通客服回复
             await forwardMessageToPrivateChat(privateChatId, message);
           }
         }
         return;
       }
 
-      // 检查用户是否被拉黑
-      const userState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
+      // 合并数据库查询，减少查询次数
+      const userState = await env.D1.prepare(
+        'SELECT is_blocked, is_verified, verified_expiry, is_first_verification FROM user_states WHERE chat_id = ?'
+      ).bind(chatId).first();
       const isBlocked = userState ? userState.is_blocked : false;
+      let isVerified = userState ? userState.is_verified : false;
+      const verifiedExpiry = userState ? userState.verified_expiry : null;
+      const isFirstVerification = userState ? userState.is_first_verification : true;
+
+      // 检查用户是否被拉黑
       if (isBlocked) {
         console.log(`User ${chatId} is blocked, ignoring message.`);
         return;
       }
 
-      // 检查用户验证状态
-      const verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry, is_first_verification FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      let isVerified = verificationState ? verificationState.is_verified : false;
-      const verifiedExpiry = verificationState ? verificationState.verified_expiry : null;
-      const isFirstVerification = verificationState ? verificationState.is_first_verification : true;
+      // 检查验证状态是否过期
       const nowSeconds = Math.floor(Date.now() / 1000);
       if (verifiedExpiry && nowSeconds > verifiedExpiry) {
-        // 验证状态已过期，重置为未验证
         await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL WHERE chat_id = ?')
           .bind(false, chatId)
           .run();
         isVerified = false;
       }
-      console.log(`User ${chatId} verification status: ${isVerified}, isFirstVerification: ${isFirstVerification}`);
 
-      // 处理 /start 命令，确保不转发
+      // 处理 /start 命令
       if (text === '/start') {
-        console.log(`Received /start command from ${chatId}, processing without forwarding...`);
+        console.log(`Received /start command from ${chatId}`);
         await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
           .bind(chatId, true)
           .run();
 
         if (isVerified && (!verifiedExpiry || nowSeconds <= verifiedExpiry)) {
-          // 如果已经验证过，直接发送 start.md 内容
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
-        } else if (isFirstVerification) {
-          // 首次使用，触发验证
+        } else {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
           await handleVerification(chatId, messageId);
         }
-        return; // 确保 /start 不被转发
+        return;
       }
 
       // 检查消息频率（防刷）
@@ -346,7 +338,6 @@ export default {
           await copyMessageToTopic(topicId, message);
         }
 
-        // 如果是首次验证通过，更新状态
         if (isFirstVerification) {
           await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
             .bind(false, chatId)
@@ -411,26 +402,17 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
-      // 检查是否已有未处理的验证码
-      const verificationState = await env.D1.prepare('SELECT code_expiry, last_verification_message_id FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      const codeExpiry = verificationState ? verificationState.code_expiry : null;
-      const lastVerificationMessageId = verificationState ? verificationState.last_verification_message_id : null;
-
-      // 如果存在未过期的验证码，直接返回，避免重复发送
-      if (codeExpiry && nowSeconds < codeExpiry) {
-        console.log(`Verification already in progress for chat_id: ${chatId}, expiry: ${codeExpiry}`);
-        return;
-      }
-
       // 清理旧的验证码状态
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
         .run();
 
       // 删除旧的验证码消息
+      const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      const lastVerificationMessageId = lastVerification ? lastVerification.last_verification_message_id : null;
+
       if (lastVerificationMessageId) {
         try {
           const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
@@ -457,7 +439,7 @@ export default {
         .bind(chatId)
         .run();
 
-      // 发送新的验证码
+      // 直接发送新的验证码
       await sendVerification(chatId);
     }
 
@@ -582,11 +564,9 @@ export default {
           .first();
         const isRateLimited = userState ? userState.is_rate_limited : false;
 
-        // 无论是否首次验证，只要通过验证就发送 start.md 内容
         const successMessage = await getVerificationSuccessMessage();
         await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
 
-        // 更新首次验证状态
         await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
           .bind(false, chatId)
           .run();
@@ -644,7 +624,6 @@ export default {
         .bind(key, data.count, data.start)
         .run();
 
-      console.log(`User ${chatId} message count: ${data.count}/${MAX_MESSAGES_PER_MINUTE} in last minute`);
       return data.count > MAX_MESSAGES_PER_MINUTE;
     }
 
@@ -684,8 +663,6 @@ export default {
       const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
 
       const notificationContent = await getNotificationContent();
-
-      // 修改用户名格式为 "用户名: @userName"
       const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
       const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
       const messageId = messageResponse.result.message_id;
@@ -708,7 +685,6 @@ export default {
     }
 
     async function sendMessageToTopic(topicId, text) {
-      console.log("Sending message to topic:", topicId, text);
       if (!text.trim()) {
         console.error(`Failed to send message to topic: message text is empty`);
         return;
@@ -777,7 +753,6 @@ export default {
     }
 
     async function forwardMessageToPrivateChat(privateChatId, message) {
-      console.log("Forwarding message to private chat:", privateChatId, message);
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
           method: 'POST',
@@ -798,7 +773,6 @@ export default {
     }
 
     async function sendMessageToUser(chatId, text) {
-      console.log("Sending message to user:", chatId, text);
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
@@ -814,7 +788,7 @@ export default {
       }
     }
 
-    async function fetchWithRetry(url, options, retries = 3, backoff = 500) { // 减少 backoff 时间以提高响应速度
+    async function fetchWithRetry(url, options, retries = 3, backoff = 300) {
       for (let i = 0; i < retries; i++) {
         try {
           const response = await fetch(url, options);
@@ -841,7 +815,6 @@ export default {
     }
 
     async function registerWebhook(request) {
-      console.log('BOT_TOKEN in registerWebhook:', BOT_TOKEN);
       const webhookUrl = `${new URL(request.url).origin}/webhook`;
       const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
@@ -852,7 +825,6 @@ export default {
     }
 
     async function unRegisterWebhook() {
-      console.log('BOT_TOKEN in unRegisterWebhook:', BOT_TOKEN);
       const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
