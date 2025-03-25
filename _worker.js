@@ -122,7 +122,9 @@ export default {
             columns: {
               chat_id: 'TEXT PRIMARY KEY',
               message_count: 'INTEGER DEFAULT 0',
-              window_start: 'INTEGER'
+              window_start: 'INTEGER',
+              start_count: 'INTEGER DEFAULT 0', // 新增字段，用于跟踪 /start 命令的频率
+              start_window_start: 'INTEGER' // 新增字段，用于跟踪 /start 命令的时间窗口
             }
           },
           chat_topic_mappings: {
@@ -272,6 +274,14 @@ export default {
       // 处理 /start 命令，确保不转发
       if (text === '/start') {
         console.log(`Received /start command from ${chatId}, processing without forwarding...`);
+
+        // 检查 /start 命令的频率
+        if (await checkStartCommandRate(chatId)) {
+          console.log(`User ${chatId} exceeded /start command rate limit, ignoring.`);
+          await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
+          return;
+        }
+
         await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
           .bind(chatId, true)
           .run();
@@ -329,6 +339,33 @@ export default {
       }
     }
 
+    // 新增函数：检查 /start 命令的频率
+    async function checkStartCommandRate(chatId) {
+      const key = chatId;
+      const now = Date.now();
+      const window = 5 * 60 * 1000; // 5 分钟窗口
+      const maxStartsPerWindow = 1; // 每 5 分钟最多允许 1 次 /start 命令
+
+      const rateData = await env.D1.prepare('SELECT start_count, start_window_start FROM message_rates WHERE chat_id = ?')
+        .bind(key)
+        .first();
+      let data = rateData ? { count: rateData.start_count, start: rateData.start_window_start } : { count: 0, start: now };
+
+      if (now - data.start > window) {
+        data.count = 1;
+        data.start = now;
+      } else {
+        data.count += 1;
+      }
+
+      await env.D1.prepare('UPDATE message_rates SET start_count = ?, start_window_start = ? WHERE chat_id = ?')
+        .bind(data.count, data.start, key)
+        .run();
+
+      console.log(`User ${chatId} /start command count: ${data.count}/${maxStartsPerWindow} in last 5 minutes`);
+      return data.count > maxStartsPerWindow;
+    }
+
     async function handleAdminCommand(message, topicId, privateChatId) {
       const text = message.text;
       const senderId = message.from.id.toString();
@@ -383,24 +420,15 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
-      // 检查是否已经有一个未过期的验证码
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      const verificationState = await env.D1.prepare('SELECT code_expiry, last_verification_message_id FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-
-      if (verificationState && verificationState.code_expiry && nowSeconds < verificationState.code_expiry) {
-        // 如果存在未过期的验证码，提示用户完成现有验证
-        await sendMessageToUser(chatId, "您已经有一个未完成的验证，请先完成当前的验证！");
-        return;
-      }
-
-      // 清理旧的验证码状态和消息
+      // 清理旧的验证码状态
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
         .run();
 
-      const lastVerificationMessageId = verificationState ? verificationState.last_verification_message_id : null;
+      const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      const lastVerificationMessageId = lastVerification ? lastVerification.last_verification_message_id : null;
       if (lastVerificationMessageId) {
         try {
           await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
@@ -419,7 +447,6 @@ export default {
           .run();
       }
 
-      // 发送新的验证码
       await sendVerification(chatId);
     }
 
@@ -605,8 +632,8 @@ export default {
         data.count += 1;
       }
 
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
-        .bind(key, data.count, data.start)
+      await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
+        .bind(data.count, data.start, key)
         .run();
 
       console.log(`User ${chatId} message count: ${data.count}/${MAX_MESSAGES_PER_MINUTE} in last minute`);
