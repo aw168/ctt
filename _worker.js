@@ -640,6 +640,18 @@ export default {
       }
     }
 
+    async function getNotificationContent() {
+      try {
+        const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
+        if (!response.ok) throw new Error(`Failed to fetch notification.md: ${response.statusText}`);
+        const content = await response.text();
+        return content.trim() || '';
+      } catch (error) {
+        console.error("Error fetching notification content:", error);
+        return '';
+      }
+    }
+
     async function checkStartCommandRate(chatId) {
       const now = Date.now();
       const window = 5 * 60 * 1000;
@@ -886,17 +898,31 @@ export default {
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
             try {
-              // 删除用户状态、消息速率和话题映射
+              // 获取用户的话题 ID
+              const topicId = await getExistingTopicId(privateChatId);
+              if (topicId) {
+                // 删除 Telegram 群组中的话题
+                await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteForumTopic`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    chat_id: GROUP_ID,
+                    message_thread_id: topicId
+                  })
+                });
+              }
+
+              // 删除数据库记录和缓存
               await env.D1.batch([
                 env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
                 env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId),
                 env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId)
               ]);
-              // 清理缓存
               userStateCache.delete(privateChatId);
               messageRateCache.delete(privateChatId);
               topicCache.delete(privateChatId);
-              await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，请手动删除对应话题以完成重置。`);
+
+              await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题已删除。`);
             } catch (error) {
               console.error(`Error deleting user ${privateChatId}:`, error);
               await sendMessageToTopic(topicId, `删除用户 ${privateChatId} 失败：${error.message}`);
@@ -1051,7 +1077,6 @@ export default {
           if (data.ok) {
             return topicId;
           } else {
-            // 话题不存在，清理缓存和数据库
             topicCache.delete(chatId);
             await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
               .bind(chatId)
@@ -1076,6 +1101,7 @@ export default {
 
     async function createForumTopic(topicName, userName, nickname, userId) {
       try {
+        const createStart = Date.now();
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1083,9 +1109,40 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
-        return data.result.message_thread_id;
+        const topicId = data.result.message_thread_id;
+        console.log(`[Timing] createForumTopic API call took ${Date.now() - createStart}ms`);
+
+        // 发送置顶消息，显示用户资料
+        const pinnedMessageStart = Date.now();
+        const notificationContent = await getNotificationContent();
+        const pinnedMessage = `**用户资料：**\n用户名: ${userName}\n昵称: ${nickname}\n用户ID: ${userId}\n\n${notificationContent}`;
+        const pinnedResponse = await sendMessageToTopic(topicId, pinnedMessage);
+        console.log(`[Timing] Sending pinned message took ${Date.now() - pinnedMessageStart}ms`);
+
+        // 异步置顶消息
+        pinMessage(topicId, pinnedResponse.result.message_id).catch(error => console.error(`Error pinning message for topic ${topicId}:`, error));
+
+        return topicId;
       } catch (error) {
         console.error(`Error creating forum topic for user ${userId}:`, error);
+        throw error;
+      }
+    }
+
+    async function pinMessage(topicId, messageId) {
+      try {
+        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            message_id: messageId,
+            message_thread_id: topicId,
+            disable_notification: true
+          })
+        });
+      } catch (error) {
+        console.error(`Error pinning message ${messageId} in topic ${topicId}:`, error);
         throw error;
       }
     }
@@ -1131,9 +1188,11 @@ export default {
       }
 
       try {
+        // 验证 Markdown 内容，移除可能导致解析失败的字符
+        const safeText = text.replace(/[*_~`[\]()]/g, '\\$&');
         const requestBody = {
           chat_id: GROUP_ID,
-          text: text,
+          text: safeText,
           message_thread_id: topicId,
           parse_mode: 'Markdown'
         };
@@ -1218,7 +1277,7 @@ export default {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 500); // 缩短超时时间到 500ms
+          const timeoutId = setTimeout(() => controller.abort(), 500);
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
