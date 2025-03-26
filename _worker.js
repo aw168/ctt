@@ -7,6 +7,7 @@ let MAX_MESSAGES_PER_MINUTE;
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
 let isWebhookInitialized = false; // 用于标记 webhook 是否已初始化
+const processedMessages = new Set(); // 用于存储已处理的消息 ID，防止重复处理
 
 // 调试环境变量加载
 export default {
@@ -232,6 +233,22 @@ export default {
 
     async function handleUpdate(update) {
       if (update.message) {
+        const messageId = update.message.message_id.toString();
+        const chatId = update.message.chat.id.toString();
+        const messageKey = `${chatId}:${messageId}`;
+        
+        // 防重处理
+        if (processedMessages.has(messageKey)) {
+          console.log(`Message ${messageKey} already processed, skipping...`);
+          return;
+        }
+        processedMessages.add(messageKey);
+        
+        // 清理旧的消息记录（防止内存泄漏）
+        if (processedMessages.size > 10000) {
+          processedMessages.clear();
+        }
+
         await onMessage(update.message);
       } else if (update.callback_query) {
         await onCallbackQuery(update.callback_query);
@@ -242,6 +259,8 @@ export default {
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
+
+      console.log(`Received message from chatId ${chatId}: ${text}`);
 
       // 处理后台群组消息
       if (chatId === GROUP_ID) {
@@ -261,7 +280,7 @@ export default {
         return;
       }
 
-      // 处理用户消息
+      // 检查用户是否被拉黑
       const userState = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -271,24 +290,28 @@ export default {
         return;
       }
 
-      const isFirstVerification = userState ? userState.is_first_verification : true;
-      const verificationEnabled = await getSetting('verification_enabled') === 'true';
-
       // 处理 /start 命令
       if (text === '/start') {
-        console.log(`Received /start command from chatId ${chatId}`);
+        console.log(`Processing /start command for chatId ${chatId}`);
+
+        // 检查 /start 命令频率
         if (await checkStartCommandRate(chatId)) {
           console.log(`User ${chatId} exceeded /start command rate limit, ignoring.`);
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
           return;
         }
 
+        // 初始化用户状态（如果不存在）
         if (!userState) {
           console.log(`No user state found for chatId ${chatId}, initializing...`);
           await env.D1.prepare('INSERT INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
             .bind(chatId, true)
             .run();
         }
+
+        const isFirstVerification = userState ? userState.is_first_verification : true;
+        const verificationEnabled = await getSetting('verification_enabled') === 'true';
+        console.log(`Verification enabled: ${verificationEnabled}, isFirstVerification: ${isFirstVerification}`);
 
         if (verificationEnabled && isFirstVerification) {
           console.log(`First verification required for chatId ${chatId}, sending verification...`);
@@ -303,6 +326,7 @@ export default {
       }
 
       // 检查消息频率
+      const verificationEnabled = await getSetting('verification_enabled') === 'true';
       if (verificationEnabled && await checkMessageRate(chatId)) {
         console.log(`User ${chatId} exceeded message rate limit, requiring verification.`);
         await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
@@ -491,6 +515,8 @@ export default {
       const topicId = callbackQuery.message.message_thread_id;
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
+
+      console.log(`Received callback query from chatId ${chatId}: ${data}`);
 
       // 处理验证码验证回调
       if (data.startsWith('verify_')) {
