@@ -241,6 +241,12 @@ export default {
               }
             }
 
+            // 为 settings 表添加索引，提高查询效率
+            if (tableName === 'settings') {
+              await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
+              console.log('Index idx_settings_key created on settings table');
+            }
+
             console.log(`Table ${tableName} checked and verified`);
           } catch (error) {
             console.error(`Error checking ${tableName}:`, error);
@@ -522,11 +528,11 @@ export default {
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       try {
-        const [verificationEnabled, userRawEnabled] = await Promise.all([
-          getSetting('verification_enabled') === 'true',
-          getSetting('user_raw_enabled') === 'true'
-        ]);
-        console.log(`Sending admin panel - verificationEnabled: ${verificationEnabled}, userRawEnabled: ${userRawEnabled}`);
+        // 确保获取最新的状态
+        const startTime = Date.now();
+        const verificationEnabled = (await getSetting('verification_enabled')) === 'true';
+        const userRawEnabled = (await getSetting('user_raw_enabled')) === 'true';
+        console.log(`sendAdminPanel - verificationEnabled: ${verificationEnabled}, userRawEnabled: ${userRawEnabled}, time taken: ${Date.now() - startTime}ms`);
 
         const buttons = [
           [
@@ -547,36 +553,45 @@ export default {
         ];
 
         const adminMessage = '管理员面板：请选择操作';
-        const apiCalls = [
-          fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: chatId,
-              message_thread_id: topicId,
-              text: adminMessage,
-              reply_markup: { inline_keyboard: buttons }
-            })
-          }),
-          fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: chatId,
-              message_id: messageId
-            })
+        const sendMessageStart = Date.now();
+        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_thread_id: topicId,
+            text: adminMessage,
+            reply_markup: { inline_keyboard: buttons }
           })
-        ];
+        });
+        console.log(`sendAdminPanel - sendMessage completed, time taken: ${Date.now() - sendMessageStart}ms`);
 
-        await Promise.all(apiCalls);
-        console.log(`Admin panel sent successfully to chatId ${chatId}, topicId ${topicId}`);
+        // 将 deleteMessage 设置为非阻塞操作
+        const deleteMessageStart = Date.now();
+        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: messageId
+          })
+        }).then(() => {
+          console.log(`sendAdminPanel - deleteMessage completed, time taken: ${Date.now() - deleteMessageStart}ms`);
+        }).catch(error => {
+          console.error(`sendAdminPanel - deleteMessage failed: ${error.message}`);
+        });
+
+        console.log(`Admin panel sent successfully to chatId ${chatId}, topicId ${topicId}, total time taken: ${Date.now() - startTime}ms`);
       } catch (error) {
         console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
       }
     }
 
     async function getVerificationSuccessMessage() {
+      const startTime = Date.now();
       const userRawEnabled = (await getSetting('user_raw_enabled')) === 'true';
+      console.log(`getVerificationSuccessMessage - userRawEnabled: ${userRawEnabled}, time taken: ${Date.now() - startTime}ms`);
+
       if (!userRawEnabled) return '验证成功！您现在可以与客服聊天。';
 
       try {
@@ -650,10 +665,12 @@ export default {
     }
 
     async function getSetting(key) {
+      const startTime = Date.now();
       try {
         const result = await env.D1.prepare('SELECT value FROM settings WHERE key = ?')
           .bind(key)
           .first();
+        console.log(`getSetting - key: ${key}, value: ${result?.value}, time taken: ${Date.now() - startTime}ms`);
         return result?.value || null;
       } catch (error) {
         console.error(`Error getting setting ${key}:`, error);
@@ -662,11 +679,12 @@ export default {
     }
 
     async function setSetting(key, value) {
+      const startTime = Date.now();
       try {
         await env.D1.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
           .bind(key, value)
           .run();
-        console.log(`Setting ${key} updated to ${value}`);
+        console.log(`setSetting - key: ${key}, value: ${value}, time taken: ${Date.now() - startTime}ms`);
       } catch (error) {
         console.error(`Error setting ${key} to ${value}:`, error);
         throw error;
@@ -674,8 +692,8 @@ export default {
     }
 
     async function onCallbackQuery(callbackQuery) {
+      const startTime = Date.now();
       const chatId = callbackQuery.message.chat.id.toString();
-      // 修改：将 const 改为 let，允许 topicId 被重新赋值
       let topicId = callbackQuery.message.message_thread_id;
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
@@ -683,7 +701,6 @@ export default {
       console.log(`Processing callback query from chatId ${chatId}, topicId ${topicId}: ${data}`);
 
       // 提取 action 和 privateChatId
-      // 修改解析逻辑，确保正确提取完整的 action
       const parts = data.split('_');
       let action;
       let privateChatId;
@@ -865,16 +882,12 @@ export default {
             await sendMessageToTopic(topicId, `未知操作：${action}`);
           }
 
-          // 重新获取最新状态并更新管理员面板
-          const [verificationEnabled, userRawEnabled] = await Promise.all([
-            getSetting('verification_enabled') === 'true',
-            getSetting('user_raw_enabled') === 'true'
-          ]);
-          console.log(`Updated states - verificationEnabled: ${verificationEnabled}, userRawEnabled: ${userRawEnabled}`);
+          // 确保在状态更新后重新发送管理员面板
           await sendAdminPanel(chatId, topicId, privateChatId, messageId);
         }
 
         // 响应回调查询
+        const answerCallbackStart = Date.now();
         await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -882,7 +895,8 @@ export default {
             callback_query_id: callbackQuery.id
           })
         });
-        console.log(`Callback query ${callbackQuery.id} processed successfully`);
+        console.log(`Callback query ${callbackQuery.id} processed successfully, answerCallbackQuery time taken: ${Date.now() - answerCallbackStart}ms`);
+        console.log(`onCallbackQuery completed, total time taken: ${Date.now() - startTime}ms`);
       } catch (error) {
         console.error(`Error processing callback query ${data}:`, error);
         await sendMessageToTopic(topicId, `处理操作 ${action} 失败：${error.message}`);
@@ -1072,6 +1086,7 @@ export default {
         throw new Error('Message text is empty');
       }
 
+      const startTime = Date.now();
       try {
         const requestBody = {
           chat_id: GROUP_ID,
@@ -1090,6 +1105,7 @@ export default {
           console.error(`Failed to send message to topic ${topicId}: ${data.description}`);
           throw new Error(`Failed to send message to topic: ${data.description}`);
         }
+        console.log(`sendMessageToTopic completed, time taken: ${Date.now() - startTime}ms`);
         return data;
       } catch (error) {
         console.error(`Error sending message to topic ${topicId}:`, error);
@@ -1098,6 +1114,7 @@ export default {
     }
 
     async function copyMessageToTopic(topicId, message) {
+      const startTime = Date.now();
       try {
         const requestBody = {
           chat_id: GROUP_ID,
@@ -1116,6 +1133,7 @@ export default {
           console.error(`Failed to copy message to topic ${topicId}: ${data.description}`);
           throw new Error(`Failed to copy message to topic: ${data.description}`);
         }
+        console.log(`copyMessageToTopic completed, time taken: ${Date.now() - startTime}ms`);
       } catch (error) {
         console.error(`Error copying message to topic ${topicId}:`, error);
         throw error;
@@ -1123,6 +1141,7 @@ export default {
     }
 
     async function pinMessage(topicId, messageId) {
+      const startTime = Date.now();
       try {
         const requestBody = {
           chat_id: GROUP_ID,
@@ -1140,6 +1159,7 @@ export default {
           console.error(`Failed to pin message ${messageId} in topic ${topicId}: ${data.description}`);
           throw new Error(`Failed to pin message: ${data.description}`);
         }
+        console.log(`pinMessage completed, time taken: ${Date.now() - startTime}ms`);
       } catch (error) {
         console.error(`Error pinning message ${messageId} in topic ${topicId}:`, error);
         throw error;
@@ -1147,6 +1167,7 @@ export default {
     }
 
     async function forwardMessageToPrivateChat(privateChatId, message) {
+      const startTime = Date.now();
       try {
         const requestBody = {
           chat_id: privateChatId,
@@ -1164,6 +1185,7 @@ export default {
           console.error(`Failed to forward message to private chat ${privateChatId}: ${data.description}`);
           throw new Error(`Failed to forward message to private chat: ${data.description}`);
         }
+        console.log(`forwardMessageToPrivateChat completed, time taken: ${Date.now() - startTime}ms`);
       } catch (error) {
         console.error(`Error forwarding message to private chat ${privateChatId}:`, error);
         throw error;
@@ -1171,6 +1193,7 @@ export default {
     }
 
     async function sendMessageToUser(chatId, text) {
+      const startTime = Date.now();
       try {
         const requestBody = { chat_id: chatId, text: text };
         console.log(`Sending message to user ${chatId} with body:`, JSON.stringify(requestBody));
@@ -1184,17 +1207,27 @@ export default {
           console.error(`Failed to send message to user ${chatId}: ${data.description}`);
           throw new Error(`Failed to send message to user: ${data.description}`);
         }
+        console.log(`sendMessageToUser completed, time taken: ${Date.now() - startTime}ms`);
       } catch (error) {
         console.error(`Error sending message to user ${chatId}:`, error);
         throw error;
       }
     }
 
-    async function fetchWithRetry(url, options, retries = 5, backoff = 2000) {
+    async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
+      const startTime = Date.now();
       for (let i = 0; i < retries; i++) {
         try {
-          const response = await fetch(url, options);
-          if (response.ok) return response;
+          // 添加超时机制，10秒超时
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 10000);
+          const response = await fetch(url, { ...options, signal: controller.signal });
+          clearTimeout(timeoutId);
+
+          if (response.ok) {
+            console.log(`fetchWithRetry - URL: ${url}, attempt ${i + 1}, success, time taken: ${Date.now() - startTime}ms`);
+            return response;
+          }
           if (response.status === 429) {
             const retryAfter = response.headers.get('Retry-After');
             const delay = retryAfter ? parseInt(retryAfter) * 1000 : backoff * Math.pow(2, i);
@@ -1204,7 +1237,10 @@ export default {
             throw new Error(`Request failed with status ${response.status}: ${response.statusText}`);
           }
         } catch (error) {
-          if (i === retries - 1) throw error;
+          if (i === retries - 1) {
+            console.error(`fetchWithRetry - URL: ${url}, failed after ${retries} retries, time taken: ${Date.now() - startTime}ms, error: ${error.message}`);
+            throw error;
+          }
           await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
         }
       }
