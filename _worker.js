@@ -3,6 +3,9 @@ let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 
+// 临时管理员白名单（用于调试）
+const ADMIN_WHITELIST = ['YOUR_ADMIN_USER_ID']; // 替换为你的 Telegram 用户 ID
+
 // 全局变量，用于控制清理频率和 webhook 初始化
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
@@ -830,6 +833,13 @@ export default {
 
     async function checkIfAdmin(userId) {
       console.log(`Checking if user ${userId} is an admin in group ${GROUP_ID}`);
+
+      // 检查白名单（临时用于调试）
+      if (ADMIN_WHITELIST.includes(userId)) {
+        console.log(`User ${userId} is in admin whitelist, granting admin access`);
+        return true;
+      }
+
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
           method: 'POST',
