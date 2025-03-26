@@ -33,7 +33,7 @@ export default {
 
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
-    // 检查 D1 数据库绑定（Cloudflare Workers 和 Pages 要求）
+    // 检查 D1 数据库绑定（Cloudflare Workers 要求）
     if (!env.D1) {
       console.error('D1 database is not bound');
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
@@ -75,6 +75,7 @@ export default {
       if (url.pathname === '/webhook') {
         try {
           const update = await request.json();
+          console.log('Received Telegram update:', JSON.stringify(update, null, 2));
           await handleUpdate(update);
           return new Response('OK');
         } catch (error) {
@@ -263,9 +264,13 @@ export default {
           processedMessages.clear();
         }
 
+        console.log(`Handling message update for chatId ${chatId}:`, JSON.stringify(update.message, null, 2));
         await onMessage(update.message);
       } else if (update.callback_query) {
+        console.log(`Handling callback query update for chatId ${update.callback_query.message.chat.id}:`, JSON.stringify(update.callback_query, null, 2));
         await onCallbackQuery(update.callback_query);
+      } else {
+        console.log('Received unknown update type:', JSON.stringify(update, null, 2));
       }
     }
 
@@ -274,7 +279,7 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
-      console.log(`Received message from chatId ${chatId}: ${text}`);
+      console.log(`Processing message from chatId ${chatId}: ${text}`);
 
       // 处理后台群组消息
       if (chatId === GROUP_ID) {
@@ -300,6 +305,7 @@ export default {
         userState = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
+        console.log(`User state for chatId ${chatId}:`, userState);
       } catch (error) {
         console.error(`Error querying user state for chatId ${chatId}:`, error);
         return;
@@ -335,6 +341,7 @@ export default {
               .bind(chatId, true)
               .run();
             userState = { is_first_verification: true, is_blocked: false };
+            console.log(`Initialized user state for chatId ${chatId}`);
           } catch (error) {
             console.error(`Error initializing user state for chatId ${chatId}:`, error);
             return;
@@ -343,14 +350,16 @@ export default {
 
         let verificationEnabled;
         try {
-          verificationEnabled = await getSetting('verification_enabled') === 'true';
+          const settingValue = await getSetting('verification_enabled');
+          verificationEnabled = settingValue === 'true';
+          console.log(`Verification enabled setting: ${verificationEnabled}`);
         } catch (error) {
           console.error(`Error getting verification_enabled setting:`, error);
           verificationEnabled = true; // 默认开启验证码
         }
 
         const isFirstVerification = userState ? userState.is_first_verification : true;
-        console.log(`Verification enabled: ${verificationEnabled}, isFirstVerification: ${isFirstVerification}`);
+        console.log(`isFirstVerification for chatId ${chatId}: ${isFirstVerification}`);
 
         if (verificationEnabled && isFirstVerification) {
           console.log(`First verification required for chatId ${chatId}, sending verification...`);
@@ -580,7 +589,7 @@ export default {
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
 
-      console.log(`Received callback query from chatId ${chatId}: ${data}`);
+      console.log(`Processing callback query from chatId ${chatId}: ${data}`);
 
       // 处理验证码验证回调
       if (data.startsWith('verify_')) {
