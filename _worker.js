@@ -287,7 +287,7 @@ export default {
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
           if (privateChatId && text === '/admin') {
-            console.log(`Admin panel requested by chatId ${chatId} in topic ${topicId}`);
+            console.log(`Admin panel requested by chatId ${chatId} in topic ${topicId}, userId: ${message.from.id}`);
             await sendAdminPanel(chatId, topicId, privateChatId, messageId);
             return;
           }
@@ -444,6 +444,9 @@ export default {
         [
           { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
           { text: 'GitHub项目', callback_data: `github_${privateChatId}` }
+        ],
+        [
+          { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
         ]
       ];
 
@@ -658,7 +661,8 @@ export default {
       } 
       // 处理管理员按钮回调
       else if (data.startsWith('block_') || data.startsWith('unblock_') || data.startsWith('toggle_verification_') || 
-               data.startsWith('check_blocklist_') || data.startsWith('toggle_user_raw_') || data.startsWith('github_')) {
+               data.startsWith('check_blocklist_') || data.startsWith('toggle_user_raw_') || data.startsWith('github_') || 
+               data.startsWith('delete_user_')) {
         console.log(`Processing admin button callback: ${data}`);
         const senderId = callbackQuery.from.id.toString();
         const isAdmin = await checkIfAdmin(senderId);
@@ -705,6 +709,26 @@ export default {
         } else if (data.startsWith('github_')) {
           console.log(`Sending GitHub link`);
           await sendMessageToTopic(topicId, '访问我的 GitHub 项目：https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO');
+        } else if (data.startsWith('delete_user_')) {
+          console.log(`Deleting user ${privateChatId} from database`);
+          try {
+            // 删除 user_states 表中的记录
+            await env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?')
+              .bind(privateChatId)
+              .run();
+            // 删除 message_rates 表中的记录
+            await env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?')
+              .bind(privateChatId)
+              .run();
+            // 删除 chat_topic_mappings 表中的记录
+            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+              .bind(privateChatId)
+              .run();
+            await sendMessageToTopic(topicId, `用户 ${privateChatId} 的所有信息已从数据库中删除。`);
+          } catch (error) {
+            console.error(`Error deleting user ${privateChatId} from database:`, error);
+            await sendMessageToTopic(topicId, `删除用户 ${privateChatId} 失败：${error.message}`);
+          }
         }
 
         await sendAdminPanel(chatId, topicId, privateChatId, messageId); // 刷新面板
@@ -805,6 +829,7 @@ export default {
     }
 
     async function checkIfAdmin(userId) {
+      console.log(`Checking if user ${userId} is an admin in group ${GROUP_ID}`);
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
           method: 'POST',
@@ -815,14 +840,17 @@ export default {
           })
         });
         const data = await response.json();
+        console.log(`getChatMember response for user ${userId}:`, JSON.stringify(data, null, 2));
         if (!data.ok) {
           console.error(`Failed to check admin status: ${data.description}`);
           return false;
         }
         const status = data.result.status;
-        return status === 'administrator' || status === 'creator';
+        const isAdmin = status === 'administrator' || status === 'creator';
+        console.log(`User ${userId} admin status: ${isAdmin} (status: ${status})`);
+        return isAdmin;
       } catch (error) {
-        console.error("Error checking admin status:", error);
+        console.error(`Error checking admin status for user ${userId}:`, error);
         return false;
       }
     }
