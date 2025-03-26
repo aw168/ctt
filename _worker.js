@@ -128,7 +128,7 @@ export default {
               topic_id: 'TEXT NOT NULL'
             }
           },
-          settings: { // 新增设置表
+          settings: {
             columns: {
               key: 'TEXT PRIMARY KEY',
               value: 'TEXT'
@@ -476,6 +476,35 @@ export default {
         .run();
     }
 
+    async function checkIfAdmin(userId) {
+      try {
+        console.log(`Checking admin status for user ${userId} in group ${GROUP_ID}`);
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            user_id: userId,
+          }),
+        });
+        const data = await response.json();
+        if (!data.ok) {
+          console.error(`Failed to check admin status for user ${userId}: ${data.description}`);
+          return { isAdmin: false, error: `API error: ${data.description}` };
+        }
+        const status = data.result.status;
+        console.log(`User ${userId} status: ${status}`);
+        const isAdmin = status === 'administrator' || status === 'creator';
+        if (!isAdmin) {
+          console.log(`User ${userId} is not an admin or creator, status: ${status}`);
+        }
+        return { isAdmin, error: null };
+      } catch (error) {
+        console.error(`Error checking admin status for user ${userId}:`, error);
+        return { isAdmin: false, error: `Exception: ${error.message}` };
+      }
+    }
+
     async function onCallbackQuery(callbackQuery) {
       const chatId = callbackQuery.message.chat.id.toString();
       const topicId = callbackQuery.message.message_thread_id;
@@ -539,9 +568,13 @@ export default {
       } else if (data.startsWith('block_') || data.startsWith('unblock_') || data.startsWith('toggle_verification_') || 
                  data.startsWith('check_blocklist_') || data.startsWith('toggle_user_raw_') || data.startsWith('github_')) {
         const senderId = callbackQuery.from.id.toString();
-        const isAdmin = await checkIfAdmin(senderId);
-        if (!isAdmin) {
-          await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
+        console.log(`Processing callback from user ${senderId} in group ${GROUP_ID}`);
+        const adminCheck = await checkIfAdmin(senderId);
+        if (!adminCheck.isAdmin) {
+          const errorMessage = adminCheck.error 
+            ? `权限检查失败：${adminCheck.error}` 
+            : '只有管理员可以使用此功能。';
+          await sendMessageToTopic(topicId, errorMessage);
           return;
         }
 
@@ -670,29 +703,6 @@ export default {
           .run();
       } catch (error) {
         console.error("Error sending verification message:", error);
-      }
-    }
-
-    async function checkIfAdmin(userId) {
-      try {
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            user_id: userId
-          })
-        });
-        const data = await response.json();
-        if (!data.ok) {
-          console.error(`Failed to check admin status: ${data.description}`);
-          return false;
-        }
-        const status = data.result.status;
-        return status === 'administrator' || status === 'creator';
-      } catch (error) {
-        console.error("Error checking admin status:", error);
-        return false;
       }
     }
 
@@ -859,7 +869,7 @@ export default {
       }
     }
 
-    async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
+    async function fetchWithRetry(url, options, retries = 5, backoff = 2000) {
       for (let i = 0; i < retries; i++) {
         try {
           const response = await fetch(url, options);
@@ -868,6 +878,7 @@ export default {
           } else if (response.status === 429) {
             const retryAfter = response.headers.get('Retry-After');
             const delay = retryAfter ? parseInt(retryAfter) * 1000 : backoff * Math.pow(2, i);
+            console.log(`Rate limited, retrying after ${delay}ms...`);
             await new Promise(resolve => setTimeout(resolve, delay));
           } else {
             console.error(`Request failed with status ${response.status}: ${response.statusText}`);
@@ -878,6 +889,8 @@ export default {
             console.error(`Failed to fetch ${url} after ${retries} retries:`, error);
             throw error;
           }
+          console.log(`Retrying (${i + 1}/${retries})...`);
+          await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
         }
       }
       throw new Error(`Failed to fetch ${url} after ${retries} retries`);
