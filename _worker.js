@@ -371,7 +371,6 @@ export default {
       }
     }
 
-    // 优化后的 sendAdminPanel，减少 API 调用并提升响应速度
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       const [verificationEnabled, userRawEnabled] = await Promise.all([
         getSetting('verification_enabled') === 'true',
@@ -591,14 +590,30 @@ export default {
 
         const privateChatId = data.split('_')[1];
         if (data.startsWith('block_')) {
+          console.log(`Blocking user ${privateChatId}`);
+          // 确保记录存在，使用 INSERT OR REPLACE
           await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
             .bind(privateChatId, true)
             .run();
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
         } else if (data.startsWith('unblock_')) {
-          await env.D1.prepare('UPDATE user_states SET is_blocked = ? WHERE chat_id = ?')
-            .bind(false, privateChatId)
-            .run();
+          console.log(`Unblocking user ${privateChatId}`);
+          // 检查用户记录是否存在
+          const userState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
+            .bind(privateChatId)
+            .first();
+          
+          if (!userState) {
+            console.log(`No user state found for ${privateChatId}, creating new record with is_blocked = false`);
+            await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
+              .bind(privateChatId, false)
+              .run();
+          } else {
+            console.log(`User state found for ${privateChatId}, updating is_blocked to false`);
+            await env.D1.prepare('UPDATE user_states SET is_blocked = ? WHERE chat_id = ?')
+              .bind(false, privateChatId)
+              .run();
+          }
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
         } else if (data.startsWith('toggle_verification_')) {
           const currentState = (await getSetting('verification_enabled')) === 'true';
@@ -606,6 +621,7 @@ export default {
           await setSetting('verification_enabled', newState.toString());
           await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
         } else if (data.startsWith('check_blocklist_')) {
+          console.log(`Checking blocklist`);
           const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
             .bind(true)
             .all();
@@ -621,7 +637,6 @@ export default {
         } else if (data.startsWith('github_')) {
           await sendMessageToTopic(topicId, '访问我的 GitHub 项目：https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO');
         } else if (data.startsWith('delete_user_')) {
-          // 修改删除用户逻辑，保留话题映射
           try {
             await env.D1.batch([
               env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
