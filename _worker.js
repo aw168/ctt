@@ -18,6 +18,9 @@ const settingsCache = {
   user_raw_enabled: null
 };
 
+// 缓存 chat_topic_mappings 表中的话题映射
+const topicCache = new Map();
+
 export default {
   async fetch(request, env) {
     // 加载环境变量
@@ -237,6 +240,11 @@ export default {
             if (tableName === 'settings') {
               await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
             }
+
+            // 为 chat_topic_mappings 表添加索引
+            if (tableName === 'chat_topic_mappings') {
+              await d1.exec('CREATE INDEX IF NOT EXISTS idx_chat_topic_mappings_chat_id ON chat_topic_mappings (chat_id)');
+            }
           } catch (error) {
             console.error(`Error checking ${tableName}:`, error);
             await d1.exec(`DROP TABLE IF EXISTS ${tableName}`);
@@ -253,6 +261,12 @@ export default {
         // 缓存初始值
         settingsCache.verification_enabled = (await getSetting('verification_enabled', d1)) === 'true';
         settingsCache.user_raw_enabled = (await getSetting('user_raw_enabled', d1)) === 'true';
+
+        // 初始化 topicCache
+        const topicMappings = await d1.prepare('SELECT chat_id, topic_id FROM chat_topic_mappings').all();
+        for (const { chat_id, topic_id } of topicMappings.results) {
+          topicCache.set(chat_id, topic_id);
+        }
       } catch (error) {
         console.error('Error in checkAndRepairTables:', error);
         throw error;
@@ -339,19 +353,18 @@ export default {
         return;
       }
 
-      // 检查用户状态，如果不存在则初始化
-      let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
+      // 批量查询用户状态
+      const userStateQuery = env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
+        .bind(chatId);
+      const userState = await userStateQuery.first();
 
       if (!userState) {
         await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified) VALUES (?, ?, ?, ?)')
           .bind(chatId, false, true, false)
           .run();
-        userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null };
       }
 
-      const isBlocked = userState.is_blocked || false;
+      const isBlocked = userState?.is_blocked || false;
       if (isBlocked) {
         await sendMessageToUser(chatId, "您已被拉黑，无法发送消息。请联系管理员解除拉黑。");
         return;
@@ -364,7 +377,7 @@ export default {
         }
 
         const verificationEnabled = settingsCache.verification_enabled;
-        const isFirstVerification = userState?.is_first_verification || true;
+        const isFirstVerification = userState?.is_first_verification ?? true;
 
         if (verificationEnabled && isFirstVerification) {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
@@ -379,7 +392,7 @@ export default {
       // 检查验证状态
       const verificationEnabled = settingsCache.verification_enabled;
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+      const isVerified = userState?.is_verified && userState?.verified_expiry && nowSeconds < userState.verified_expiry;
 
       if (verificationEnabled && !isVerified) {
         await sendMessageToUser(chatId, "您尚未完成验证，请完成验证后发送消息。");
@@ -397,58 +410,52 @@ export default {
         return;
       }
 
+      // 并行获取用户信息和话题 ID
+      const [userInfo, topicId] = await Promise.all([
+        getUserInfo(chatId),
+        getExistingTopicId(chatId)
+      ]);
+
+      const userName = userInfo.username || userInfo.first_name;
+      const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
+      const topicName = `${nickname}`;
+
+      let finalTopicId = topicId;
+      let shouldCreateTopic = !finalTopicId;
+
       // 转发消息
       try {
-        const userInfo = await getUserInfo(chatId);
-        const userName = userInfo.username || userInfo.first_name;
-        const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
-        const topicName = `${nickname}`;
-
-        let topicId = await getExistingTopicId(chatId);
-        if (!topicId || !(await checkTopicExists(topicId))) {
-          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
-          await saveTopicId(chatId, topicId);
-        }
-
         if (text) {
           const formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n${text}`;
-          await sendMessageToTopic(topicId, formattedMessage);
+          if (shouldCreateTopic) {
+            finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
+            await saveTopicId(chatId, finalTopicId);
+          }
+          await sendMessageToTopic(finalTopicId, formattedMessage);
         } else {
-          await copyMessageToTopic(topicId, message);
+          if (shouldCreateTopic) {
+            finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
+            await saveTopicId(chatId, finalTopicId);
+          }
+          await copyMessageToTopic(finalTopicId, message);
         }
       } catch (error) {
-        console.error(`Error handling message from chatId ${chatId}:`, error);
-        await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
-        await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
-      }
-    }
-
-    async function checkTopicExists(topicId) {
-      try {
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_thread_id: topicId,
-            text: 'Checking topic existence...'
-          })
-        });
-        const data = await response.json();
-        if (data.ok) {
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: GROUP_ID,
-              message_id: data.result.message_id
-            })
-          });
-          return true;
+        if (error.message.includes('chat not found') || error.message.includes('topic not found')) {
+          // 话题不存在，重新创建
+          finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
+          await saveTopicId(chatId, finalTopicId);
+          // 重试发送消息
+          if (text) {
+            const formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n${text}`;
+            await sendMessageToTopic(finalTopicId, formattedMessage);
+          } else {
+            await copyMessageToTopic(finalTopicId, message);
+          }
+        } else {
+          console.error(`Error handling message from chatId ${chatId}:`, error);
+          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
+          await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
         }
-        return false;
-      } catch (error) {
-        return false;
       }
     }
 
@@ -495,7 +502,7 @@ export default {
           ],
           [
             { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
-            { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' } // 修改为直接跳转链接
+            { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
           ],
           [
             { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
@@ -661,9 +668,6 @@ export default {
       } else if (data.startsWith('unblock_')) {
         action = 'unblock';
         privateChatId = parts.slice(1).join('_');
-      } else if (data.startsWith('github_')) {
-        action = 'github';
-        privateChatId = parts.slice(1).join('_');
       } else if (data.startsWith('delete_user_')) {
         action = 'delete_user';
         privateChatId = parts.slice(2).join('_');
@@ -739,14 +743,10 @@ export default {
             return;
           }
 
-          if (!(await checkTopicExists(topicId))) {
-            const userInfo = await getUserInfo(privateChatId);
-            const userName = userInfo.username || userInfo.first_name;
-            const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
-            const topicName = `${nickname}`;
-            topicId = await createForumTopic(topicName, userName, nickname, privateChatId);
-            await saveTopicId(privateChatId, topicId);
-          }
+          const userInfo = await getUserInfo(privateChatId);
+          const userName = userInfo.username || userInfo.first_name;
+          const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
+          const topicName = `${nickname}`;
 
           if (action === 'block') {
             await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
@@ -776,8 +776,6 @@ export default {
             const newState = !currentState;
             await setSetting('user_raw_enabled', newState.toString());
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
-          } else if (action === 'github') {
-            // 直接跳转链接已在 sendAdminPanel 中实现
           } else if (action === 'delete_user') {
             try {
               await env.D1.batch([
@@ -925,10 +923,19 @@ export default {
 
     async function getExistingTopicId(chatId) {
       try {
+        // 优先从缓存中获取
+        if (topicCache.has(chatId)) {
+          return topicCache.get(chatId);
+        }
+
         const mapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
           .bind(chatId)
           .first();
-        return mapping?.topic_id || null;
+        const topicId = mapping?.topic_id || null;
+        if (topicId) {
+          topicCache.set(chatId, topicId);
+        }
+        return topicId;
       } catch (error) {
         console.error(`Error fetching topic ID for chatId ${chatId}:`, error);
         throw error;
@@ -966,6 +973,8 @@ export default {
         await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
           .bind(chatId, topicId)
           .run();
+        // 更新缓存
+        topicCache.set(chatId, topicId);
       } catch (error) {
         console.error(`Error saving topic ID ${topicId} for chatId ${chatId}:`, error);
         throw error;
@@ -974,10 +983,20 @@ export default {
 
     async function getPrivateChatId(topicId) {
       try {
+        // 从缓存中查找
+        const chatId = [...topicCache.entries()].find(([_, tid]) => tid === topicId)?.[0];
+        if (chatId) {
+          return chatId;
+        }
+
         const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
           .bind(topicId)
           .first();
-        return mapping?.chat_id || null;
+        const result = mapping?.chat_id || null;
+        if (result) {
+          topicCache.set(result, topicId);
+        }
+        return result;
       } catch (error) {
         console.error(`Error fetching private chat ID for topicId ${topicId}:`, error);
         throw error;
@@ -1101,7 +1120,7 @@ export default {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 10000);
+          const timeoutId = setTimeout(() => controller.abort(), 5000); // 缩短超时时间到 5 秒
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
