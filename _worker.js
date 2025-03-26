@@ -12,6 +12,7 @@ const processedMessages = new Set(); // 用于存储已处理的消息 ID，防�
 // 调试环境变量加载
 export default {
   async fetch(request, env) {
+    // 加载环境变量
     console.log('BOT_TOKEN_ENV:', env.BOT_TOKEN_ENV || 'undefined');
     console.log('GROUP_ID_ENV:', env.GROUP_ID_ENV || 'undefined');
     console.log('MAX_MESSAGES_PER_MINUTE_ENV:', env.MAX_MESSAGES_PER_MINUTE_ENV || 'undefined');
@@ -32,23 +33,36 @@ export default {
 
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
-    // 检查 D1 绑定
+    // 检查 D1 数据库绑定（Cloudflare Workers 和 Pages 要求）
     if (!env.D1) {
       console.error('D1 database is not bound');
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
     // 在每次部署时自动检查和修复数据库表
-    await checkAndRepairTables(env.D1);
+    try {
+      await checkAndRepairTables(env.D1);
+    } catch (error) {
+      console.error('Error checking and repairing tables:', error);
+      return new Response('Database initialization error', { status: 500 });
+    }
 
     // 自动注册 webhook（仅在首次启动时执行）
     if (!isWebhookInitialized && BOT_TOKEN) {
-      await autoRegisterWebhook(request);
-      isWebhookInitialized = true; // 标记为已初始化，避免重复注册
+      try {
+        await autoRegisterWebhook(request);
+        isWebhookInitialized = true; // 标记为已初始化，避免重复注册
+      } catch (error) {
+        console.error('Error auto-registering webhook:', error);
+      }
     }
 
     // 清理过期的验证码缓存（基于时间间隔）
-    await cleanExpiredVerificationCodes(env.D1);
+    try {
+      await cleanExpiredVerificationCodes(env.D1);
+    } catch (error) {
+      console.error('Error cleaning expired verification codes:', error);
+    }
 
     // 主处理函数
     async function handleRequest(request) {
@@ -281,9 +295,16 @@ export default {
       }
 
       // 检查用户是否被拉黑
-      const userState = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
+      let userState;
+      try {
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+      } catch (error) {
+        console.error(`Error querying user state for chatId ${chatId}:`, error);
+        return;
+      }
+
       const isBlocked = userState ? userState.is_blocked : false;
       if (isBlocked) {
         console.log(`User ${chatId} is blocked, ignoring message.`);
@@ -295,22 +316,40 @@ export default {
         console.log(`Processing /start command for chatId ${chatId}`);
 
         // 检查 /start 命令频率
-        if (await checkStartCommandRate(chatId)) {
-          console.log(`User ${chatId} exceeded /start command rate limit, ignoring.`);
-          await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
+        try {
+          if (await checkStartCommandRate(chatId)) {
+            console.log(`User ${chatId} exceeded /start command rate limit, ignoring.`);
+            await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
+            return;
+          }
+        } catch (error) {
+          console.error(`Error checking start command rate for chatId ${chatId}:`, error);
           return;
         }
 
         // 初始化用户状态（如果不存在）
         if (!userState) {
           console.log(`No user state found for chatId ${chatId}, initializing...`);
-          await env.D1.prepare('INSERT INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
-            .bind(chatId, true)
-            .run();
+          try {
+            await env.D1.prepare('INSERT INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
+              .bind(chatId, true)
+              .run();
+            userState = { is_first_verification: true, is_blocked: false };
+          } catch (error) {
+            console.error(`Error initializing user state for chatId ${chatId}:`, error);
+            return;
+          }
+        }
+
+        let verificationEnabled;
+        try {
+          verificationEnabled = await getSetting('verification_enabled') === 'true';
+        } catch (error) {
+          console.error(`Error getting verification_enabled setting:`, error);
+          verificationEnabled = true; // 默认开启验证码
         }
 
         const isFirstVerification = userState ? userState.is_first_verification : true;
-        const verificationEnabled = await getSetting('verification_enabled') === 'true';
         console.log(`Verification enabled: ${verificationEnabled}, isFirstVerification: ${isFirstVerification}`);
 
         if (verificationEnabled && isFirstVerification) {
@@ -326,12 +365,23 @@ export default {
       }
 
       // 检查消息频率
-      const verificationEnabled = await getSetting('verification_enabled') === 'true';
+      let verificationEnabled;
+      try {
+        verificationEnabled = await getSetting('verification_enabled') === 'true';
+      } catch (error) {
+        console.error(`Error getting verification_enabled setting:`, error);
+        verificationEnabled = true; // 默认开启验证码
+      }
+
       if (verificationEnabled && await checkMessageRate(chatId)) {
         console.log(`User ${chatId} exceeded message rate limit, requiring verification.`);
-        await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
-          .bind(true, chatId)
-          .run();
+        try {
+          await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
+            .bind(true, chatId)
+            .run();
+        } catch (error) {
+          console.error(`Error updating rate limit for chatId ${chatId}:`, error);
+        }
         const messageContent = text || '非文本消息';
         await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n信息过于频繁，请完成验证后发送信息`);
         await handleVerification(chatId, messageId);
@@ -363,8 +413,15 @@ export default {
     }
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
-      const verificationEnabled = await getSetting('verification_enabled') === 'true';
-      const userRawEnabled = await getSetting('user_raw_enabled') === 'true';
+      let verificationEnabled, userRawEnabled;
+      try {
+        verificationEnabled = await getSetting('verification_enabled') === 'true';
+        userRawEnabled = await getSetting('user_raw_enabled') === 'true';
+      } catch (error) {
+        console.error('Error fetching settings for admin panel:', error);
+        verificationEnabled = true;
+        userRawEnabled = true;
+      }
 
       const buttons = [
         [
@@ -421,7 +478,14 @@ export default {
     }
 
     async function getVerificationSuccessMessage() {
-      const userRawEnabled = await getSetting('user_raw_enabled') === 'true';
+      let userRawEnabled;
+      try {
+        userRawEnabled = await getSetting('user_raw_enabled') === 'true';
+      } catch (error) {
+        console.error('Error fetching user_raw_enabled setting:', error);
+        userRawEnabled = true;
+      }
+
       if (!userRawEnabled) return '验证成功！您现在可以与客服聊天。';
 
       try {
@@ -465,8 +529,8 @@ export default {
         data.count += 1;
       }
 
-      await env.D1.prepare('UPDATE message_rates SET start_count = ?, start_window_start = ? WHERE chat_id = ?')
-        .bind(data.count, data.start, chatId)
+      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
+        .bind(chatId, data.count, data.start)
         .run();
 
       console.log(`User ${chatId} /start command count: ${data.count}/${maxStartsPerWindow} in last 5 minutes`);
@@ -489,8 +553,8 @@ export default {
         data.count += 1;
       }
 
-      await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
-        .bind(data.count, data.start, chatId)
+      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
+        .bind(chatId, data.count, data.start)
         .run();
 
       console.log(`User ${chatId} message count: ${data.count}/${MAX_MESSAGES_PER_MINUTE} in last minute`);
