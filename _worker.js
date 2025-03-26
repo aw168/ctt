@@ -286,6 +286,11 @@ export default {
             await sendAdminPanel(chatId, topicId, privateChatId, messageId);
             return;
           }
+          if (privateChatId && text.startsWith('/reset_user')) {
+            console.log(`Reset user command received for chatId ${chatId} in topic ${topicId}`);
+            await handleResetUser(chatId, topicId, text);
+            return;
+          }
           if (privateChatId) {
             console.log(`Forwarding message from group to private chatId ${privateChatId}`);
             await forwardMessageToPrivateChat(privateChatId, message);
@@ -295,16 +300,16 @@ export default {
       }
 
       // 检查用户状态，如果不存在则初始化
-      let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
+      let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
 
       if (!userState) {
         console.log(`No user state found for chatId ${chatId}, initializing with default values...`);
-        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
-          .bind(chatId, false, true)
+        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified) VALUES (?, ?, ?, ?)')
+          .bind(chatId, false, true, false)
           .run();
-        userState = { is_blocked: false, is_first_verification: true };
+        userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null };
       }
 
       const isBlocked = userState.is_blocked || false;
@@ -312,6 +317,7 @@ export default {
 
       if (isBlocked) {
         console.log(`User ${chatId} is blocked, ignoring message.`);
+        await sendMessageToUser(chatId, "您已被拉黑，无法发送消息。请联系管理员解除拉黑。");
         return;
       }
 
@@ -339,7 +345,18 @@ export default {
         return;
       }
 
+      // 检查验证状态
       const verificationEnabled = (await getSetting('verification_enabled')) === 'true';
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+
+      if (verificationEnabled && !isVerified) {
+        console.log(`User ${chatId} is not verified, requiring verification.`);
+        await sendMessageToUser(chatId, "您尚未完成验证，请完成验证后发送消息。");
+        await handleVerification(chatId, messageId);
+        return;
+      }
+
       if (verificationEnabled && await checkMessageRate(chatId)) {
         console.log(`User ${chatId} exceeded message rate limit, requiring verification.`);
         await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
@@ -351,26 +368,67 @@ export default {
         return;
       }
 
+      // 转发消息
       try {
+        console.log(`Fetching user info for chatId ${chatId}`);
         const userInfo = await getUserInfo(chatId);
         const userName = userInfo.username || userInfo.first_name;
         const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
         const topicName = `${nickname}`;
+        console.log(`User info for chatId ${chatId}: username=${userName}, nickname=${nickname}`);
 
         let topicId = await getExistingTopicId(chatId);
         if (!topicId) {
+          console.log(`No topic found for chatId ${chatId}, creating new topic...`);
           topicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
           await saveTopicId(chatId, topicId);
+          console.log(`Created topic ${topicId} for chatId ${chatId}`);
+        } else {
+          console.log(`Found existing topic ${topicId} for chatId ${chatId}`);
         }
 
         if (text) {
           const formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n${text}`;
+          console.log(`Sending text message to topic ${topicId}: ${formattedMessage}`);
           await sendMessageToTopic(topicId, formattedMessage);
         } else {
+          console.log(`Copying non-text message to topic ${topicId}`);
           await copyMessageToTopic(topicId, message);
         }
+        console.log(`Message from chatId ${chatId} successfully forwarded to topic ${topicId}`);
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
+        await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
+        await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
+      }
+    }
+
+    // 新增：处理 /reset_user 命令
+    async function handleResetUser(chatId, topicId, text) {
+      const senderId = chatId; // 假设 chatId 是发送者的 ID
+      const isAdmin = await checkIfAdmin(senderId);
+      if (!isAdmin) {
+        await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
+        return;
+      }
+
+      const parts = text.split(' ');
+      if (parts.length !== 2) {
+        await sendMessageToTopic(topicId, '用法：/reset_user <chat_id>');
+        return;
+      }
+
+      const targetChatId = parts[1];
+      try {
+        await env.D1.batch([
+          env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId),
+          env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId)
+          // 不删除 chat_topic_mappings，以保留话题
+        ]);
+        await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
+      } catch (error) {
+        console.error(`Error resetting user ${targetChatId}:`, error);
+        await sendMessageToTopic(topicId, `重置用户 ${targetChatId} 失败：${error.message}`);
       }
     }
 
@@ -594,11 +652,9 @@ export default {
         const privateChatId = data.split('_')[1];
         if (data.startsWith('block_')) {
           console.log(`Blocking user ${privateChatId}`);
-          // 确保记录存在，使用 INSERT OR REPLACE
           await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
             .bind(privateChatId, true)
             .run();
-          // 确认数据库状态
           const updatedState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
             .bind(privateChatId)
             .first();
@@ -606,11 +662,9 @@ export default {
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
         } else if (data.startsWith('unblock_')) {
           console.log(`Unblocking user ${privateChatId}`);
-          // 强制插入或更新记录，确保 is_blocked = false
           await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
             .bind(privateChatId, false, true)
             .run();
-          // 确认数据库状态
           const updatedState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
             .bind(privateChatId)
             .first();
@@ -643,7 +697,7 @@ export default {
             await env.D1.batch([
               env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
               env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId)
-              // 不删除 chat_topic_mappings，以保留话题关联
+              // 不删除 chat_topic_mappings，以保留话题
             ]);
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息记录已删除，话题保留。`);
           } catch (error) {
@@ -765,55 +819,80 @@ export default {
     }
 
     async function getUserInfo(chatId) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId })
-      });
-      const data = await response.json();
-      if (!data.ok) throw new Error(`Failed to get user info: ${data.description}`);
-      return data.result;
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(`Failed to get user info: ${data.description}`);
+        return data.result;
+      } catch (error) {
+        console.error(`Error fetching user info for chatId ${chatId}:`, error);
+        throw error;
+      }
     }
 
     async function getExistingTopicId(chatId) {
-      const mapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      return mapping?.topic_id || null;
+      try {
+        const mapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        return mapping?.topic_id || null;
+      } catch (error) {
+        console.error(`Error fetching topic ID for chatId ${chatId}:`, error);
+        throw error;
+      }
     }
 
     async function createForumTopic(topicName, userName, nickname, userId) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: GROUP_ID, name: topicName })
-      });
-      const data = await response.json();
-      if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
-      const topicId = data.result.message_thread_id;
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: GROUP_ID, name: topicName })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
+        const topicId = data.result.message_thread_id;
 
-      const now = new Date();
-      const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
-      const notificationContent = await getNotificationContent();
-      const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
-      const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
-      const messageId = messageResponse.result.message_id;
-      await pinMessage(topicId, messageId);
+        const now = new Date();
+        const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
+        const notificationContent = await getNotificationContent();
+        const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
+        const messageId = messageResponse.result.message_id;
+        await pinMessage(topicId, messageId);
 
-      return topicId;
+        return topicId;
+      } catch (error) {
+        console.error(`Error creating forum topic for user ${userId}:`, error);
+        throw error;
+      }
     }
 
     async function saveTopicId(chatId, topicId) {
-      await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-        .bind(chatId, topicId)
-        .run();
+      try {
+        await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
+          .bind(chatId, topicId)
+          .run();
+      } catch (error) {
+        console.error(`Error saving topic ID ${topicId} for chatId ${chatId}:`, error);
+        throw error;
+      }
     }
 
     async function getPrivateChatId(topicId) {
-      const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
-        .bind(topicId)
-        .first();
-      return mapping?.chat_id || null;
+      try {
+        const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
+          .bind(topicId)
+          .first();
+        return mapping?.chat_id || null;
+      } catch (error) {
+        console.error(`Error fetching private chat ID for topicId ${topicId}:`, error);
+        throw error;
+      }
     }
 
     async function sendMessageToTopic(topicId, text) {
@@ -822,72 +901,97 @@ export default {
         return;
       }
 
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: GROUP_ID,
-          text: text,
-          message_thread_id: topicId,
-          parse_mode: 'Markdown'
-        })
-      });
-      const data = await response.json();
-      if (!data.ok) console.error(`Failed to send message to topic: ${data.description}`);
-      return data;
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            text: text,
+            message_thread_id: topicId,
+            parse_mode: 'Markdown'
+          })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(`Failed to send message to topic: ${data.description}`);
+        return data;
+      } catch (error) {
+        console.error(`Error sending message to topic ${topicId}:`, error);
+        throw error;
+      }
     }
 
     async function copyMessageToTopic(topicId, message) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: GROUP_ID,
-          from_chat_id: message.chat.id,
-          message_id: message.message_id,
-          message_thread_id: topicId
-        })
-      });
-      const data = await response.json();
-      if (!data.ok) console.error(`Failed to copy message to topic: ${data.description}`);
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            from_chat_id: message.chat.id,
+            message_id: message.message_id,
+            message_thread_id: topicId
+          })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(`Failed to copy message to topic: ${data.description}`);
+      } catch (error) {
+        console.error(`Error copying message to topic ${topicId}:`, error);
+        throw error;
+      }
     }
 
     async function pinMessage(topicId, messageId) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: GROUP_ID,
-          message_id: messageId,
-          message_thread_id: topicId
-        })
-      });
-      const data = await response.json();
-      if (!data.ok) console.error(`Failed to pin message: ${data.description}`);
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            message_id: messageId,
+            message_thread_id: topicId
+          })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(`Failed to pin message: ${data.description}`);
+      } catch (error) {
+        console.error(`Error pinning message ${messageId} in topic ${topicId}:`, error);
+        throw error;
+      }
     }
 
     async function forwardMessageToPrivateChat(privateChatId, message) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: privateChatId,
-          from_chat_id: message.chat.id,
-          message_id: message.message_id
-        })
-      });
-      const data = await response.json();
-      if (!data.ok) console.error(`Failed to forward message to private chat: ${data.description}`);
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: privateChatId,
+            from_chat_id: message.chat.id,
+            message_id: message.message_id
+          })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(`Failed to forward message to private chat: ${data.description}`);
+      } catch (error) {
+        console.error(`Error forwarding message to private chat ${privateChatId}:`, error);
+        throw error;
+      }
     }
 
     async function sendMessageToUser(chatId, text) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: text })
-      });
-      const data = await response.json();
-      if (!data.ok) console.error(`Failed to send message to user: ${data.description}`);
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, text: text })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(`Failed to send message to user: ${data.description}`);
+      } catch (error) {
+        console.error(`Error sending message to user ${chatId}:`, error);
+        throw error;
+      }
     }
 
     async function fetchWithRetry(url, options, retries = 5, backoff = 2000) {
