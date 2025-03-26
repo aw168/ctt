@@ -262,7 +262,7 @@ export default {
       }
 
       // 检查用户是否被拉黑
-      const userState = await env.D1.prepare('SELECT is_blocked, is_verified, verified_expiry, is_first_verification FROM user_states WHERE chat_id = ?')
+      const userState = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
       const isBlocked = userState ? userState.is_blocked : false;
@@ -271,9 +271,6 @@ export default {
         return;
       }
 
-      // 检查用户是否已经验证且验证未过期
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      const isVerified = userState && userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
       const isFirstVerification = userState ? userState.is_first_verification : true;
 
       // 处理 /start 命令，确保不转发
@@ -294,29 +291,16 @@ export default {
             .run();
         }
 
-        // 如果用户已经验证且验证未过期，直接发送欢迎消息
-        if (isVerified) {
-          const successMessage = await getVerificationSuccessMessage();
-          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
-          return;
-        }
-
-        // 如果是首次验证，触发验证流程
         if (isFirstVerification) {
+          // 首次使用，发送欢迎消息并触发验证
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
           await handleVerification(chatId, messageId);
         } else {
-          // 如果不是首次验证但验证已过期，触发新的验证
-          await sendMessageToUser(chatId, "您的验证已过期，请重新验证以继续使用！");
-          await handleVerification(chatId, messageId);
+          // 非首次使用，直接发送欢迎消息
+          const successMessage = await getVerificationSuccessMessage();
+          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
         }
         return; // 确保 /start 不被转发
-      }
-
-      // 如果用户未验证且不是首次验证（可能是验证过期），需要重新验证
-      if (!isVerified) {
-        await sendMessageToUser(chatId, "您尚未完成验证或验证已过期，请使用 /start 命令重新验证！");
-        return;
       }
 
       // 检查消息频率（防刷）
