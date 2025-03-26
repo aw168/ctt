@@ -294,11 +294,22 @@ export default {
         return;
       }
 
+      // 检查用户状态，如果不存在则初始化
       let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
 
-      const isBlocked = userState?.is_blocked || false;
+      if (!userState) {
+        console.log(`No user state found for chatId ${chatId}, initializing with default values...`);
+        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
+          .bind(chatId, false, true)
+          .run();
+        userState = { is_blocked: false, is_first_verification: true };
+      }
+
+      const isBlocked = userState.is_blocked || false;
+      console.log(`User ${chatId} is_blocked status: ${isBlocked}`);
+
       if (isBlocked) {
         console.log(`User ${chatId} is blocked, ignoring message.`);
         return;
@@ -311,14 +322,6 @@ export default {
           console.log(`User ${chatId} exceeded /start command rate limit, ignoring.`);
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
           return;
-        }
-
-        if (!userState) {
-          console.log(`No user state found for chatId ${chatId}, initializing...`);
-          await env.D1.prepare('INSERT INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
-            .bind(chatId, true)
-            .run();
-          userState = { is_first_verification: true, is_blocked: false };
         }
 
         const verificationEnabled = (await getSetting('verification_enabled')) === 'true';
@@ -595,25 +598,23 @@ export default {
           await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
             .bind(privateChatId, true)
             .run();
+          // 确认数据库状态
+          const updatedState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
+            .bind(privateChatId)
+            .first();
+          console.log(`After blocking, user ${privateChatId} is_blocked status: ${updatedState?.is_blocked}`);
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
         } else if (data.startsWith('unblock_')) {
           console.log(`Unblocking user ${privateChatId}`);
-          // 检查用户记录是否存在
-          const userState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
+          // 强制插入或更新记录，确保 is_blocked = false
+          await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
+            .bind(privateChatId, false, true)
+            .run();
+          // 确认数据库状态
+          const updatedState = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
             .bind(privateChatId)
             .first();
-          
-          if (!userState) {
-            console.log(`No user state found for ${privateChatId}, creating new record with is_blocked = false`);
-            await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
-              .bind(privateChatId, false)
-              .run();
-          } else {
-            console.log(`User state found for ${privateChatId}, updating is_blocked to false`);
-            await env.D1.prepare('UPDATE user_states SET is_blocked = ? WHERE chat_id = ?')
-              .bind(false, privateChatId)
-              .run();
-          }
+          console.log(`After unblocking, user ${privateChatId} is_blocked status: ${updatedState?.is_blocked}`);
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
         } else if (data.startsWith('toggle_verification_')) {
           const currentState = (await getSetting('verification_enabled')) === 'true';
@@ -625,6 +626,7 @@ export default {
           const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
             .bind(true)
             .all();
+          console.log(`Blocked users query result: ${JSON.stringify(blockedUsers.results)}`);
           const blockList = blockedUsers.results.length > 0 
             ? blockedUsers.results.map(row => row.chat_id).join('\n')
             : '当前没有被拉黑的用户。';
