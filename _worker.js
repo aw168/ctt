@@ -301,7 +301,7 @@ export default {
         }
 
         if (text) {
-          const formattedMessage = rawDisplayEnabled && text.includes('raw.githubusercontent') 
+          const formattedMessage = rawDisplayEnabled && text.includes('raw.githubusercontent.com') 
             ? `*${nickname}:*\n------------------------------------------------\n\n${text}\n\n[Raw Content](https://raw.githubusercontent.com${text.split('raw.githubusercontent.com')[1]})`
             : `*${nickname}:*\n------------------------------------------------\n\n${text}`;
           await sendMessageToTopic(topicId, formattedMessage);
@@ -380,6 +380,7 @@ export default {
 
     async function checkIfAdmin(userId) {
       try {
+        console.log(`Checking admin status for userId: ${userId} in group: ${GROUP_ID}`);
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -389,7 +390,14 @@ export default {
           }),
         });
         const data = await response.json();
-        return data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
+        console.log(`getChatMember response: ${JSON.stringify(data, null, 2)}`);
+        if (!data.ok) {
+          console.error(`Failed to check admin status: ${data.description}`);
+          return false;
+        }
+        const status = data.result.status;
+        console.log(`User ${userId} status: ${status}`);
+        return status === 'administrator' || status === 'creator';
       } catch (error) {
         console.error("Error checking admin status:", error);
         return false;
