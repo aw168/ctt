@@ -27,6 +27,9 @@ const messageRateCache = new Map();
 // 缓存用户信息
 const userInfoCache = new Map();
 
+// 缓存 admin.md 内容
+let adminPanelMessageCache = '';
+
 export default {
   async fetch(request, env) {
     // 加载环境变量
@@ -52,6 +55,19 @@ export default {
       await checkAndRepairTables(env.D1);
     } catch (error) {
       return new Response('Database initialization error', { status: 500 });
+    }
+
+    // 初始化 adminPanelMessageCache
+    if (!adminPanelMessageCache) {
+      try {
+        const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/admin.md');
+        if (response.ok) {
+          adminPanelMessageCache = await response.text();
+          adminPanelMessageCache = adminPanelMessageCache.trim() || '';
+        }
+      } catch (error) {
+        adminPanelMessageCache = '';
+      }
     }
 
     if (!isWebhookInitialized && BOT_TOKEN) {
@@ -316,6 +332,7 @@ export default {
     }
 
     async function onMessage(message) {
+      const startTime = Date.now(); // 记录开始时间
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
@@ -349,7 +366,7 @@ export default {
           is_first_verification: true,
           is_rate_limited: false
         };
-        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified) VALUES (?, ?, ?, ?)')
+        env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified) VALUES (?, ?, ?, ?)')
           .bind(chatId, false, true, false)
           .run();
         userStateCache.set(chatId, userState);
@@ -390,9 +407,10 @@ export default {
         return;
       }
 
+      const rateCheckTime = Date.now();
       if (verificationEnabled && await checkMessageRate(chatId)) {
         userState.is_rate_limited = true;
-        await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
+        env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
           .bind(true, chatId)
           .run();
         const messageContent = text || '非文本消息';
@@ -400,12 +418,15 @@ export default {
         await handleVerification(chatId, messageId);
         return;
       }
+      console.log(`Rate check took ${Date.now() - rateCheckTime}ms`);
 
       // 并行获取用户信息和话题 ID
+      const userInfoTime = Date.now();
       const [userInfo, topicId] = await Promise.all([
         getUserInfo(chatId),
         getExistingTopicId(chatId)
       ]);
+      console.log(`User info and topic ID fetch took ${Date.now() - userInfoTime}ms`);
 
       const userName = userInfo.username || userInfo.first_name;
       const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
@@ -416,30 +437,18 @@ export default {
       let shouldCreateTopic = !finalTopicId;
 
       // 转发消息
-      try {
-        if (shouldCreateTopic) {
-          finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
-          await saveTopicId(chatId, finalTopicId);
-        }
-        if (text) {
-          await sendMessageToTopic(finalTopicId, formattedMessage);
-        } else {
-          await copyMessageToTopic(finalTopicId, message);
-        }
-      } catch (error) {
-        if (error.message.includes('chat not found') || error.message.includes('topic not found')) {
-          finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
-          await saveTopicId(chatId, finalTopicId);
-          if (text) {
-            await sendMessageToTopic(finalTopicId, formattedMessage);
-          } else {
-            await copyMessageToTopic(finalTopicId, message);
-          }
-        } else {
-          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
-          await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
-        }
+      const forwardTime = Date.now();
+      if (shouldCreateTopic) {
+        finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
+        saveTopicId(chatId, finalTopicId); // 异步保存
       }
+      if (text) {
+        await sendMessageToTopic(finalTopicId, formattedMessage);
+      } else {
+        await copyMessageToTopic(finalTopicId, message);
+      }
+      console.log(`Forwarding message took ${Date.now() - forwardTime}ms`);
+      console.log(`Total message handling took ${Date.now() - startTime}ms`);
     }
 
     async function handleResetUser(chatId, topicId, text) {
@@ -467,17 +476,11 @@ export default {
     }
 
     async function getAdminPanelMessage() {
-      try {
-        const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/admin.md');
-        if (!response.ok) return '';
-        const content = await response.text();
-        return content.trim() || '';
-      } catch (error) {
-        return '';
-      }
+      return adminPanelMessageCache;
     }
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
+      const startTime = Date.now();
       const verificationEnabled = settingsCache.verification_enabled;
       const userRawEnabled = settingsCache.user_raw_enabled;
 
@@ -512,6 +515,7 @@ export default {
         })
       });
 
+      // 异步删除消息
       fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -520,6 +524,8 @@ export default {
           message_id: messageId
         })
       });
+
+      console.log(`Admin panel response took ${Date.now() - startTime}ms`);
     }
 
     async function getVerificationSuccessMessage() {
@@ -550,7 +556,8 @@ export default {
       }
 
       messageRateCache.set(chatId, rateData);
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
+      // 异步更新数据库
+      env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
         .bind(chatId, rateData.start_count, rateData.start_window_start)
         .run();
 
@@ -570,7 +577,8 @@ export default {
       }
 
       messageRateCache.set(chatId, rateData);
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
+      // 异步更新数据库
+      env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
         .bind(chatId, rateData.message_count, rateData.window_start)
         .run();
 
@@ -856,15 +864,19 @@ export default {
         return userInfoCache.get(chatId);
       }
 
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+      // 返回默认值并异步加载用户信息
+      const defaultUserInfo = { first_name: "Unknown", last_name: "", username: "unknown", id: chatId };
+      fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId })
+      }).then(async response => {
+        const data = await response.json();
+        if (data.ok) {
+          userInfoCache.set(chatId, data.result);
+        }
       });
-      const data = await response.json();
-      if (!data.ok) throw new Error(`Failed to get user info: ${data.description}`);
-      userInfoCache.set(chatId, data.result);
-      return data.result;
+      return defaultUserInfo;
     }
 
     async function getExistingTopicId(chatId) {
@@ -925,10 +937,11 @@ export default {
     }
 
     async function saveTopicId(chatId, topicId) {
-      await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
+      topicCache.set(chatId, topicId);
+      // 异步保存到数据库
+      env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
         .bind(chatId, topicId)
         .run();
-      topicCache.set(chatId, topicId);
     }
 
     async function getPrivateChatId(topicId) {
@@ -1018,11 +1031,11 @@ export default {
       }
     }
 
-    async function fetchWithRetry(url, options, retries = 2, backoff = 500) {
+    async function fetchWithRetry(url, options, retries = 1, backoff = 500) {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 2000); // 缩短超时时间到 2 秒
+          const timeoutId = setTimeout(() => controller.abort(), 1500); // 缩短超时时间到 1.5 秒
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
