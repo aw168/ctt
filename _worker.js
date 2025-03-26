@@ -682,9 +682,41 @@ export default {
       console.log(`Processing callback query from chatId ${chatId}, topicId ${topicId}: ${data}`);
 
       // 提取 action 和 privateChatId
-      const [action, ...rest] = data.split('_');
-      const privateChatId = rest.join('_'); // 防止 ID 中包含下划线时被截断
-      console.log(`Action: ${action}, privateChatId: ${privateChatId}`);
+      // 修改解析逻辑，确保正确提取完整的 action
+      const parts = data.split('_');
+      let action;
+      let privateChatId;
+
+      if (data.startsWith('verify_')) {
+        action = 'verify';
+        privateChatId = parts[1]; // verify_<chatId>_<option>_<result>
+      } else if (data.startsWith('toggle_verification_')) {
+        action = 'toggle_verification';
+        privateChatId = parts.slice(2).join('_');
+      } else if (data.startsWith('toggle_user_raw_')) {
+        action = 'toggle_user_raw';
+        privateChatId = parts.slice(3).join('_');
+      } else if (data.startsWith('check_blocklist_')) {
+        action = 'check_blocklist';
+        privateChatId = parts.slice(2).join('_');
+      } else if (data.startsWith('block_')) {
+        action = 'block';
+        privateChatId = parts.slice(1).join('_');
+      } else if (data.startsWith('unblock_')) {
+        action = 'unblock';
+        privateChatId = parts.slice(1).join('_');
+      } else if (data.startsWith('github_')) {
+        action = 'github';
+        privateChatId = parts.slice(1).join('_');
+      } else if (data.startsWith('delete_user_')) {
+        action = 'delete_user';
+        privateChatId = parts.slice(2).join('_');
+      } else {
+        action = data;
+        privateChatId = '';
+      }
+
+      console.log(`Parsed action: ${action}, privateChatId: ${privateChatId}`);
 
       try {
         if (action === 'verify') {
@@ -756,6 +788,18 @@ export default {
           }
 
           console.log(`Processing admin action: ${action} for privateChatId ${privateChatId}`);
+
+          // 检查话题是否有效，如果无效则重新创建
+          if (!(await checkTopicExists(topicId))) {
+            console.log(`Topic ${topicId} is invalid, attempting to recreate for privateChatId ${privateChatId}`);
+            const userInfo = await getUserInfo(privateChatId);
+            const userName = userInfo.username || userInfo.first_name;
+            const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
+            const topicName = `${nickname}`;
+            topicId = await createForumTopic(topicName, userName, nickname, privateChatId);
+            await saveTopicId(privateChatId, topicId);
+            console.log(`Recreated topic ${topicId} for privateChatId ${privateChatId}`);
+          }
 
           if (action === 'block') {
             console.log(`Blocking user ${privateChatId}`);
