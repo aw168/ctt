@@ -21,6 +21,9 @@ const topicCache = new Map();
 // 缓存 user_states 表中的用户状态
 const userStateCache = new Map();
 
+// 缓存 message_rates 表中的消息速率
+const messageRateCache = new Map();
+
 export default {
   async fetch(request, env) {
     // 加载环境变量
@@ -250,6 +253,11 @@ export default {
             if (tableName === 'user_states') {
               await d1.exec('CREATE INDEX IF NOT EXISTS idx_user_states_chat_id ON user_states (chat_id)');
             }
+
+            // 为 message_rates 表添加索引
+            if (tableName === 'message_rates') {
+              await d1.exec('CREATE INDEX IF NOT EXISTS idx_message_rates_chat_id ON message_rates (chat_id)');
+            }
           } catch (error) {
             console.error(`Error checking ${tableName}:`, error);
             await d1.exec(`DROP TABLE IF EXISTS ${tableName}`);
@@ -282,6 +290,17 @@ export default {
             verified_expiry: state.verified_expiry || null,
             is_first_verification: state.is_first_verification || false,
             is_rate_limited: state.is_rate_limited || false
+          });
+        }
+
+        // 初始化 messageRateCache
+        const messageRates = await d1.prepare('SELECT chat_id, message_count, window_start, start_count, start_window_start FROM message_rates').all();
+        for (const rate of messageRates.results) {
+          messageRateCache.set(rate.chat_id, {
+            message_count: rate.message_count || 0,
+            window_start: rate.window_start || Date.now(),
+            start_count: rate.start_count || 0,
+            start_window_start: rate.start_window_start || Date.now()
           });
         }
       } catch (error) {
@@ -432,9 +451,10 @@ export default {
 
       if (verificationEnabled && await checkMessageRate(chatId)) {
         userState.is_rate_limited = true;
-        await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
+        env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
           .bind(true, chatId)
-          .run();
+          .run()
+          .catch(error => console.error(`Error updating rate limit for ${chatId}:`, error));
         const messageContent = text || '非文本消息';
         await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n信息过于频繁，请完成验证后发送信息`);
         await handleVerification(chatId, messageId);
@@ -454,36 +474,30 @@ export default {
       let finalTopicId = topicId;
       let shouldCreateTopic = !finalTopicId;
 
+      // 提前准备消息内容
+      const formattedMessage = text ? `*${nickname}:*\n------------------------------------------------\n\n${text}` : null;
+
       // 转发消息
       try {
-        if (text) {
-          const formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n${text}`;
-          if (shouldCreateTopic) {
-            finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
-            await saveTopicId(chatId, finalTopicId);
-          }
+        if (shouldCreateTopic) {
+          finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
+          await saveTopicId(chatId, finalTopicId);
+        }
+        if (formattedMessage) {
           await sendMessageToTopic(finalTopicId, formattedMessage);
         } else {
-          if (shouldCreateTopic) {
-            finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
-            await saveTopicId(chatId, finalTopicId);
-          }
           await copyMessageToTopic(finalTopicId, message);
         }
       } catch (error) {
         if (error.message.includes('chat not found') || error.message.includes('topic not found')) {
-          // 话题不存在，重新创建
           finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
           await saveTopicId(chatId, finalTopicId);
-          // 重试发送消息
-          if (text) {
-            const formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n${text}`;
+          if (formattedMessage) {
             await sendMessageToTopic(finalTopicId, formattedMessage);
           } else {
             await copyMessageToTopic(finalTopicId, message);
           }
         } else {
-          console.error(`Error handling message from chatId ${chatId}:`, error);
           await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
           await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
         }
@@ -511,6 +525,7 @@ export default {
           env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId)
         ]);
         userStateCache.delete(targetChatId);
+        messageRateCache.delete(targetChatId);
         await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
       } catch (error) {
         console.error(`Error resetting user ${targetChatId}:`, error);
@@ -574,9 +589,7 @@ export default {
             chat_id: chatId,
             message_id: messageId
           })
-        }).catch(error => {
-          console.error(`Error deleting message ${messageId}:`, error);
-        });
+        }).catch(error => console.error(`Error deleting message ${messageId}:`, error));
       } catch (error) {
         console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
       }
@@ -614,10 +627,13 @@ export default {
       const window = 5 * 60 * 1000;
       const maxStartsPerWindow = 1;
 
-      const rateData = await env.D1.prepare('SELECT start_count, start_window_start FROM message_rates WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      let data = rateData ? { count: rateData.start_count, start: rateData.start_window_start } : { count: 0, start: now };
+      let rateData = messageRateCache.get(chatId);
+      if (!rateData) {
+        rateData = { start_count: 0, start_window_start: now };
+        messageRateCache.set(chatId, rateData);
+      }
+
+      let data = { count: rateData.start_count, start: rateData.start_window_start };
 
       if (now - data.start > window) {
         data.count = 1;
@@ -626,9 +642,15 @@ export default {
         data.count += 1;
       }
 
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
+      rateData.start_count = data.count;
+      rateData.start_window_start = data.start;
+      messageRateCache.set(chatId, rateData);
+
+      // 异步更新数据库
+      env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
         .bind(chatId, data.count, data.start)
-        .run();
+        .run()
+        .catch(error => console.error(`Error updating message_rates for ${chatId}:`, error));
 
       return data.count > maxStartsPerWindow;
     }
@@ -637,10 +659,13 @@ export default {
       const now = Date.now();
       const window = 60 * 1000;
 
-      const rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      let data = rateData ? { count: rateData.message_count, start: rateData.window_start } : { count: 0, start: now };
+      let rateData = messageRateCache.get(chatId);
+      if (!rateData) {
+        rateData = { message_count: 0, window_start: now, start_count: 0, start_window_start: now };
+        messageRateCache.set(chatId, rateData);
+      }
+
+      let data = { count: rateData.message_count, start: rateData.window_start };
 
       if (now - data.start > window) {
         data.count = 1;
@@ -649,9 +674,15 @@ export default {
         data.count += 1;
       }
 
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
+      rateData.message_count = data.count;
+      rateData.window_start = data.start;
+      messageRateCache.set(chatId, rateData);
+
+      // 异步更新数据库
+      env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
         .bind(chatId, data.count, data.start)
-        .run();
+        .run()
+        .catch(error => console.error(`Error updating message_rates for ${chatId}:`, error));
 
       return data.count > MAX_MESSAGES_PER_MINUTE;
     }
@@ -842,6 +873,7 @@ export default {
                 env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId)
               ]);
               userStateCache.delete(privateChatId);
+              messageRateCache.delete(privateChatId);
               await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息记录已删除，话题保留。`);
             } catch (error) {
               console.error(`Error deleting user ${privateChatId}:`, error);
@@ -1009,17 +1041,7 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
-        const topicId = data.result.message_thread_id;
-
-        const now = new Date();
-        const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
-        const notificationContent = await getNotificationContent();
-        const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
-        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
-        const messageId = messageResponse.result.message_id;
-        await pinMessage(topicId, messageId);
-
-        return topicId;
+        return data.result.message_thread_id;
       } catch (error) {
         console.error(`Error creating forum topic for user ${userId}:`, error);
         throw error;
@@ -1084,7 +1106,6 @@ export default {
         }
         return data;
       } catch (error) {
-        console.error(`Error sending message to topic ${topicId}:`, error);
         throw error;
       }
     }
@@ -1107,29 +1128,6 @@ export default {
           throw new Error(`Failed to copy message to topic: ${data.description}`);
         }
       } catch (error) {
-        console.error(`Error copying message to topic ${topicId}:`, error);
-        throw error;
-      }
-    }
-
-    async function pinMessage(topicId, messageId) {
-      try {
-        const requestBody = {
-          chat_id: GROUP_ID,
-          message_id: messageId,
-          message_thread_id: topicId
-        };
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(requestBody)
-        });
-        const data = await response.json();
-        if (!data.ok) {
-          throw new Error(`Failed to pin message: ${data.description}`);
-        }
-      } catch (error) {
-        console.error(`Error pinning message ${messageId} in topic ${topicId}:`, error);
         throw error;
       }
     }
@@ -1174,11 +1172,11 @@ export default {
       }
     }
 
-    async function fetchWithRetry(url, options, retries = 3, backoff = 500) {
+    async function fetchWithRetry(url, options, retries = 2, backoff = 300) {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 3000); // 进一步缩短超时时间到 3 秒
+          const timeoutId = setTimeout(() => controller.abort(), 1000); // 缩短超时时间到 1 秒
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
