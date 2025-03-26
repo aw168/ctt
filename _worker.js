@@ -128,7 +128,7 @@ export default {
               topic_id: 'TEXT NOT NULL'
             }
           },
-          settings: { // 新增设置表
+          settings: {
             columns: {
               key: 'TEXT PRIMARY KEY',
               value: 'TEXT'
@@ -243,21 +243,25 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
+      // 处理后台群组消息
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
           if (privateChatId && text === '/admin') {
+            console.log(`Admin panel requested by chatId ${chatId} in topic ${topicId}`);
             await sendAdminPanel(chatId, topicId, privateChatId, messageId);
             return;
           }
           if (privateChatId) {
+            console.log(`Forwarding message from group to private chatId ${privateChatId}`);
             await forwardMessageToPrivateChat(privateChatId, message);
           }
         }
         return;
       }
 
+      // 处理用户消息
       const userState = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -270,8 +274,9 @@ export default {
       const isFirstVerification = userState ? userState.is_first_verification : true;
       const verificationEnabled = await getSetting('verification_enabled') === 'true';
 
+      // 处理 /start 命令
       if (text === '/start') {
-        console.log(`Received /start command from ${chatId}, processing without forwarding...`);
+        console.log(`Received /start command from chatId ${chatId}`);
         if (await checkStartCommandRate(chatId)) {
           console.log(`User ${chatId} exceeded /start command rate limit, ignoring.`);
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
@@ -279,21 +284,25 @@ export default {
         }
 
         if (!userState) {
+          console.log(`No user state found for chatId ${chatId}, initializing...`);
           await env.D1.prepare('INSERT INTO user_states (chat_id, is_first_verification) VALUES (?, ?)')
             .bind(chatId, true)
             .run();
         }
 
         if (verificationEnabled && isFirstVerification) {
+          console.log(`First verification required for chatId ${chatId}, sending verification...`);
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
           await handleVerification(chatId, messageId);
         } else {
+          console.log(`No verification required for chatId ${chatId}, sending welcome message...`);
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
         }
         return;
       }
 
+      // 检查消息频率
       if (verificationEnabled && await checkMessageRate(chatId)) {
         console.log(`User ${chatId} exceeded message rate limit, requiring verification.`);
         await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
@@ -305,6 +314,7 @@ export default {
         return;
       }
 
+      // 处理普通消息，转发到群组
       try {
         const userInfo = await getUserInfo(chatId);
         const userName = userInfo.username || userInfo.first_name;
@@ -482,9 +492,14 @@ export default {
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
 
+      // 处理验证码验证回调
       if (data.startsWith('verify_')) {
+        console.log(`Processing verification callback for chatId ${chatId}`);
         const [, userChatId, selectedAnswer, result] = data.split('_');
-        if (userChatId !== chatId) return;
+        if (userChatId !== chatId) {
+          console.log(`ChatId mismatch: expected ${userChatId}, got ${chatId}`);
+          return;
+        }
 
         const verificationState = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
           .bind(chatId)
@@ -493,11 +508,13 @@ export default {
         const codeExpiry = verificationState ? verificationState.code_expiry : null;
         const nowSeconds = Math.floor(Date.now() / 1000);
         if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
+          console.log(`Verification code expired or not found for chatId ${chatId}`);
           await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
           return;
         }
 
         if (result === 'correct') {
+          console.log(`Verification successful for chatId ${chatId}`);
           const verifiedExpiry = nowSeconds + 3600; // 1 小时有效期，仅用于记录
           await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
             .bind(true, verifiedExpiry, chatId)
@@ -513,17 +530,20 @@ export default {
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
 
           if (isFirstVerification) {
+            console.log(`Marking first verification as complete for chatId ${chatId}`);
             await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
               .bind(false, chatId)
               .run();
           }
 
           if (isRateLimited) {
+            console.log(`Clearing rate limit for chatId ${chatId}`);
             await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
               .bind(false, chatId)
               .run();
           }
         } else {
+          console.log(`Verification failed for chatId ${chatId}, retrying...`);
           await sendMessageToUser(chatId, '验证失败，请重新尝试。');
           await handleVerification(chatId, messageId);
         }
@@ -536,22 +556,28 @@ export default {
             message_id: messageId
           })
         });
-      } else if (data.startsWith('block_') || data.startsWith('unblock_') || data.startsWith('toggle_verification_') || 
-                 data.startsWith('check_blocklist_') || data.startsWith('toggle_user_raw_') || data.startsWith('github_')) {
+      } 
+      // 处理管理员按钮回调
+      else if (data.startsWith('block_') || data.startsWith('unblock_') || data.startsWith('toggle_verification_') || 
+               data.startsWith('check_blocklist_') || data.startsWith('toggle_user_raw_') || data.startsWith('github_')) {
+        console.log(`Processing admin button callback: ${data}`);
         const senderId = callbackQuery.from.id.toString();
         const isAdmin = await checkIfAdmin(senderId);
         if (!isAdmin) {
+          console.log(`User ${senderId} is not an admin, rejecting action`);
           await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
           return;
         }
 
         const privateChatId = data.split('_')[1];
         if (data.startsWith('block_')) {
+          console.log(`Blocking user ${privateChatId}`);
           await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
             .bind(privateChatId, true)
             .run();
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
         } else if (data.startsWith('unblock_')) {
+          console.log(`Unblocking user ${privateChatId}`);
           await env.D1.prepare('UPDATE user_states SET is_blocked = ? WHERE chat_id = ?')
             .bind(false, privateChatId)
             .run();
@@ -559,9 +585,11 @@ export default {
         } else if (data.startsWith('toggle_verification_')) {
           const currentState = await getSetting('verification_enabled') === 'true';
           const newState = !currentState;
+          console.log(`Toggling verification: ${currentState} -> ${newState}`);
           await setSetting('verification_enabled', newState.toString());
           await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
         } else if (data.startsWith('check_blocklist_')) {
+          console.log(`Checking blocklist`);
           const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
             .bind(true)
             .all();
@@ -572,9 +600,11 @@ export default {
         } else if (data.startsWith('toggle_user_raw_')) {
           const currentState = await getSetting('user_raw_enabled') === 'true';
           const newState = !currentState;
+          console.log(`Toggling user raw: ${currentState} -> ${newState}`);
           await setSetting('user_raw_enabled', newState.toString());
           await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
         } else if (data.startsWith('github_')) {
+          console.log(`Sending GitHub link`);
           await sendMessageToTopic(topicId, '访问我的 GitHub 项目：https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO');
         }
 
@@ -591,6 +621,7 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
+      console.log(`Handling verification for chatId ${chatId}`);
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
         .run();
@@ -621,6 +652,7 @@ export default {
     }
 
     async function sendVerification(chatId) {
+      console.log(`Sending verification to chatId ${chatId}`);
       const num1 = Math.floor(Math.random() * 10);
       const num2 = Math.floor(Math.random() * 10);
       const operation = Math.random() > 0.5 ? '+' : '-';
