@@ -886,13 +886,17 @@ export default {
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
             try {
+              // 删除用户状态、消息速率和话题映射
               await env.D1.batch([
                 env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
-                env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId)
+                env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId),
+                env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId)
               ]);
+              // 清理缓存
               userStateCache.delete(privateChatId);
               messageRateCache.delete(privateChatId);
-              await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息记录已删除，话题保留。`);
+              topicCache.delete(privateChatId);
+              await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，请手动删除对应话题以完成重置。`);
             } catch (error) {
               console.error(`Error deleting user ${privateChatId}:`, error);
               await sendMessageToTopic(topicId, `删除用户 ${privateChatId} 失败：${error.message}`);
@@ -1047,6 +1051,7 @@ export default {
           if (data.ok) {
             return topicId;
           } else {
+            // 话题不存在，清理缓存和数据库
             topicCache.delete(chatId);
             await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
               .bind(chatId)
