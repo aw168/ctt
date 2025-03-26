@@ -675,7 +675,8 @@ export default {
 
     async function onCallbackQuery(callbackQuery) {
       const chatId = callbackQuery.message.chat.id.toString();
-      const topicId = callbackQuery.message.message_thread_id;
+      // 修改：将 const 改为 let，允许 topicId 被重新赋值
+      let topicId = callbackQuery.message.message_thread_id;
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
 
