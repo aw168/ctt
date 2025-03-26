@@ -2,13 +2,14 @@
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
+let BOT_API_URL;
 
 // 全局变量，用于控制清理频率和 webhook 初始化
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
 let isWebhookInitialized = false; // 用于标记 webhook 是否已初始化
 const processedMessages = new Set(); // 用于存储已处理的消息 ID，防止重复处理
-const processingCallbacks = new Set(); // 用于存储正在处理的 callback_query.id
+const processingActions = new Map(); // 用于存储正在处理的 chatId:action 组合
 
 // 缓存 settings 表中的常用值
 const settingsCache = {
@@ -34,6 +35,10 @@ const adminCache = new Map();
 // 缓存 admin.md 内容
 let adminPanelMessageCache = '';
 
+// 消息队列，用于批量发送
+const messageQueue = [];
+let isProcessingQueue = false;
+
 export default {
   async fetch(request, env) {
     // 加载环境变量
@@ -52,6 +57,7 @@ export default {
     }
 
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
+    BOT_API_URL = env.BOT_API_URL || 'https://api.telegram.org'; // 支持自定义 Telegram API 节点
 
     if (!env.D1) {
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
@@ -122,7 +128,7 @@ export default {
 
     async function autoRegisterWebhook(request) {
       const webhookUrl = `${new URL(request.url).origin}/webhook`;
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+      await fetch(`${BOT_API_URL}/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: webhookUrl }),
@@ -130,7 +136,7 @@ export default {
     }
 
     async function checkBotPermissions() {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+      const response = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/getChat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: GROUP_ID })
@@ -138,7 +144,7 @@ export default {
       const data = await response.json();
       if (!data.ok) return;
 
-      const memberResponse = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+      const memberResponse = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/getChatMember`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -149,7 +155,7 @@ export default {
     }
 
     async function getBotId() {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`, {
+      const response = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/getMe`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({})
@@ -340,6 +346,7 @@ export default {
     }
 
     async function onMessage(message) {
+      const startTime = Date.now();
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
@@ -423,10 +430,13 @@ export default {
       }
 
       // 并行获取用户信息和话题 ID
+      const userInfoStart = Date.now();
       const [userInfo, topicId] = await Promise.all([
         getUserInfo(chatId),
         getExistingTopicId(chatId)
       ]);
+      const userInfoEnd = Date.now();
+      console.log(`getUserInfo took ${userInfoEnd - userInfoStart}ms`);
 
       const userName = userInfo.username || userInfo.first_name;
       const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
@@ -452,12 +462,54 @@ export default {
       let finalTopicId = topicId;
       let shouldCreateTopic = !finalTopicId;
 
-      // 转发消息
+      // 转发消息（加入消息队列）
       if (shouldCreateTopic) {
+        const createTopicStart = Date.now();
         finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
+        const createTopicEnd = Date.now();
+        console.log(`createForumTopic took ${createTopicEnd - createTopicStart}ms`);
         saveTopicId(chatId, finalTopicId); // 异步保存，不等待
       }
-      await sendMessageToTopic(finalTopicId, formattedMessage);
+
+      messageQueue.push({ topicId: finalTopicId, text: formattedMessage });
+      processMessageQueue();
+
+      const endTime = Date.now();
+      console.log(`Total onMessage took ${endTime - startTime}ms`);
+    }
+
+    async function processMessageQueue() {
+      if (isProcessingQueue || messageQueue.length === 0) {
+        return;
+      }
+
+      isProcessingQueue = true;
+      try {
+        const messagesToSend = [...messageQueue];
+        messageQueue.length = 0;
+
+        // 按 topicId 分组，批量发送
+        const messagesByTopic = messagesToSend.reduce((acc, msg) => {
+          if (!acc[msg.topicId]) {
+            acc[msg.topicId] = [];
+          }
+          acc[msg.topicId].push(msg.text);
+          return acc;
+        }, {});
+
+        for (const [topicId, texts] of Object.entries(messagesByTopic)) {
+          const combinedText = texts.join('\n\n');
+          const sendStart = Date.now();
+          await sendMessageToTopic(topicId, combinedText);
+          const sendEnd = Date.now();
+          console.log(`sendMessageToTopic for topic ${topicId} took ${sendEnd - sendStart}ms`);
+        }
+      } finally {
+        isProcessingQueue = false;
+        if (messageQueue.length > 0) {
+          processMessageQueue();
+        }
+      }
     }
 
     async function handleResetUser(chatId, topicId, text) {
@@ -515,7 +567,7 @@ export default {
       const adminMessageContent = await getAdminPanelMessage();
       const adminMessage = adminMessageContent ? `${adminMessageContent}\n\n管理员面板：请选择操作` : '管理员面板：请选择操作';
 
-      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -526,7 +578,7 @@ export default {
         })
       });
 
-      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+      await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/deleteMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -610,16 +662,49 @@ export default {
     }
 
     async function onCallbackQuery(callbackQuery) {
+      const chatId = callbackQuery.message.chat.id.toString();
       const callbackId = callbackQuery.id;
-      
-      // 检查是否已经在处理相同的 callback_query
-      if (processingCallbacks.has(callbackId)) {
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+      const data = callbackQuery.data;
+
+      const parts = data.split('_');
+      let action;
+      let privateChatId;
+
+      if (data.startsWith('verify_')) {
+        action = 'verify';
+        privateChatId = parts[1];
+      } else if (data.startsWith('toggle_verification_')) {
+        action = 'toggle_verification';
+        privateChatId = parts.slice(2).join('_');
+      } else if (data.startsWith('toggle_user_raw_')) {
+        action = 'toggle_user_raw';
+        privateChatId = parts.slice(3).join('_');
+      } else if (data.startsWith('check_blocklist_')) {
+        action = 'check_blocklist';
+        privateChatId = parts.slice(2).join('_');
+      } else if (data.startsWith('block_')) {
+        action = 'block';
+        privateChatId = parts.slice(1).join('_');
+      } else if (data.startsWith('unblock_')) {
+        action = 'unblock';
+        privateChatId = parts.slice(1).join('_');
+      } else if (data.startsWith('delete_user_')) {
+        action = 'delete_user';
+        privateChatId = parts.slice(2).join('_');
+      } else {
+        action = data;
+        privateChatId = '';
+      }
+
+      // 检查是否已经在处理相同的 chatId 和 action
+      const actionKey = `${chatId}:${action}`;
+      if (processingActions.has(actionKey)) {
+        await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/answerCallbackQuery`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             callback_query_id: callbackId,
-            text: '正在处理，请稍候...',
+            text: '请勿重复点击，正在处理...',
             show_alert: false
           })
         });
@@ -627,43 +712,11 @@ export default {
       }
 
       // 添加到处理中的集合
-      processingCallbacks.add(callbackId);
+      processingActions.set(actionKey, true);
 
       try {
-        const chatId = callbackQuery.message.chat.id.toString();
         let topicId = callbackQuery.message.message_thread_id;
-        const data = callbackQuery.data;
         const messageId = callbackQuery.message.message_id;
-
-        const parts = data.split('_');
-        let action;
-        let privateChatId;
-
-        if (data.startsWith('verify_')) {
-          action = 'verify';
-          privateChatId = parts[1];
-        } else if (data.startsWith('toggle_verification_')) {
-          action = 'toggle_verification';
-          privateChatId = parts.slice(2).join('_');
-        } else if (data.startsWith('toggle_user_raw_')) {
-          action = 'toggle_user_raw';
-          privateChatId = parts.slice(3).join('_');
-        } else if (data.startsWith('check_blocklist_')) {
-          action = 'check_blocklist';
-          privateChatId = parts.slice(2).join('_');
-        } else if (data.startsWith('block_')) {
-          action = 'block';
-          privateChatId = parts.slice(1).join('_');
-        } else if (data.startsWith('unblock_')) {
-          action = 'unblock';
-          privateChatId = parts.slice(1).join('_');
-        } else if (data.startsWith('delete_user_')) {
-          action = 'delete_user';
-          privateChatId = parts.slice(2).join('_');
-        } else {
-          action = data;
-          privateChatId = '';
-        }
 
         if (action === 'verify') {
           const [, userChatId, selectedAnswer, result] = data.split('_');
@@ -721,7 +774,7 @@ export default {
             await handleVerification(chatId, messageId);
           }
 
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+          await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/deleteMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -794,7 +847,7 @@ export default {
           await sendAdminPanel(chatId, topicId, privateChatId, messageId);
         }
 
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+        await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/answerCallbackQuery`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -804,8 +857,8 @@ export default {
           })
         });
       } finally {
-        // 无论成功或失败，都移除处理中的 callback_query
-        processingCallbacks.delete(callbackId);
+        // 无论成功或失败，都移除处理中的动作
+        processingActions.delete(actionKey);
       }
     }
 
@@ -820,7 +873,7 @@ export default {
       const lastVerificationMessageId = lastVerification?.last_verification_message_id;
 
       if (lastVerificationMessageId) {
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+        await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/deleteMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -862,7 +915,7 @@ export default {
         .bind(chatId, correctResult.toString(), codeExpiry)
         .run();
 
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      const response = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -884,7 +937,7 @@ export default {
         return adminCache.get(userId);
       }
 
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+      const response = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/getChatMember`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -904,7 +957,7 @@ export default {
       }
 
       const defaultUserInfo = { first_name: "Unknown", last_name: "", username: "unknown", id: chatId };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+      const response = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/getChat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId })
@@ -922,7 +975,7 @@ export default {
     }
 
     async function createForumTopic(topicName, userName, nickname, userId) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
+      const response = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/createForumTopic`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: GROUP_ID, name: topicName })
@@ -934,7 +987,7 @@ export default {
       const now = new Date();
       const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
       const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n通知内容：请及时处理用户消息。`;
-      const messageResponse = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      const messageResponse = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -947,7 +1000,7 @@ export default {
       const messageData = await messageResponse.json();
       if (messageData.ok) {
         const messageId = messageData.result.message_id;
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
+        await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/pinChatMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -993,7 +1046,7 @@ export default {
         message_thread_id: topicId,
         parse_mode: 'Markdown'
       };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      const response = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody)
@@ -1005,7 +1058,7 @@ export default {
 
     async function sendMessageToUser(chatId, text) {
       const requestBody = { chat_id: chatId, text: text };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      const response = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody)
@@ -1018,7 +1071,7 @@ export default {
       for (let i = 0; i <= retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 500); // 缩短超时时间到 500ms
+          const timeoutId = setTimeout(() => controller.abort(), 500); // 超时时间 500ms
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
@@ -1042,7 +1095,7 @@ export default {
 
     async function registerWebhook(request) {
       const webhookUrl = `${new URL(request.url).origin}/webhook`;
-      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+      const response = await fetch(`${BOT_API_URL}/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: webhookUrl })
@@ -1051,7 +1104,7 @@ export default {
     }
 
     async function unRegisterWebhook() {
-      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+      const response = await fetch(`${BOT_API_URL}/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: '' })
