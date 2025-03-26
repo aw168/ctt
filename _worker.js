@@ -9,7 +9,10 @@ let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
 let isWebhookInitialized = false; // 用于标记 webhook 是否已初始化
 const processedMessages = new Set(); // 用于存储已处理的消息 ID，防止重复处理
-const processingActions = new Map(); // 用于存储正在处理的 chatId:action 组合
+const processingActions = new Map(); // 用于存储正在处理的 chatId:messageId 组合
+
+// 性能日志
+const performanceLogs = [];
 
 // 缓存 settings 表中的常用值
 const settingsCache = {
@@ -34,10 +37,6 @@ const adminCache = new Map();
 
 // 缓存 admin.md 内容
 let adminPanelMessageCache = '';
-
-// 消息队列，用于批量发送
-const messageQueue = [];
-let isProcessingQueue = false;
 
 export default {
   async fetch(request, env) {
@@ -66,6 +65,7 @@ export default {
     try {
       await checkAndRepairTables(env.D1);
     } catch (error) {
+      performanceLogs.push(`[${new Date().toISOString()}] Database initialization error: ${error.message}`);
       return new Response('Database initialization error', { status: 500 });
     }
 
@@ -81,6 +81,7 @@ export default {
         }
       } catch (error) {
         adminPanelMessageCache = '';
+        performanceLogs.push(`[${new Date().toISOString()}] Failed to fetch admin.md: ${error.message}`);
       }
     }
 
@@ -88,18 +89,24 @@ export default {
       try {
         await autoRegisterWebhook(request);
         isWebhookInitialized = true;
-      } catch (error) {}
+      } catch (error) {
+        performanceLogs.push(`[${new Date().toISOString()}] Failed to initialize webhook: ${error.message}`);
+      }
     }
 
     if (BOT_TOKEN && GROUP_ID) {
       try {
         await checkBotPermissions();
-      } catch (error) {}
+      } catch (error) {
+        performanceLogs.push(`[${new Date().toISOString()}] Failed to check bot permissions: ${error.message}`);
+      }
     }
 
     try {
       await cleanExpiredVerificationCodes(env.D1);
-    } catch (error) {}
+    } catch (error) {
+      performanceLogs.push(`[${new Date().toISOString()}] Failed to clean expired verification codes: ${error.message}`);
+    }
 
     async function handleRequest(request) {
       if (!BOT_TOKEN || !GROUP_ID) {
@@ -113,6 +120,7 @@ export default {
           await handleUpdate(update);
           return new Response('OK');
         } catch (error) {
+          performanceLogs.push(`[${new Date().toISOString()}] Failed to handle webhook update: ${error.message}`);
           return new Response('Bad Request', { status: 400 });
         }
       } else if (url.pathname === '/registerWebhook') {
@@ -122,6 +130,9 @@ export default {
       } else if (url.pathname === '/checkTables') {
         await checkAndRepairTables(env.D1);
         return new Response('Database tables checked and repaired', { status: 200 });
+      } else if (url.pathname === '/log') {
+        // 返回性能日志
+        return new Response(performanceLogs.join('\n'), { status: 200, headers: { 'Content-Type': 'text/plain' } });
       }
       return new Response('Not Found', { status: 404 });
     }
@@ -351,6 +362,8 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
+      performanceLogs.push(`[${new Date().toISOString()}] onMessage started for chatId: ${chatId}`);
+
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
@@ -436,7 +449,7 @@ export default {
         getExistingTopicId(chatId)
       ]);
       const userInfoEnd = Date.now();
-      console.log(`getUserInfo took ${userInfoEnd - userInfoStart}ms`);
+      performanceLogs.push(`[${new Date().toISOString()}] getUserInfo for chatId ${chatId} took ${userInfoEnd - userInfoStart}ms`);
 
       const userName = userInfo.username || userInfo.first_name;
       const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
@@ -462,54 +475,34 @@ export default {
       let finalTopicId = topicId;
       let shouldCreateTopic = !finalTopicId;
 
-      // 转发消息（加入消息队列）
+      // 转发消息（直接发送，移除消息队列）
       if (shouldCreateTopic) {
         const createTopicStart = Date.now();
-        finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
-        const createTopicEnd = Date.now();
-        console.log(`createForumTopic took ${createTopicEnd - createTopicStart}ms`);
-        saveTopicId(chatId, finalTopicId); // 异步保存，不等待
+        try {
+          finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
+          const createTopicEnd = Date.now();
+          performanceLogs.push(`[${new Date().toISOString()}] createForumTopic for chatId ${chatId} took ${createTopicEnd - createTopicStart}ms`);
+          saveTopicId(chatId, finalTopicId); // 异步保存，不等待
+        } catch (error) {
+          performanceLogs.push(`[${new Date().toISOString()}] Failed to create forum topic for chatId ${chatId}: ${error.message}`);
+          await sendMessageToUser(chatId, "创建话题失败，请稍后再试。");
+          return;
+        }
       }
 
-      messageQueue.push({ topicId: finalTopicId, text: formattedMessage });
-      processMessageQueue();
-
-      const endTime = Date.now();
-      console.log(`Total onMessage took ${endTime - startTime}ms`);
-    }
-
-    async function processMessageQueue() {
-      if (isProcessingQueue || messageQueue.length === 0) {
+      const sendStart = Date.now();
+      try {
+        await sendMessageToTopic(finalTopicId, formattedMessage);
+        const sendEnd = Date.now();
+        performanceLogs.push(`[${new Date().toISOString()}] sendMessageToTopic for topic ${finalTopicId} took ${sendEnd - sendStart}ms`);
+      } catch (error) {
+        performanceLogs.push(`[${new Date().toISOString()}] Failed to send message to topic ${finalTopicId}: ${error.message}`);
+        await sendMessageToUser(chatId, "消息转发失败，请稍后再试。");
         return;
       }
 
-      isProcessingQueue = true;
-      try {
-        const messagesToSend = [...messageQueue];
-        messageQueue.length = 0;
-
-        // 按 topicId 分组，批量发送
-        const messagesByTopic = messagesToSend.reduce((acc, msg) => {
-          if (!acc[msg.topicId]) {
-            acc[msg.topicId] = [];
-          }
-          acc[msg.topicId].push(msg.text);
-          return acc;
-        }, {});
-
-        for (const [topicId, texts] of Object.entries(messagesByTopic)) {
-          const combinedText = texts.join('\n\n');
-          const sendStart = Date.now();
-          await sendMessageToTopic(topicId, combinedText);
-          const sendEnd = Date.now();
-          console.log(`sendMessageToTopic for topic ${topicId} took ${sendEnd - sendStart}ms`);
-        }
-      } finally {
-        isProcessingQueue = false;
-        if (messageQueue.length > 0) {
-          processMessageQueue();
-        }
-      }
+      const endTime = Date.now();
+      performanceLogs.push(`[${new Date().toISOString()}] Total onMessage for chatId ${chatId} took ${endTime - startTime}ms`);
     }
 
     async function handleResetUser(chatId, topicId, text) {
@@ -567,7 +560,7 @@ export default {
       const adminMessageContent = await getAdminPanelMessage();
       const adminMessage = adminMessageContent ? `${adminMessageContent}\n\n管理员面板：请选择操作` : '管理员面板：请选择操作';
 
-      await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/sendMessage`, {
+      const response = await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -577,15 +570,17 @@ export default {
           reply_markup: { inline_keyboard: buttons }
         })
       });
-
-      await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/deleteMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: messageId
-        })
-      });
+      const data = await response.json();
+      if (data.ok) {
+        await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: messageId
+          })
+        });
+      }
     }
 
     async function getVerificationSuccessMessage() {
@@ -663,48 +658,19 @@ export default {
 
     async function onCallbackQuery(callbackQuery) {
       const chatId = callbackQuery.message.chat.id.toString();
+      const messageId = callbackQuery.message.message_id.toString();
       const callbackId = callbackQuery.id;
       const data = callbackQuery.data;
 
-      const parts = data.split('_');
-      let action;
-      let privateChatId;
-
-      if (data.startsWith('verify_')) {
-        action = 'verify';
-        privateChatId = parts[1];
-      } else if (data.startsWith('toggle_verification_')) {
-        action = 'toggle_verification';
-        privateChatId = parts.slice(2).join('_');
-      } else if (data.startsWith('toggle_user_raw_')) {
-        action = 'toggle_user_raw';
-        privateChatId = parts.slice(3).join('_');
-      } else if (data.startsWith('check_blocklist_')) {
-        action = 'check_blocklist';
-        privateChatId = parts.slice(2).join('_');
-      } else if (data.startsWith('block_')) {
-        action = 'block';
-        privateChatId = parts.slice(1).join('_');
-      } else if (data.startsWith('unblock_')) {
-        action = 'unblock';
-        privateChatId = parts.slice(1).join('_');
-      } else if (data.startsWith('delete_user_')) {
-        action = 'delete_user';
-        privateChatId = parts.slice(2).join('_');
-      } else {
-        action = data;
-        privateChatId = '';
-      }
-
-      // 检查是否已经在处理相同的 chatId 和 action
-      const actionKey = `${chatId}:${action}`;
+      // 使用 chatId 和 messageId 组合作为防抖的键
+      const actionKey = `${chatId}:${messageId}`;
       if (processingActions.has(actionKey)) {
         await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/answerCallbackQuery`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             callback_query_id: callbackId,
-            text: '请勿重复点击，正在处理...',
+            text: '正在处理，请稍候...',
             show_alert: false
           })
         });
@@ -714,9 +680,48 @@ export default {
       // 添加到处理中的集合
       processingActions.set(actionKey, true);
 
+      // 禁用按钮
+      await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: {} // 移除按钮
+        })
+      });
+
       try {
         let topicId = callbackQuery.message.message_thread_id;
-        const messageId = callbackQuery.message.message_id;
+        const parts = data.split('_');
+        let action;
+        let privateChatId;
+
+        if (data.startsWith('verify_')) {
+          action = 'verify';
+          privateChatId = parts[1];
+        } else if (data.startsWith('toggle_verification_')) {
+          action = 'toggle_verification';
+          privateChatId = parts.slice(2).join('_');
+        } else if (data.startsWith('toggle_user_raw_')) {
+          action = 'toggle_user_raw';
+          privateChatId = parts.slice(3).join('_');
+        } else if (data.startsWith('check_blocklist_')) {
+          action = 'check_blocklist';
+          privateChatId = parts.slice(2).join('_');
+        } else if (data.startsWith('block_')) {
+          action = 'block';
+          privateChatId = parts.slice(1).join('_');
+        } else if (data.startsWith('unblock_')) {
+          action = 'unblock';
+          privateChatId = parts.slice(1).join('_');
+        } else if (data.startsWith('delete_user_')) {
+          action = 'delete_user';
+          privateChatId = parts.slice(2).join('_');
+        } else {
+          action = data;
+          privateChatId = '';
+        }
 
         if (action === 'verify') {
           const [, userChatId, selectedAnswer, result] = data.split('_');
@@ -844,6 +849,7 @@ export default {
             await sendMessageToTopic(topicId, `未知操作：${action}`);
           }
 
+          // 重新发送管理员面板，恢复按钮
           await sendAdminPanel(chatId, topicId, privateChatId, messageId);
         }
 
@@ -856,6 +862,19 @@ export default {
             show_alert: false
           })
         });
+      } catch (error) {
+        performanceLogs.push(`[${new Date().toISOString()}] onCallbackQuery failed for chatId ${chatId}: ${error.message}`);
+        await fetchWithRetry(`${BOT_API_URL}/bot${BOT_TOKEN}/answerCallbackQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            callback_query_id: callbackId,
+            text: '操作失败，请稍后再试！',
+            show_alert: true
+          })
+        });
+        // 重新发送管理员面板，恢复按钮
+        await sendAdminPanel(chatId, topicId, privateChatId, messageId);
       } finally {
         // 无论成功或失败，都移除处理中的动作
         processingActions.delete(actionKey);
@@ -1115,6 +1134,7 @@ export default {
     try {
       return await handleRequest(request);
     } catch (error) {
+      performanceLogs.push(`[${new Date().toISOString()}] Internal Server Error: ${error.message}`);
       return new Response('Internal Server Error', { status: 500 });
     }
   }
