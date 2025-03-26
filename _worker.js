@@ -453,7 +453,8 @@ export default {
         ]
       ];
 
-      const adminMessage = await getAdminRawContent();
+      // 硬编码管理员面板消息，绕过 admin_panel.md
+      const adminMessage = '管理员面板：请选择操作';
       try {
         await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
@@ -461,7 +462,7 @@ export default {
           body: JSON.stringify({
             chat_id: chatId,
             message_thread_id: topicId,
-            text: adminMessage || '管理员面板：请选择操作',
+            text: adminMessage,
             reply_markup: {
               inline_keyboard: buttons
             }
@@ -477,18 +478,6 @@ export default {
         });
       } catch (error) {
         console.error('Error sending admin panel:', error);
-      }
-    }
-
-    async function getAdminRawContent() {
-      try {
-        const response = await fetch('https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO/main/admin_panel.md');
-        if (!response.ok) throw new Error(`Failed to fetch admin_panel.md: ${response.statusText}`);
-        const content = await response.text();
-        return content.trim() || '管理员面板：请选择操作';
-      } catch (error) {
-        console.error('Error fetching admin raw content:', error);
-        return '管理员面板：请选择操作';
       }
     }
 
@@ -672,6 +661,7 @@ export default {
         if (!isAdmin) {
           console.log(`User ${senderId} is not an admin, rejecting action`);
           await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
+          await sendAdminPanel(chatId, topicId, data.split('_')[1], messageId); // 重新显示管理员面板
           return;
         }
 
@@ -841,13 +831,15 @@ export default {
       }
 
       try {
+        const requestBody = JSON.stringify({
+          chat_id: GROUP_ID,
+          user_id: userId
+        });
+        console.log(`Sending getChatMember request: ${requestBody}`);
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            user_id: userId
-          })
+          body: requestBody
         });
         const data = await response.json();
         console.log(`getChatMember response for user ${userId}:`, JSON.stringify(data, null, 2));
@@ -1028,7 +1020,7 @@ export default {
       }
     }
 
-    async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
+    async function fetchWithRetry(url, options, retries = 5, backoff = 2000) {
       for (let i = 0; i < retries; i++) {
         try {
           const response = await fetch(url, options);
@@ -1037,6 +1029,7 @@ export default {
           } else if (response.status === 429) {
             const retryAfter = response.headers.get('Retry-After');
             const delay = retryAfter ? parseInt(retryAfter) * 1000 : backoff * Math.pow(2, i);
+            console.log(`Rate limited, retrying after ${delay}ms (attempt ${i + 1}/${retries})`);
             await new Promise(resolve => setTimeout(resolve, delay));
           } else {
             console.error(`Request failed with status ${response.status}: ${response.statusText}`);
@@ -1047,6 +1040,8 @@ export default {
             console.error(`Failed to fetch ${url} after ${retries} retries:`, error);
             throw error;
           }
+          console.log(`Retrying after ${backoff * Math.pow(2, i)}ms (attempt ${i + 1}/${retries})`);
+          await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
         }
       }
       throw new Error(`Failed to fetch ${url} after ${retries} retries`);
