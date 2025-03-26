@@ -27,6 +27,9 @@ const messageRateCache = new Map();
 // 缓存用户信息
 const userInfoCache = new Map();
 
+// 缓存管理员状态
+const adminCache = new Map();
+
 // 缓存 admin.md 内容
 let adminPanelMessageCache = '';
 
@@ -51,8 +54,12 @@ export default {
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
+    if (!env.KV) {
+      return new Response('Server configuration error: KV namespace is not bound', { status: 500 });
+    }
+
     try {
-      await checkAndRepairTables(env.D1);
+      await checkAndRepairTables(env.D1, env.KV);
     } catch (error) {
       return new Response('Database initialization error', { status: 500 });
     }
@@ -106,7 +113,7 @@ export default {
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
       } else if (url.pathname === '/checkTables') {
-        await checkAndRepairTables(env.D1);
+        await checkAndRepairTables(env.D1, env.KV);
         return new Response('Database tables checked and repaired', { status: 200 });
       }
       return new Response('Not Found', { status: 404 });
@@ -151,7 +158,7 @@ export default {
       return data.result.id;
     }
 
-    async function checkAndRepairTables(d1) {
+    async function checkAndRepairTables(d1, kv) {
       const expectedTables = {
         user_states: {
           columns: {
@@ -164,21 +171,6 @@ export default {
             last_verification_message_id: 'TEXT',
             is_first_verification: 'BOOLEAN DEFAULT FALSE',
             is_rate_limited: 'BOOLEAN DEFAULT FALSE'
-          }
-        },
-        message_rates: {
-          columns: {
-            chat_id: 'TEXT PRIMARY KEY',
-            message_count: 'INTEGER DEFAULT 0',
-            window_start: 'INTEGER',
-            start_count: 'INTEGER DEFAULT 0',
-            start_window_start: 'INTEGER'
-          }
-        },
-        chat_topic_mappings: {
-          columns: {
-            chat_id: 'TEXT PRIMARY KEY',
-            topic_id: 'TEXT NOT NULL'
           }
         },
         settings: {
@@ -223,10 +215,6 @@ export default {
           await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
         }
 
-        if (tableName === 'chat_topic_mappings') {
-          await d1.exec('CREATE INDEX IF NOT EXISTS idx_chat_topic_mappings_chat_id ON chat_topic_mappings (chat_id)');
-        }
-
         if (tableName === 'user_states') {
           await d1.exec('CREATE INDEX IF NOT EXISTS idx_user_states_chat_id ON user_states (chat_id)');
         }
@@ -241,10 +229,14 @@ export default {
       settingsCache.verification_enabled = (await getSetting('verification_enabled', d1)) === 'true';
       settingsCache.user_raw_enabled = (await getSetting('user_raw_enabled', d1)) === 'true';
 
-      // 初始化 topicCache
-      const topicMappings = await d1.prepare('SELECT chat_id, topic_id FROM chat_topic_mappings').all();
-      for (const { chat_id, topic_id } of topicMappings.results) {
-        topicCache.set(chat_id, topic_id);
+      // 初始化 topicCache 从 KV
+      const topicKeys = await kv.list({ prefix: 'topic:' });
+      for (const key of topicKeys.keys) {
+        const chatId = key.name.replace('topic:', '');
+        const topicId = await kv.get(key.name);
+        if (topicId) {
+          topicCache.set(chatId, topicId);
+        }
       }
 
       // 初始化 userStateCache
@@ -259,15 +251,14 @@ export default {
         });
       }
 
-      // 初始化 messageRateCache
-      const messageRates = await d1.prepare('SELECT chat_id, message_count, window_start, start_count, start_window_start FROM message_rates').all();
-      for (const rate of messageRates.results) {
-        messageRateCache.set(rate.chat_id, {
-          message_count: rate.message_count || 0,
-          window_start: rate.window_start || Date.now(),
-          start_count: rate.start_count || 0,
-          start_window_start: rate.start_window_start || Date.now()
-        });
+      // 初始化 messageRateCache 从 KV
+      const rateKeys = await kv.list({ prefix: 'rate:' });
+      for (const key of rateKeys.keys) {
+        const chatId = key.name.replace('rate:', '');
+        const rateData = await kv.get(key.name, { type: 'json' });
+        if (rateData) {
+          messageRateCache.set(chatId, rateData);
+        }
       }
     }
 
@@ -332,7 +323,7 @@ export default {
     }
 
     async function onMessage(message) {
-      const startTime = Date.now(); // 记录开始时间
+      const startTime = Date.now();
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
@@ -440,7 +431,7 @@ export default {
       const forwardTime = Date.now();
       if (shouldCreateTopic) {
         finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
-        saveTopicId(chatId, finalTopicId); // 异步保存
+        saveTopicId(chatId, finalTopicId);
       }
       if (text) {
         await sendMessageToTopic(finalTopicId, formattedMessage);
@@ -467,11 +458,11 @@ export default {
 
       const targetChatId = parts[1];
       await env.D1.batch([
-        env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId),
-        env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId)
+        env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId)
       ]);
       userStateCache.delete(targetChatId);
       messageRateCache.delete(targetChatId);
+      await env.KV.delete(`rate:${targetChatId}`);
       await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
     }
 
@@ -504,26 +495,28 @@ export default {
 
       const adminMessageContent = await getAdminPanelMessage();
       const adminMessage = adminMessageContent ? `${adminMessageContent}\n\n管理员面板：请选择操作` : '管理员面板：请选择操作';
-      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_thread_id: topicId,
-          text: adminMessage,
-          reply_markup: { inline_keyboard: buttons }
-        })
-      });
 
-      // 异步删除消息
-      fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: messageId
+      // 并行执行 sendMessage 和 deleteMessage
+      await Promise.all([
+        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_thread_id: topicId,
+            text: adminMessage,
+            reply_markup: { inline_keyboard: buttons }
+          })
+        }),
+        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: messageId
+          })
         })
-      });
+      ]);
 
       console.log(`Admin panel response took ${Date.now() - startTime}ms`);
     }
@@ -556,10 +549,7 @@ export default {
       }
 
       messageRateCache.set(chatId, rateData);
-      // 异步更新数据库
-      env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
-        .bind(chatId, rateData.start_count, rateData.start_window_start)
-        .run();
+      env.KV.put(`rate:${chatId}`, JSON.stringify(rateData));
 
       return rateData.start_count > maxStartsPerWindow;
     }
@@ -577,10 +567,7 @@ export default {
       }
 
       messageRateCache.set(chatId, rateData);
-      // 异步更新数据库
-      env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
-        .bind(chatId, rateData.message_count, rateData.window_start)
-        .run();
+      env.KV.put(`rate:${chatId}`, JSON.stringify(rateData));
 
       return rateData.message_count > MAX_MESSAGES_PER_MINUTE;
     }
@@ -754,11 +741,11 @@ export default {
           await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
         } else if (action === 'delete_user') {
           await env.D1.batch([
-            env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
-            env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId)
+            env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId)
           ]);
           userStateCache.delete(privateChatId);
           messageRateCache.delete(privateChatId);
+          await env.KV.delete(`rate:${privateChatId}`);
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息记录已删除，话题保留。`);
         } else {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
@@ -847,6 +834,10 @@ export default {
     }
 
     async function checkIfAdmin(userId) {
+      if (adminCache.has(userId)) {
+        return adminCache.get(userId);
+      }
+
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -856,7 +847,9 @@ export default {
         })
       });
       const data = await response.json();
-      return data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
+      const isAdmin = data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
+      adminCache.set(userId, isAdmin);
+      return isAdmin;
     }
 
     async function getUserInfo(chatId) {
@@ -864,7 +857,6 @@ export default {
         return userInfoCache.get(chatId);
       }
 
-      // 返回默认值并异步加载用户信息
       const defaultUserInfo = { first_name: "Unknown", last_name: "", username: "unknown", id: chatId };
       fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
         method: 'POST',
@@ -884,10 +876,7 @@ export default {
         return topicCache.get(chatId);
       }
 
-      const mapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      const topicId = mapping?.topic_id || null;
+      const topicId = await env.KV.get(`topic:${chatId}`);
       if (topicId) {
         topicCache.set(chatId, topicId);
       }
@@ -895,6 +884,7 @@ export default {
     }
 
     async function createForumTopic(topicName, userName, nickname, userId) {
+      const startTime = Date.now();
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -904,7 +894,7 @@ export default {
       if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
       const topicId = data.result.message_thread_id;
 
-      // 非阻塞发送置顶消息
+      // 完全异步化置顶消息
       const now = new Date();
       const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
       const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n通知内容：请及时处理用户消息。`;
@@ -917,8 +907,7 @@ export default {
           text: pinnedMessage,
           parse_mode: 'Markdown'
         })
-      }).then(async response => {
-        const messageData = await response.json();
+      }).then(response => response.json()).then(messageData => {
         if (messageData.ok) {
           const messageId = messageData.result.message_id;
           fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
@@ -933,15 +922,13 @@ export default {
         }
       });
 
+      console.log(`Create forum topic took ${Date.now() - startTime}ms`);
       return topicId;
     }
 
     async function saveTopicId(chatId, topicId) {
       topicCache.set(chatId, topicId);
-      // 异步保存到数据库
-      env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-        .bind(chatId, topicId)
-        .run();
+      env.KV.put(`topic:${chatId}`, topicId);
     }
 
     async function getPrivateChatId(topicId) {
@@ -950,17 +937,20 @@ export default {
         return chatId;
       }
 
-      const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
-        .bind(topicId)
-        .first();
-      const result = mapping?.chat_id || null;
-      if (result) {
-        topicCache.set(result, topicId);
+      const keys = await env.KV.list({ prefix: 'topic:' });
+      for (const key of keys.keys) {
+        const storedTopicId = await env.KV.get(key.name);
+        if (storedTopicId === topicId) {
+          const chatId = key.name.replace('topic:', '');
+          topicCache.set(chatId, topicId);
+          return chatId;
+        }
       }
-      return result;
+      return null;
     }
 
     async function sendMessageToTopic(topicId, text) {
+      const startTime = Date.now();
       if (!text.trim()) {
         throw new Error('Message text is empty');
       }
@@ -980,10 +970,12 @@ export default {
       if (!data.ok) {
         throw new Error(`Failed to send message to topic: ${data.description}`);
       }
+      console.log(`Send message to topic took ${Date.now() - startTime}ms`);
       return data;
     }
 
     async function copyMessageToTopic(topicId, message) {
+      const startTime = Date.now();
       const requestBody = {
         chat_id: GROUP_ID,
         from_chat_id: message.chat.id,
@@ -999,9 +991,11 @@ export default {
       if (!data.ok) {
         throw new Error(`Failed to copy message to topic: ${data.description}`);
       }
+      console.log(`Copy message to topic took ${Date.now() - startTime}ms`);
     }
 
     async function forwardMessageToPrivateChat(privateChatId, message) {
+      const startTime = Date.now();
       const requestBody = {
         chat_id: privateChatId,
         from_chat_id: message.chat.id,
@@ -1016,9 +1010,11 @@ export default {
       if (!data.ok) {
         throw new Error(`Failed to forward message to private chat: ${data.description}`);
       }
+      console.log(`Forward message to private chat took ${Date.now() - startTime}ms`);
     }
 
     async function sendMessageToUser(chatId, text) {
+      const startTime = Date.now();
       const requestBody = { chat_id: chatId, text: text };
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
@@ -1029,17 +1025,20 @@ export default {
       if (!data.ok) {
         throw new Error(`Failed to send message to user: ${data.description}`);
       }
+      console.log(`Send message to user took ${Date.now() - startTime}ms`);
     }
 
-    async function fetchWithRetry(url, options, retries = 1, backoff = 500) {
-      for (let i = 0; i < retries; i++) {
+    async function fetchWithRetry(url, options, retries = 0, backoff = 500) {
+      const startTime = Date.now();
+      for (let i = 0; i <= retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 1500); // 缩短超时时间到 1.5 秒
+          const timeoutId = setTimeout(() => controller.abort(), 1000); // 缩短超时时间到 1 秒
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
           if (response.ok) {
+            console.log(`Fetch ${url} took ${Date.now() - startTime}ms`);
             return response;
           }
           if (response.status === 429) {
@@ -1050,7 +1049,8 @@ export default {
             throw new Error(`Request failed with status ${response.status}`);
           }
         } catch (error) {
-          if (i === retries - 1) {
+          if (i === retries) {
+            console.log(`Fetch ${url} failed after ${Date.now() - startTime}ms: ${error.message}`);
             throw error;
           }
           await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
