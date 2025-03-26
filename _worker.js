@@ -151,6 +151,7 @@ export default {
         const canPostMessages = memberData.result.can_post_messages !== false;
         if (!canSendMessages || !canPostMessages) {
           console.error('Bot lacks permission to send messages in the group');
+          throw new Error('Bot lacks permission to send messages in the group');
         }
       } catch (error) {
         console.error('Error checking bot permissions:', error);
@@ -375,9 +376,12 @@ export default {
     }
 
     async function onMessage(message) {
+      const startTime = Date.now();
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
+
+      console.log(`[Timing] onMessage start for chatId ${chatId}: ${startTime}`);
 
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
@@ -462,10 +466,12 @@ export default {
       }
 
       // 并行获取用户信息和话题 ID
+      const userInfoStart = Date.now();
       const [userInfo, topicId] = await Promise.all([
         getUserInfo(chatId),
         getExistingTopicId(chatId)
       ]);
+      console.log(`[Timing] getUserInfo and getExistingTopicId took ${Date.now() - userInfoStart}ms`);
 
       const userName = userInfo.username || userInfo.first_name;
       const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
@@ -477,31 +483,55 @@ export default {
       // 提前准备消息内容
       const formattedMessage = text ? `*${nickname}:*\n------------------------------------------------\n\n${text}` : null;
 
+      // 验证消息长度
+      if (formattedMessage && formattedMessage.length > 4096) {
+        await sendMessageToUser(chatId, "消息过长（超过 4096 字符），无法转发。请缩短后重试。");
+        return;
+      }
+
       // 转发消息
       try {
+        console.log(`[Timing] Preparing to forward message for chatId ${chatId}, shouldCreateTopic: ${shouldCreateTopic}, topicId: ${finalTopicId}`);
         if (shouldCreateTopic) {
+          const createTopicStart = Date.now();
           finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
-          await saveTopicId(chatId, finalTopicId);
+          console.log(`[Timing] createForumTopic took ${Date.now() - createTopicStart}ms`);
+          // 异步保存话题 ID
+          saveTopicId(chatId, finalTopicId).catch(error => console.error(`Error saving topicId for ${chatId}:`, error));
         }
+
+        const forwardStart = Date.now();
         if (formattedMessage) {
+          console.log(`[Timing] Sending text message to topicId ${finalTopicId}: length=${formattedMessage.length}, content=${formattedMessage.substring(0, 50)}...`);
           await sendMessageToTopic(finalTopicId, formattedMessage);
         } else {
+          console.log(`[Timing] Copying message to topicId ${finalTopicId}: from_chat_id=${message.chat.id}, message_id=${message.message_id}`);
           await copyMessageToTopic(finalTopicId, message);
         }
+        console.log(`[Timing] Forwarding message took ${Date.now() - forwardStart}ms`);
       } catch (error) {
+        console.error(`Error forwarding message for chatId ${chatId}:`, error);
         if (error.message.includes('chat not found') || error.message.includes('topic not found')) {
+          const createTopicStart = Date.now();
           finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
-          await saveTopicId(chatId, finalTopicId);
+          console.log(`[Timing] Recreate topic took ${Date.now() - createTopicStart}ms`);
+          saveTopicId(chatId, finalTopicId).catch(error => console.error(`Error saving topicId for ${chatId}:`, error));
+          const retryForwardStart = Date.now();
           if (formattedMessage) {
+            console.log(`[Timing] Retrying send text message to topicId ${finalTopicId}`);
             await sendMessageToTopic(finalTopicId, formattedMessage);
           } else {
+            console.log(`[Timing] Retrying copy message to topicId ${finalTopicId}`);
             await copyMessageToTopic(finalTopicId, message);
           }
+          console.log(`[Timing] Retry forwarding took ${Date.now() - retryForwardStart}ms`);
         } else {
           await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
           await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
         }
       }
+
+      console.log(`[Timing] onMessage total took ${Date.now() - startTime}ms for chatId ${chatId}`);
     }
 
     async function handleResetUser(chatId, topicId, text) {
@@ -607,18 +637,6 @@ export default {
       } catch (error) {
         console.error("Error fetching verification success message:", error);
         return '验证成功！您现在可以与客服聊天。';
-      }
-    }
-
-    async function getNotificationContent() {
-      try {
-        const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
-        if (!response.ok) throw new Error(`Failed to fetch notification.md: ${response.statusText}`);
-        const content = await response.text();
-        return content.trim() || '';
-      } catch (error) {
-        console.error("Error fetching notification content:", error);
-        return '';
       }
     }
 
@@ -1015,7 +1033,26 @@ export default {
       try {
         // 优先从缓存中获取
         if (topicCache.has(chatId)) {
-          return topicCache.get(chatId);
+          const topicId = topicCache.get(chatId);
+          // 验证话题是否存在
+          const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getForumTopic`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: GROUP_ID,
+              message_thread_id: topicId
+            })
+          });
+          const data = await response.json();
+          if (data.ok) {
+            return topicId;
+          } else {
+            topicCache.delete(chatId);
+            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+              .bind(chatId)
+              .run();
+            return null;
+          }
         }
 
         const mapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
@@ -1028,7 +1065,7 @@ export default {
         return topicId;
       } catch (error) {
         console.error(`Error fetching topic ID for chatId ${chatId}:`, error);
-        throw error;
+        return null;
       }
     }
 
@@ -1079,7 +1116,7 @@ export default {
         return result;
       } catch (error) {
         console.error(`Error fetching private chat ID for topicId ${topicId}:`, error);
-        throw error;
+        return null;
       }
     }
 
@@ -1172,23 +1209,25 @@ export default {
       }
     }
 
-    async function fetchWithRetry(url, options, retries = 2, backoff = 300) {
+    async function fetchWithRetry(url, options, retries = 1, backoff = 200) {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 1000); // 缩短超时时间到 1 秒
+          const timeoutId = setTimeout(() => controller.abort(), 500); // 缩短超时时间到 500ms
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
           if (response.ok) {
             return response;
           }
+          const errorData = await response.json();
           if (response.status === 429) {
             const retryAfter = response.headers.get('Retry-After');
             const delay = retryAfter ? parseInt(retryAfter) * 1000 : backoff * Math.pow(2, i);
+            console.log(`Rate limited, retrying after ${delay}ms: ${JSON.stringify(errorData)}`);
             await new Promise(resolve => setTimeout(resolve, delay));
           } else {
-            throw new Error(`Request failed with status ${response.status}: ${response.statusText}`);
+            throw new Error(`Request failed with status ${response.status}: ${errorData.description || response.statusText}`);
           }
         } catch (error) {
           if (i === retries - 1) {
