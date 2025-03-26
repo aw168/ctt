@@ -382,7 +382,9 @@ export default {
             return;
           }
           if (privateChatId) {
-            await forwardMessageToPrivateChat(privateChatId, message);
+            // 从群组转发到私聊时，使用 sendMessage 替代 copyMessage
+            const formattedMessage = text ? `*群组消息:*\n------------------------------------------------\n\n${text}` : '收到一条非文本消息';
+            await sendMessageToUser(privateChatId, formattedMessage);
           }
         }
         return;
@@ -460,16 +462,34 @@ export default {
       }
       console.log(`Rate check took ${Date.now() - rateCheckTime}ms`);
 
-      // 获取用户信息和话题 ID
-      const userInfoTime = Date.now();
-      const userInfo = await getUserInfo(chatId);
-      const topicId = await getExistingTopicId(chatId);
-      console.log(`User info and topic ID fetch took ${Date.now() - userInfoTime}ms`);
+      // 并行获取用户信息和话题 ID
+      const fetchDataTime = Date.now();
+      const [userInfo, topicId] = await Promise.all([
+        getUserInfo(chatId),
+        getExistingTopicId(chatId)
+      ]);
+      console.log(`User info and topic ID fetch took ${Date.now() - fetchDataTime}ms`);
 
       const userName = userInfo.username || userInfo.first_name;
       const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
       const topicName = `${nickname}`;
-      const formattedMessage = text ? `*${nickname}:*\n------------------------------------------------\n\n${text}` : null;
+
+      // 格式化消息内容
+      let formattedMessage = '';
+      if (text) {
+        formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n${text}`;
+      } else if (message.photo) {
+        const caption = message.caption || '无描述';
+        formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n发送了一张图片\n描述: ${caption}`;
+      } else if (message.document) {
+        const fileName = message.document.file_name || '未知文件';
+        formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n发送了一个文件\n文件名: ${fileName}`;
+      } else if (message.video) {
+        const caption = message.caption || '无描述';
+        formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n发送了一个视频\n描述: ${caption}`;
+      } else {
+        formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n发送了一条非文本消息`;
+      }
 
       let finalTopicId = topicId;
       let shouldCreateTopic = !finalTopicId;
@@ -480,11 +500,7 @@ export default {
         finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
         await saveTopicId(chatId, finalTopicId);
       }
-      if (text) {
-        await sendMessageToTopic(finalTopicId, formattedMessage);
-      } else {
-        await copyMessageToTopic(finalTopicId, message);
-      }
+      await sendMessageToTopic(finalTopicId, formattedMessage);
       console.log(`Forwarding message took ${Date.now() - forwardTime}ms`);
       console.log(`Total message handling took ${Date.now() - startTime}ms`);
     }
@@ -1131,53 +1147,6 @@ export default {
       }
     }
 
-    async function copyMessageToTopic(topicId, message) {
-      const startTime = Date.now();
-      try {
-        const requestBody = {
-          chat_id: GROUP_ID,
-          from_chat_id: message.chat.id,
-          message_id: message.message_id,
-          message_thread_id: topicId
-        };
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(requestBody)
-        });
-        const data = await response.json();
-        if (!data.ok) {
-          throw new Error(`Failed to copy message to topic: ${data.description}`);
-        }
-        console.log(`Copy message to topic took ${Date.now() - startTime}ms`);
-      } catch (error) {
-        console.log(`Error copying message to topic ${topicId}: ${error.message}`);
-      }
-    }
-
-    async function forwardMessageToPrivateChat(privateChatId, message) {
-      const startTime = Date.now();
-      try {
-        const requestBody = {
-          chat_id: privateChatId,
-          from_chat_id: message.chat.id,
-          message_id: message.message_id
-        };
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(requestBody)
-        });
-        const data = await response.json();
-        if (!data.ok) {
-          throw new Error(`Failed to forward message to private chat: ${data.description}`);
-        }
-        console.log(`Forward message to private chat took ${Date.now() - startTime}ms`);
-      } catch (error) {
-        console.log(`Error forwarding message to private chat ${privateChatId}: ${error.message}`);
-      }
-    }
-
     async function sendMessageToUser(chatId, text) {
       const startTime = Date.now();
       try {
@@ -1202,7 +1171,7 @@ export default {
       for (let i = 0; i <= retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 2000); // 恢复超时时间到 2 秒
+          const timeoutId = setTimeout(() => controller.abort(), 2000);
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
