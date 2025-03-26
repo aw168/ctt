@@ -149,9 +149,10 @@ export default {
 
         const canSendMessages = memberData.result.can_send_messages !== false;
         const canPostMessages = memberData.result.can_post_messages !== false;
-        if (!canSendMessages || !canPostMessages) {
-          console.error('Bot lacks permission to send messages in the group');
-          throw new Error('Bot lacks permission to send messages in the group');
+        const canManageTopics = memberData.result.can_manage_topics !== false;
+        if (!canSendMessages || !canPostMessages || !canManageTopics) {
+          console.error('Bot lacks necessary permissions in the group');
+          throw new Error('Bot lacks necessary permissions in the group');
         }
       } catch (error) {
         console.error('Error checking bot permissions:', error);
@@ -1112,10 +1113,24 @@ export default {
         const topicId = data.result.message_thread_id;
         console.log(`[Timing] createForumTopic API call took ${Date.now() - createStart}ms`);
 
-        // 发送置顶消息，显示用户资料
+        // 格式化当前时间为 YYYY-MM-DD HH:mm:ss
+        const now = new Date();
+        const formattedDateTime = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+
+        // 发送置顶消息，格式与截图一致
         const pinnedMessageStart = Date.now();
-        const notificationContent = await getNotificationContent();
-        const pinnedMessage = `**用户资料：**\n用户名: ${userName}\n昵称: ${nickname}\n用户ID: ${userId}\n\n${notificationContent}`;
+        const pinnedMessage = `CTTIBOT\n` +
+                             `用户资料：\n` +
+                             `用户名：@${userName}\n` +
+                             `UserID：${userId}\n` +
+                             `发起时间：${formattedDateTime}\n\n` +
+                             `支持命令：\n` +
+                             `/block（拉黑用户）\n` +
+                             `/unblock（解除拉黑）\n` +
+                             `/checkblock（查看用户是否在黑名单）。\n\n` +
+                             `可以直接按按钮或输入命令给用户执行命令。\n\n` +
+                             `资源地址：\n` +
+                             `[GitHub 项目](https://github.com/iawooo/ctt)`;
         const pinnedResponse = await sendMessageToTopic(topicId, pinnedMessage);
         console.log(`[Timing] Sending pinned message took ${Date.now() - pinnedMessageStart}ms`);
 
@@ -1131,6 +1146,7 @@ export default {
 
     async function pinMessage(topicId, messageId) {
       try {
+        const pinStart = Date.now();
         await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1141,6 +1157,7 @@ export default {
             disable_notification: true
           })
         });
+        console.log(`[Timing] pinChatMessage API call took ${Date.now() - pinStart}ms`);
       } catch (error) {
         console.error(`Error pinning message ${messageId} in topic ${topicId}:`, error);
         throw error;
@@ -1149,9 +1166,11 @@ export default {
 
     async function saveTopicId(chatId, topicId) {
       try {
+        const saveStart = Date.now();
         await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
           .bind(chatId, topicId)
           .run();
+        console.log(`[Timing] saveTopicId D1 write took ${Date.now() - saveStart}ms`);
         // 更新缓存
         topicCache.set(chatId, topicId);
       } catch (error) {
@@ -1196,13 +1215,16 @@ export default {
           message_thread_id: topicId,
           parse_mode: 'Markdown'
         };
+        const sendStart = Date.now();
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody)
         });
         const data = await response.json();
+        console.log(`[Timing] sendMessageToTopic API call took ${Date.now() - sendStart}ms`);
         if (!data.ok) {
+          console.error(`Failed to send message to topic ${topicId}: ${JSON.stringify(requestBody)}`);
           throw new Error(`Failed to send message to topic: ${data.description}`);
         }
         return data;
@@ -1219,13 +1241,16 @@ export default {
           message_id: message.message_id,
           message_thread_id: topicId
         };
+        const copyStart = Date.now();
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody)
         });
         const data = await response.json();
+        console.log(`[Timing] copyMessageToTopic API call took ${Date.now() - copyStart}ms`);
         if (!data.ok) {
+          console.error(`Failed to copy message to topic ${topicId}: ${JSON.stringify(requestBody)}`);
           throw new Error(`Failed to copy message to topic: ${data.description}`);
         }
       } catch (error) {
@@ -1240,12 +1265,14 @@ export default {
           from_chat_id: message.chat.id,
           message_id: message.message_id
         };
+        const forwardStart = Date.now();
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody)
         });
         const data = await response.json();
+        console.log(`[Timing] forwardMessageToPrivateChat API call took ${Date.now() - forwardStart}ms`);
         if (!data.ok) {
           throw new Error(`Failed to forward message to private chat: ${data.description}`);
         }
@@ -1258,12 +1285,14 @@ export default {
     async function sendMessageToUser(chatId, text) {
       try {
         const requestBody = { chat_id: chatId, text: text };
+        const sendStart = Date.now();
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody)
         });
         const data = await response.json();
+        console.log(`[Timing] sendMessageToUser API call took ${Date.now() - sendStart}ms`);
         if (!data.ok) {
           throw new Error(`Failed to send message to user: ${data.description}`);
         }
@@ -1277,7 +1306,7 @@ export default {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 500);
+          const timeoutId = setTimeout(() => controller.abort(), 300); // 缩短超时时间到 300ms
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
