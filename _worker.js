@@ -1,13 +1,10 @@
-// 从环境变量中读取配置
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 
-// 全局变量，用于控制清理频率和 webhook 初始化
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
 let isWebhookInitialized = false;
-const processedMessages = new Set();
 
 // 缓存 settings 表中的常用值
 const settingsCache = {
@@ -15,25 +12,19 @@ const settingsCache = {
   user_raw_enabled: null
 };
 
+// 缓存用户信息和管理员状态
+const userInfoCache = new Map();
+const adminCache = new Map();
+
 export default {
   async fetch(request, env) {
     // 加载环境变量
-    if (!env.BOT_TOKEN_ENV) {
-      console.error('BOT_TOKEN_ENV is not defined');
-      BOT_TOKEN = null;
-    } else {
-      BOT_TOKEN = env.BOT_TOKEN_ENV;
-    }
-
-    if (!env.GROUP_ID_ENV) {
-      console.error('GROUP_ID_ENV is not defined');
-      GROUP_ID = null;
-    } else {
-      GROUP_ID = env.GROUP_ID_ENV;
-    }
-
+    BOT_TOKEN = env.BOT_TOKEN_ENV || null;
+    GROUP_ID = env.GROUP_ID_ENV || null;
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
+    if (!BOT_TOKEN) console.error('BOT_TOKEN_ENV is not defined');
+    if (!GROUP_ID) console.error('GROUP_ID_ENV is not defined');
     if (!env.D1) {
       console.error('D1 database is not bound');
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
@@ -204,43 +195,41 @@ export default {
         };
 
         for (const [tableName, structure] of Object.entries(expectedTables)) {
-          try {
-            const tableInfo = await d1.prepare(
-              `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`
-            ).bind(tableName).first();
+          const tableInfo = await d1.prepare(
+            `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`
+          ).bind(tableName).first();
 
-            if (!tableInfo) {
-              await createTable(d1, tableName, structure);
-              continue;
-            }
-
-            const columnsResult = await d1.prepare(
-              `PRAGMA table_info(${tableName})`
-            ).all();
-            
-            const currentColumns = new Map(
-              columnsResult.results.map(col => [col.name, {
-                type: col.type,
-                notnull: col.notnull,
-                dflt_value: col.dflt_value
-              }])
-            );
-
-            for (const [colName, colDef] of Object.entries(structure.columns)) {
-              if (!currentColumns.has(colName)) {
-                const columnParts = colDef.split(' ');
-                const addColumnSQL = `ALTER TABLE ${tableName} ADD COLUMN ${colName} ${columnParts.slice(1).join(' ')}`;
-                await d1.exec(addColumnSQL);
-              }
-            }
-
-            if (tableName === 'settings') {
-              await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
-            }
-          } catch (error) {
-            console.error(`Error checking ${tableName}:`, error);
-            await d1.exec(`DROP TABLE IF EXISTS ${tableName}`);
+          if (!tableInfo) {
             await createTable(d1, tableName, structure);
+            continue;
+          }
+
+          const columnsResult = await d1.prepare(
+            `PRAGMA table_info(${tableName})`
+          ).all();
+          
+          const currentColumns = new Map(
+            columnsResult.results.map(col => [col.name, {
+              type: col.type,
+              notnull: col.notnull,
+              dflt_value: col.dflt_value
+            }])
+          );
+
+          for (const [colName, colDef] of Object.entries(structure.columns)) {
+            if (!currentColumns.has(colName)) {
+              const columnParts = colDef.split(' ');
+              const addColumnSQL = `ALTER TABLE ${tableName} ADD COLUMN ${colName} ${columnParts.slice(1).join(' ')}`;
+              await d1.exec(addColumnSQL);
+            }
+          }
+
+          if (tableName === 'chat_topic_mappings') {
+            await d1.exec('CREATE INDEX IF NOT EXISTS idx_chat_topic_mappings_chat_id ON chat_topic_mappings (chat_id)');
+            await d1.exec('CREATE INDEX IF NOT EXISTS idx_chat_topic_mappings_topic_id ON chat_topic_mappings (topic_id)');
+          }
+          if (tableName === 'settings') {
+            await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
           }
         }
 
@@ -294,19 +283,6 @@ export default {
 
     async function handleUpdate(update) {
       if (update.message) {
-        const messageId = update.message.message_id.toString();
-        const chatId = update.message.chat.id.toString();
-        const messageKey = `${chatId}:${messageId}`;
-        
-        if (processedMessages.has(messageKey)) {
-          return;
-        }
-        processedMessages.add(messageKey);
-        
-        if (processedMessages.size > 10000) {
-          processedMessages.clear();
-        }
-
         await onMessage(update.message);
       } else if (update.callback_query) {
         await onCallbackQuery(update.callback_query);
@@ -337,10 +313,17 @@ export default {
         return;
       }
 
-      let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
+      // 并行查询 user_states 和 message_rates
+      const [userStateResult, rateDataResult] = await Promise.all([
+        env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first(),
+        env.D1.prepare('SELECT message_count, window_start, start_count, start_window_start FROM message_rates WHERE chat_id = ?')
+          .bind(chatId)
+          .first()
+      ]);
 
+      let userState = userStateResult;
       if (!userState) {
         await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified) VALUES (?, ?, ?, ?)')
           .bind(chatId, false, true, false)
@@ -355,7 +338,23 @@ export default {
       }
 
       if (text === '/start') {
-        if (await checkStartCommandRate(chatId)) {
+        const now = Date.now();
+        const window = 5 * 60 * 1000;
+        const maxStartsPerWindow = 1;
+
+        let startData = rateDataResult ? { count: rateDataResult.start_count, start: rateDataResult.start_window_start } : { count: 0, start: now };
+        if (now - startData.start > window) {
+          startData.count = 1;
+          startData.start = now;
+        } else {
+          startData.count += 1;
+        }
+
+        await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start, message_count, window_start) VALUES (?, ?, ?, ?, ?)')
+          .bind(chatId, startData.count, startData.start, rateDataResult?.message_count || 0, rateDataResult?.window_start || now)
+          .run();
+
+        if (startData.count > maxStartsPerWindow) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
           return;
         }
@@ -377,7 +376,24 @@ export default {
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
       const isFirstVerification = userState.is_first_verification;
-      const isRateLimited = await checkMessageRate(chatId);
+
+      // 检查消息速率限制
+      const now = Date.now();
+      const window = 60 * 1000;
+      let rateData = rateDataResult ? { count: rateDataResult.message_count, start: rateDataResult.window_start } : { count: 0, start: now };
+
+      if (now - rateData.start > window) {
+        rateData.count = 1;
+        rateData.start = now;
+      } else {
+        rateData.count += 1;
+      }
+
+      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start, start_count, start_window_start) VALUES (?, ?, ?, ?, ?)')
+        .bind(chatId, rateData.count, rateData.start, rateDataResult?.start_count || 0, rateDataResult?.start_window_start || now)
+        .run();
+
+      const isRateLimited = rateData.count > MAX_MESSAGES_PER_MINUTE;
 
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
         await sendMessageToUser(chatId, "请完成验证后发送消息。");
@@ -386,19 +402,24 @@ export default {
       }
 
       try {
-        const userInfo = await getUserInfo(chatId);
+        // 并行获取用户信息和话题 ID
+        const [userInfo, topicIdResult] = await Promise.all([
+          getUserInfo(chatId),
+          getExistingTopicId(chatId)
+        ]);
+
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
-        let topicId = await getExistingTopicId(chatId);
+        let topicId = topicIdResult;
         if (!topicId) {
           topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
           await saveTopicId(chatId, topicId);
         }
 
         if (text) {
-          const formattedMessage = `${nickname}:\n------------------------------------------------\n\n${text}`;
+          const formattedMessage = `${nickname}:\n${text}`;
           await sendMessageToTopic(topicId, formattedMessage);
         } else {
           await copyMessageToTopic(topicId, message);
@@ -461,27 +482,26 @@ export default {
         ];
 
         const adminMessage = '管理员面板：请选择操作';
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_thread_id: topicId,
-            text: adminMessage,
-            reply_markup: { inline_keyboard: buttons }
+        await Promise.all([
+          fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_thread_id: topicId,
+              text: adminMessage,
+              reply_markup: { inline_keyboard: buttons }
+            })
+          }),
+          fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: messageId
+            })
           })
-        });
-
-        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: messageId
-          })
-        }).catch(error => {
-          console.error(`Error deleting message ${messageId}:`, error);
-        });
+        ]);
       } catch (error) {
         console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
       }
@@ -512,53 +532,6 @@ export default {
         console.error("Error fetching notification content:", error);
         return '';
       }
-    }
-
-    async function checkStartCommandRate(chatId) {
-      const now = Date.now();
-      const window = 5 * 60 * 1000;
-      const maxStartsPerWindow = 1;
-
-      const rateData = await env.D1.prepare('SELECT start_count, start_window_start FROM message_rates WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      let data = rateData ? { count: rateData.start_count, start: rateData.start_window_start } : { count: 0, start: now };
-
-      if (now - data.start > window) {
-        data.count = 1;
-        data.start = now;
-      } else {
-        data.count += 1;
-      }
-
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
-        .bind(chatId, data.count, data.start)
-        .run();
-
-      return data.count > maxStartsPerWindow;
-    }
-
-    async function checkMessageRate(chatId) {
-      const now = Date.now();
-      const window = 60 * 1000;
-
-      const rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      let data = rateData ? { count: rateData.message_count, start: rateData.window_start } : { count: 0, start: now };
-
-      if (now - data.start > window) {
-        data.count = 1;
-        data.start = now;
-      } else {
-        data.count += 1;
-      }
-
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
-        .bind(chatId, data.count, data.start)
-        .run();
-
-      return data.count > MAX_MESSAGES_PER_MINUTE;
     }
 
     async function getSetting(key, d1) {
@@ -812,6 +785,10 @@ export default {
     }
 
     async function checkIfAdmin(userId) {
+      if (adminCache.has(userId)) {
+        return adminCache.get(userId);
+      }
+
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
           method: 'POST',
@@ -822,7 +799,10 @@ export default {
           })
         });
         const data = await response.json();
-        return data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
+        const isAdmin = data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
+        adminCache.set(userId, isAdmin);
+        setTimeout(() => adminCache.delete(userId), 60 * 60 * 1000); // 缓存 1 小时
+        return isAdmin;
       } catch (error) {
         console.error(`Error checking admin status for user ${userId}:`, error);
         return false;
@@ -830,6 +810,10 @@ export default {
     }
 
     async function getUserInfo(chatId) {
+      if (userInfoCache.has(chatId)) {
+        return userInfoCache.get(chatId);
+      }
+
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
           method: 'POST',
@@ -838,28 +822,37 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          return {
+          const userInfo = {
             id: chatId,
             username: `User_${chatId}`,
             nickname: `User_${chatId}`
           };
+          userInfoCache.set(chatId, userInfo);
+          setTimeout(() => userInfoCache.delete(chatId), 60 * 60 * 1000); // 缓存 1 小时
+          return userInfo;
         }
         const result = data.result;
         const nickname = result.first_name
           ? `${result.first_name}${result.last_name ? ` ${result.last_name}` : ''}`.trim()
           : result.username || `User_${chatId}`;
-        return {
+        const userInfo = {
           id: result.id || chatId,
           username: result.username || `User_${chatId}`,
           nickname: nickname
         };
+        userInfoCache.set(chatId, userInfo);
+        setTimeout(() => userInfoCache.delete(chatId), 60 * 60 * 1000); // 缓存 1 小时
+        return userInfo;
       } catch (error) {
         console.error(`Error fetching user info for chatId ${chatId}:`, error);
-        return {
+        const userInfo = {
           id: chatId,
           username: `User_${chatId}`,
           nickname: `User_${chatId}`
         };
+        userInfoCache.set(chatId, userInfo);
+        setTimeout(() => userInfoCache.delete(chatId), 60 * 60 * 1000); // 缓存 1 小时
+        return userInfo;
       }
     }
 
@@ -1042,7 +1035,7 @@ export default {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 5000);
+          const timeoutId = setTimeout(() => controller.abort(), 3000);
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
