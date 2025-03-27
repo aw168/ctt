@@ -196,6 +196,7 @@ export default {
 
         const canSendMessages = memberData.result.can_send_messages !== false;
         const canManageTopics = memberData.result.can_manage_topics !== false;
+        const canPinMessages = memberData.result.can_pin_messages !== false;
         if (!canSendMessages) {
           await logToGroup('Bot lacks permission to send messages in the group');
           throw new Error('Bot lacks permission to send messages in the group');
@@ -203,6 +204,10 @@ export default {
         if (!canManageTopics) {
           await logToGroup('Bot lacks permission to manage topics in the group');
           throw new Error('Bot lacks permission to manage topics in the group');
+        }
+        if (!canPinMessages) {
+          await logToGroup('Bot lacks permission to pin messages in the group');
+          throw new Error('Bot lacks permission to pin messages in the group');
         }
       } catch (error) {
         await logToGroup(`Error checking bot permissions: ${error.message}`);
@@ -444,9 +449,9 @@ export default {
 
       try {
         const userInfo = await getUserInfo(chatId);
-        const userName = userInfo.username || userInfo.first_name;
-        const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
-        const topicName = `${nickname}`;
+        const userName = userInfo.username || userInfo.first_name || 'Unknown';
+        const nickname = `${userInfo.first_name || 'Unknown'} ${userInfo.last_name || ''}`.trim();
+        const topicName = `${nickname || 'Unknown User'}`;
 
         let topicId = await getExistingTopicId(chatId);
         if (!topicId || !(await checkTopicExists(topicId))) {
@@ -492,7 +497,7 @@ export default {
         }
         return false;
       } catch (error) {
-        await logToGroup(`Error checking topic existence for topicId ${topicId}: ${error.message}`);
+        await logToGroup(`Error checking topic existence for topicId ${topicId}: ${error.message} (${error.description || 'No description'})`);
         return false;
       }
     }
@@ -938,7 +943,9 @@ export default {
           body: JSON.stringify({ chat_id: chatId })
         });
         const data = await response.json();
-        if (!data.ok) throw new Error(`Failed to get user info: ${data.description}`);
+        if (!data.ok) {
+          throw new Error(`Failed to get user info: ${data.description}`);
+        }
         return data.result;
       } catch (error) {
         await logToGroup(`Error fetching user info for chatId ${chatId}: ${error.message}`);
@@ -966,7 +973,9 @@ export default {
           body: JSON.stringify({ chat_id: GROUP_ID, name: topicName })
         });
         const data = await response.json();
-        if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
+        if (!data.ok) {
+          throw new Error(`Failed to create forum topic: ${data.description}`);
+        }
         const topicId = data.result.message_thread_id;
 
         const now = new Date();
@@ -979,7 +988,7 @@ export default {
 
         return topicId;
       } catch (error) {
-        await logToGroup(`Error creating forum topic for user ${userId}: ${error.message}`);
+        await logToGroup(`Error creating forum topic for user ${userId}: ${error.message} (${error.description || 'No description'})`);
         throw error;
       }
     }
@@ -1013,6 +1022,11 @@ export default {
       }
 
       try {
+        // 检查话题是否仍然存在
+        if (!(await checkTopicExists(topicId))) {
+          throw new Error(`Topic ${topicId} does not exist or is inaccessible`);
+        }
+
         const requestBody = {
           chat_id: GROUP_ID,
           text: text,
@@ -1030,7 +1044,7 @@ export default {
         }
         return data;
       } catch (error) {
-        await logToGroup(`Error sending message to topic ${topicId}: ${error.message}`);
+        await logToGroup(`Error sending message to topic ${topicId}: ${error.message} (${error.description || 'No description'})`);
         throw error;
       }
     }
@@ -1049,7 +1063,7 @@ export default {
         }
         return true;
       } catch (error) {
-        await logToGroup(`Error checking access to chat ${chatId}: ${error.message}`);
+        await logToGroup(`Error checking access to chat ${chatId}: ${error.message} (${error.description || 'No description'})`);
         return false;
       }
     }
@@ -1064,6 +1078,11 @@ export default {
         // 检查机器人是否有权限向目标群组发送消息
         if (!(await canSendMessageToChat(GROUP_ID))) {
           throw new Error(`Bot cannot send messages to group ${GROUP_ID}`);
+        }
+
+        // 检查话题是否仍然存在
+        if (!(await checkTopicExists(topicId))) {
+          throw new Error(`Topic ${topicId} does not exist or is inaccessible`);
         }
 
         const requestBody = {
@@ -1083,7 +1102,7 @@ export default {
           throw new Error(`Failed to copy message to topic: ${data.description} (chat_id: ${GROUP_ID}, from_chat_id: ${message.chat.id}, message_id: ${message.message_id}, topic_id: ${topicId})`);
         }
       } catch (error) {
-        await logToGroup(`Error copying message to topic ${topicId}: ${error.message}`);
+        await logToGroup(`Error copying message to topic ${topicId}: ${error.message} (${error.description || 'No description'})`);
         // 回退机制：如果 copyMessage 失败，尝试直接发送文本
         if (message.text) {
           const fallbackMessage = `消息（来自 ${message.chat.id}）：\n${message.text}`;
@@ -1111,7 +1130,7 @@ export default {
           throw new Error(`Failed to pin message: ${data.description}`);
         }
       } catch (error) {
-        await logToGroup(`Error pinning message ${messageId} in topic ${topicId}: ${error.message}`);
+        await logToGroup(`Error pinning message ${messageId} in topic ${topicId}: ${error.message} (${error.description || 'No description'})`);
         throw error;
       }
     }
@@ -1144,7 +1163,7 @@ export default {
           throw new Error(`Failed to forward message to private chat: ${data.description} (chat_id: ${privateChatId}, from_chat_id: ${message.chat.id}, message_id: ${message.message_id})`);
         }
       } catch (error) {
-        await logToGroup(`Error forwarding message to private chat ${privateChatId}: ${error.message}`);
+        await logToGroup(`Error forwarding message to private chat ${privateChatId}: ${error.message} (${error.description || 'No description'})`);
         // 回退机制：如果 copyMessage 失败，尝试直接发送文本
         if (message.text) {
           const fallbackMessage = `消息（来自群组）：\n${message.text}`;
@@ -1168,7 +1187,7 @@ export default {
           throw new Error(`Failed to send message to user: ${data.description}`);
         }
       } catch (error) {
-        await logToGroup(`Error sending message to user ${chatId}: ${error.message}`);
+        await logToGroup(`Error sending message to user ${chatId}: ${error.message} (${error.description || 'No description'})`);
         throw error;
       }
     }
@@ -1223,7 +1242,7 @@ export default {
     try {
       return await handleRequest(request);
     } catch (error) {
-      await logToGroup(`Unhandled error in fetch handler: ${error.message}`);
+      await logToGroup(`Unhandled error in fetch handler: ${error.message} (${error.description || 'No description'})`);
       return new Response('Internal Server Error', { status: 500 });
     }
   }
