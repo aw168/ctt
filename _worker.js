@@ -175,7 +175,7 @@ export default {
               verification_code: 'TEXT',
               code_expiry: 'INTEGER',
               last_verification_message_id: 'TEXT',
-              is_first_verification: 'BOOLEAN DEFAULT FALSE',
+              is_first_verification: 'BOOLEAN DEFAULT TRUE',
               is_rate_limited: 'BOOLEAN DEFAULT FALSE'
             }
           },
@@ -233,7 +233,6 @@ export default {
               }
             }
 
-            // 为 settings 表添加索引
             if (tableName === 'settings') {
               await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
             }
@@ -244,13 +243,11 @@ export default {
           }
         }
 
-        // 初始化 settings 表并缓存值
         await d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
           .bind('verification_enabled', 'true').run();
         await d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
           .bind('user_raw_enabled', 'true').run();
 
-        // 缓存初始值
         settingsCache.verification_enabled = (await getSetting('verification_enabled', d1)) === 'true';
         settingsCache.user_raw_enabled = (await getSetting('user_raw_enabled', d1)) === 'true';
       } catch (error) {
@@ -339,7 +336,6 @@ export default {
         return;
       }
 
-      // 检查用户状态，如果不存在则初始化
       let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -364,7 +360,7 @@ export default {
         }
 
         const verificationEnabled = settingsCache.verification_enabled;
-        const isFirstVerification = userState?.is_first_verification || true;
+        const isFirstVerification = userState.is_first_verification;
 
         if (verificationEnabled && isFirstVerification) {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
@@ -376,28 +372,18 @@ export default {
         return;
       }
 
-      // 检查验证状态
       const verificationEnabled = settingsCache.verification_enabled;
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+      const isFirstVerification = userState.is_first_verification;
+      const isRateLimited = await checkMessageRate(chatId);
 
-      if (verificationEnabled && !isVerified) {
-        await sendMessageToUser(chatId, "您尚未完成验证，请完成验证后发送消息。");
+      if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
+        await sendMessageToUser(chatId, "请完成验证后发送消息。");
         await handleVerification(chatId, messageId);
         return;
       }
 
-      if (verificationEnabled && await checkMessageRate(chatId)) {
-        await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
-          .bind(true, chatId)
-          .run();
-        const messageContent = text || '非文本消息';
-        await sendMessageToUser(chatId, `无法转发的信息：${messageContent}\n信息过于频繁，请完成验证后发送信息`);
-        await handleVerification(chatId, messageId);
-        return;
-      }
-
-      // 转发消息
       try {
         const userInfo = await getUserInfo(chatId);
         const userName = userInfo.username || userInfo.first_name;
@@ -495,7 +481,7 @@ export default {
           ],
           [
             { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
-            { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' } // 修改为直接跳转链接
+            { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
           ],
           [
             { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
@@ -514,7 +500,6 @@ export default {
           })
         });
 
-        // 非阻塞删除消息
         fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -621,7 +606,6 @@ export default {
         await env.D1.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
           .bind(key, value)
           .run();
-        // 更新缓存
         if (key === 'verification_enabled') {
           settingsCache.verification_enabled = value === 'true';
         } else if (key === 'user_raw_enabled') {
@@ -692,31 +676,13 @@ export default {
           }
 
           if (result === 'correct') {
-            const verifiedExpiry = nowSeconds + 3600;
-            await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
-              .bind(true, verifiedExpiry, chatId)
+            const verifiedExpiry = nowSeconds + 3600 * 24; // 验证有效期设为24小时
+            await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ? WHERE chat_id = ?')
+              .bind(true, verifiedExpiry, false, chatId)
               .run();
-
-            const userState = await env.D1.prepare('SELECT is_first_verification, is_rate_limited FROM user_states WHERE chat_id = ?')
-              .bind(chatId)
-              .first();
-            const isFirstVerification = userState?.is_first_verification || false;
-            const isRateLimited = userState?.is_rate_limited || false;
 
             const successMessage = await getVerificationSuccessMessage();
             await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
-
-            if (isFirstVerification) {
-              await env.D1.prepare('UPDATE user_states SET is_first_verification = ? WHERE chat_id = ?')
-                .bind(false, chatId)
-                .run();
-            }
-
-            if (isRateLimited) {
-              await env.D1.prepare('UPDATE user_states SET is_rate_limited = ? WHERE chat_id = ?')
-                .bind(false, chatId)
-                .run();
-            }
           } else {
             await sendMessageToUser(chatId, '验证失败，请重新尝试。');
             await handleVerification(chatId, messageId);
@@ -776,8 +742,6 @@ export default {
             const newState = !currentState;
             await setSetting('user_raw_enabled', newState.toString());
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
-          } else if (action === 'github') {
-            // 直接跳转链接已在 sendAdminPanel 中实现
           } else if (action === 'delete_user') {
             try {
               await env.D1.batch([
@@ -996,7 +960,7 @@ export default {
           message_thread_id: topicId,
           parse_mode: 'Markdown'
         };
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        const response = await fetchWithRetry(`https:// `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody)
@@ -1018,8 +982,10 @@ export default {
           chat_id: GROUP_ID,
           from_chat_id: message.chat.id,
           message_id: message.message_id,
-          message_thread_id: topicId
-        };
+          message_thread_id: topicId,
+          disable_notification: true // 添加此参数避免频繁通知
+       –
+
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1027,7 +993,7 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          throw new Error(`Failed to copy message to topic: ${data.description}`);
+          throw new Error(`Failed to copy message to topic: ${data.description} (chat_id: ${GROUP_ID}, from_chat_id: ${message.chat.id}, message_id: ${message.message_id})`);
         }
       } catch (error) {
         console.error(`Error copying message to topic ${topicId}:`, error);
@@ -1062,7 +1028,8 @@ export default {
         const requestBody = {
           chat_id: privateChatId,
           from_chat_id: message.chat.id,
-          message_id: message.message_id
+          message_id: message.message_id,
+          disable_notification: true // 添加此参数避免频繁通知
         };
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
           method: 'POST',
@@ -1071,7 +1038,7 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          throw new Error(`Failed to forward message to private chat: ${data.description}`);
+          throw new Error(`Failed to forward message to private chat: ${data.description} (chat_id: ${privateChatId}, from_chat_id: ${message.chat.id}, message_id: ${message.message_id})`);
         }
       } catch (error) {
         console.error(`Error forwarding message to private chat ${privateChatId}:`, error);
