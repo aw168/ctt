@@ -385,14 +385,14 @@ export default {
 
       try {
         const userInfo = await getUserInfo(chatId);
-        const userName = userInfo.username || userInfo.first_name;
-        const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
-        const topicName = `${nickname}`;
+        const userName = userInfo.username || `User_${chatId}`; // 备用用户名
+        const nickname = userInfo.nickname || userName; // 备用昵称
+        const topicName = nickname;
 
         let topicId = await getExistingTopicId(chatId);
         if (!topicId || !(await checkTopicExists(topicId))) {
           console.log(`Creating new topic for chatId ${chatId}, topicName: ${topicName}`);
-          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id);
+          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
           await saveTopicId(chatId, topicId);
         }
 
@@ -713,9 +713,9 @@ export default {
 
           if (!(await checkTopicExists(topicId))) {
             const userInfo = await getUserInfo(privateChatId);
-            const userName = userInfo.username || userInfo.first_name;
-            const nickname = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();
-            const topicName = `${nickname}`;
+            const userName = userInfo.username || `User_${privateChatId}`;
+            const nickname = userInfo.nickname || userName;
+            const topicName = nickname;
             topicId = await createForumTopic(topicName, userName, nickname, privateChatId);
             await saveTopicId(privateChatId, topicId);
           }
@@ -885,11 +885,33 @@ export default {
           body: JSON.stringify({ chat_id: chatId })
         });
         const data = await response.json();
-        if (!data.ok) throw new Error(`Failed to get user info: ${data.description}`);
-        return data.result;
+        if (!data.ok) {
+          console.warn(`Failed to get user info for chatId ${chatId}: ${data.description}`);
+          // 返回一个默认对象，只包含 chatId 和一个默认用户名
+          return {
+            id: chatId,
+            username: `User_${chatId}`,
+            nickname: `User_${chatId}`
+          };
+        }
+        const result = data.result;
+        // 构造 nickname，优先使用 first_name 和 last_name，如果没有则用 username 或 chatId
+        const nickname = result.first_name
+          ? `${result.first_name}${result.last_name ? ` ${result.last_name}` : ''}`.trim()
+          : result.username || `User_${chatId}`;
+        return {
+          id: result.id || chatId,
+          username: result.username || `User_${chatId}`,
+          nickname: nickname
+        };
       } catch (error) {
         console.error(`Error fetching user info for chatId ${chatId}:`, error);
-        throw error;
+        // 如果完全失败，返回一个默认对象
+        return {
+          id: chatId,
+          username: `User_${chatId}`,
+          nickname: `User_${chatId}`
+        };
       }
     }
 
@@ -1072,7 +1094,7 @@ export default {
         const data = await response.json();
         if (!data.ok) {
           console.error(`Failed to send message to user ${chatId}: ${data.description}`, data);
-          throw new Error(`Failed to send message to user: ${data.description}`);
+          throw new Error(`Failed to send message to user: ${data DESCRIPTION}`);
         }
       } catch (error) {
         console.error(`Error sending message to user ${chatId}:`, error);
