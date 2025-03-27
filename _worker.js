@@ -290,6 +290,9 @@ export default {
     }
 
     async function onMessage(message) {
+      const totalStart = Date.now();
+      const timings = {};
+
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
@@ -314,6 +317,7 @@ export default {
       }
 
       // 并行查询 user_states 和 message_rates
+      const dbStart = Date.now();
       const [userStateResult, rateDataResult] = await Promise.all([
         env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
           .bind(chatId)
@@ -322,12 +326,15 @@ export default {
           .bind(chatId)
           .first()
       ]);
+      timings.dbQuery = Date.now() - dbStart;
 
       let userState = userStateResult;
       if (!userState) {
+        const insertStart = Date.now();
         await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified) VALUES (?, ?, ?, ?)')
           .bind(chatId, false, true, false)
           .run();
+        timings.dbInsert = Date.now() - insertStart;
         userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null };
       }
 
@@ -350,9 +357,11 @@ export default {
           startData.count += 1;
         }
 
+        const rateUpdateStart = Date.now();
         await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start, message_count, window_start) VALUES (?, ?, ?, ?, ?)')
           .bind(chatId, startData.count, startData.start, rateDataResult?.message_count || 0, rateDataResult?.window_start || now)
           .run();
+        timings.rateUpdate = Date.now() - rateUpdateStart;
 
         if (startData.count > maxStartsPerWindow) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
@@ -389,9 +398,11 @@ export default {
         rateData.count += 1;
       }
 
+      const rateUpdateStart = Date.now();
       await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start, start_count, start_window_start) VALUES (?, ?, ?, ?, ?)')
         .bind(chatId, rateData.count, rateData.start, rateDataResult?.start_count || 0, rateDataResult?.start_window_start || now)
         .run();
+      timings.rateUpdate = Date.now() - rateUpdateStart;
 
       const isRateLimited = rateData.count > MAX_MESSAGES_PER_MINUTE;
 
@@ -403,10 +414,14 @@ export default {
 
       try {
         // 并行获取用户信息和话题 ID
+        const userInfoStart = Date.now();
+        const topicIdStart = Date.now();
         const [userInfo, topicIdResult] = await Promise.all([
           getUserInfo(chatId),
           getExistingTopicId(chatId)
         ]);
+        timings.getUserInfo = Date.now() - userInfoStart;
+        timings.getTopicId = Date.now() - topicIdStart;
 
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
@@ -414,15 +429,37 @@ export default {
 
         let topicId = topicIdResult;
         if (!topicId) {
+          const createTopicStart = Date.now();
           topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
           await saveTopicId(chatId, topicId);
+          timings.createTopic = Date.now() - createTopicStart;
         }
 
         if (text) {
+          const sendMessageStart = Date.now();
           const formattedMessage = `${nickname}:\n${text}`;
           await sendMessageToTopic(topicId, formattedMessage);
+          timings.sendMessage = Date.now() - sendMessageStart;
+
+          // 添加耗时信息
+          const totalTime = Date.now() - totalStart;
+          const timingDetails = Object.entries(timings)
+            .map(([key, value]) => `${key}: ${value}ms`)
+            .join(', ');
+          const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
+          await sendMessageToTopic(topicId, timingMessage);
         } else {
+          const copyMessageStart = Date.now();
           await copyMessageToTopic(topicId, message);
+          timings.copyMessage = Date.now() - copyMessageStart;
+
+          // 添加耗时信息
+          const totalTime = Date.now() - totalStart;
+          const timingDetails = Object.entries(timings)
+            .map(([key, value]) => `${key}: ${value}ms`)
+            .join(', ');
+          const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
+          await sendMessageToTopic(topicId, timingMessage);
         }
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
@@ -459,6 +496,9 @@ export default {
     }
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
+      const totalStart = Date.now();
+      const timings = {};
+
       try {
         const verificationEnabled = settingsCache.verification_enabled;
         const userRawEnabled = settingsCache.user_raw_enabled;
@@ -482,6 +522,8 @@ export default {
         ];
 
         const adminMessage = '管理员面板：请选择操作';
+        const sendMessageStart = Date.now();
+        const deleteMessageStart = Date.now();
         await Promise.all([
           fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
@@ -502,6 +544,16 @@ export default {
             })
           })
         ]);
+        timings.sendMessage = Date.now() - sendMessageStart;
+        timings.deleteMessage = Date.now() - deleteMessageStart;
+
+        // 添加耗时信息
+        const totalTime = Date.now() - totalStart;
+        const timingDetails = Object.entries(timings)
+          .map(([key, value]) => `${key}: ${value}ms`)
+          .join(', ');
+        const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
+        await sendMessageToTopic(topicId, timingMessage);
       } catch (error) {
         console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
       }
