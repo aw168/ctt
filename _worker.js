@@ -18,24 +18,36 @@ const adminCache = new Map();
 
 export default {
   async fetch(request, env) {
-    // 加载环境变量
+    const totalStart = Date.now();
+    const timings = {};
+
+    // 记录初始化耗时
+    const initStart = Date.now();
     BOT_TOKEN = env.BOT_TOKEN_ENV || null;
     GROUP_ID = env.GROUP_ID_ENV || null;
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
     if (!BOT_TOKEN) console.error('BOT_TOKEN_ENV is not defined');
     if (!GROUP_ID) console.error('GROUP_ID_ENV is not defined');
-    if (!env.D1) {
-      console.error('D1 database is not bound');
-      return new Response('Server configuration error: D1 database is not bound', { status: 500 });
+    if (!env.KV) {
+      console.error('KV namespace is not bound');
+      return new Response('Server configuration error: KV namespace is not bound', { status: 500 });
     }
+    timings.init = Date.now() - initStart;
 
-    try {
-      await checkAndRepairTables(env.D1);
-    } catch (error) {
-      console.error('Error checking and repairing tables:', error);
-      return new Response('Database initialization error', { status: 500 });
+    // 初始化 settings
+    const settingsInitStart = Date.now();
+    settingsCache.verification_enabled = (await env.KV.get('settings:verification_enabled')) === 'true';
+    settingsCache.user_raw_enabled = (await env.KV.get('settings:user_raw_enabled')) === 'true';
+    if (settingsCache.verification_enabled === null) {
+      await env.KV.put('settings:verification_enabled', 'true');
+      settingsCache.verification_enabled = true;
     }
+    if (settingsCache.user_raw_enabled === null) {
+      await env.KV.put('settings:user_raw_enabled', 'true');
+      settingsCache.user_raw_enabled = true;
+    }
+    timings.settingsInit = Date.now() - settingsInitStart;
 
     if (!isWebhookInitialized && BOT_TOKEN) {
       try {
@@ -55,12 +67,15 @@ export default {
     }
 
     try {
-      await cleanExpiredVerificationCodes(env.D1);
+      await cleanExpiredVerificationCodes(env.KV);
     } catch (error) {
       console.error('Error cleaning expired verification codes:', error);
     }
 
     async function handleRequest(request) {
+      const handleStart = Date.now();
+      timings.handleRequestStart = Date.now() - totalStart;
+
       if (!BOT_TOKEN || !GROUP_ID) {
         console.error('Missing required environment variables');
         return new Response('Server configuration error: Missing required environment variables', { status: 500 });
@@ -80,9 +95,6 @@ export default {
         return await registerWebhook(request);
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
-      } else if (url.pathname === '/checkTables') {
-        await checkAndRepairTables(env.D1);
-        return new Response('Database tables checked and repaired', { status: 200 });
       }
       return new Response('Not Found', { status: 404 });
     }
@@ -155,106 +167,7 @@ export default {
       return data.result.id;
     }
 
-    async function checkAndRepairTables(d1) {
-      try {
-        const expectedTables = {
-          user_states: {
-            columns: {
-              chat_id: 'TEXT PRIMARY KEY',
-              is_blocked: 'BOOLEAN DEFAULT FALSE',
-              is_verified: 'BOOLEAN DEFAULT FALSE',
-              verified_expiry: 'INTEGER',
-              verification_code: 'TEXT',
-              code_expiry: 'INTEGER',
-              last_verification_message_id: 'TEXT',
-              is_first_verification: 'BOOLEAN DEFAULT TRUE',
-              is_rate_limited: 'BOOLEAN DEFAULT FALSE'
-            }
-          },
-          message_rates: {
-            columns: {
-              chat_id: 'TEXT PRIMARY KEY',
-              message_count: 'INTEGER DEFAULT 0',
-              window_start: 'INTEGER',
-              start_count: 'INTEGER DEFAULT 0',
-              start_window_start: 'INTEGER'
-            }
-          },
-          chat_topic_mappings: {
-            columns: {
-              chat_id: 'TEXT PRIMARY KEY',
-              topic_id: 'TEXT NOT NULL'
-            }
-          },
-          settings: {
-            columns: {
-              key: 'TEXT PRIMARY KEY',
-              value: 'TEXT'
-            }
-          }
-        };
-
-        for (const [tableName, structure] of Object.entries(expectedTables)) {
-          const tableInfo = await d1.prepare(
-            `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`
-          ).bind(tableName).first();
-
-          if (!tableInfo) {
-            await createTable(d1, tableName, structure);
-            continue;
-          }
-
-          const columnsResult = await d1.prepare(
-            `PRAGMA table_info(${tableName})`
-          ).all();
-          
-          const currentColumns = new Map(
-            columnsResult.results.map(col => [col.name, {
-              type: col.type,
-              notnull: col.notnull,
-              dflt_value: col.dflt_value
-            }])
-          );
-
-          for (const [colName, colDef] of Object.entries(structure.columns)) {
-            if (!currentColumns.has(colName)) {
-              const columnParts = colDef.split(' ');
-              const addColumnSQL = `ALTER TABLE ${tableName} ADD COLUMN ${colName} ${columnParts.slice(1).join(' ')}`;
-              await d1.exec(addColumnSQL);
-            }
-          }
-
-          if (tableName === 'chat_topic_mappings') {
-            await d1.exec('CREATE INDEX IF NOT EXISTS idx_chat_topic_mappings_chat_id ON chat_topic_mappings (chat_id)');
-            await d1.exec('CREATE INDEX IF NOT EXISTS idx_chat_topic_mappings_topic_id ON chat_topic_mappings (topic_id)');
-          }
-          if (tableName === 'settings') {
-            await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
-          }
-        }
-
-        await d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-          .bind('verification_enabled', 'true').run();
-        await d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-          .bind('user_raw_enabled', 'true').run();
-
-        settingsCache.verification_enabled = (await getSetting('verification_enabled', d1)) === 'true';
-        settingsCache.user_raw_enabled = (await getSetting('user_raw_enabled', d1)) === 'true';
-      } catch (error) {
-        console.error('Error in checkAndRepairTables:', error);
-        throw error;
-      }
-    }
-
-    async function createTable(d1, tableName, structure) {
-      const columnsDef = Object.entries(structure.columns)
-        .map(([name, def]) => `${name} ${def}`)
-        .join(', ');
-      const createSQL = `CREATE TABLE ${tableName} (${columnsDef})`;
-      await d1.exec(createSQL);
-    }
-
-    async function cleanExpiredVerificationCodes(d1) {
+    async function cleanExpiredVerificationCodes(kv) {
       const now = Date.now();
       if (now - lastCleanupTime < CLEANUP_INTERVAL) {
         return;
@@ -262,19 +175,19 @@ export default {
 
       try {
         const nowSeconds = Math.floor(now / 1000);
-        const expiredCodes = await d1.prepare(
-          'SELECT chat_id FROM user_states WHERE code_expiry IS NOT NULL AND code_expiry < ?'
-        ).bind(nowSeconds).all();
+        const userStates = await kv.list({ prefix: 'user_state:' });
+        const expiredKeys = [];
 
-        if (expiredCodes.results.length > 0) {
-          await d1.batch(
-            expiredCodes.results.map(({ chat_id }) =>
-              d1.prepare(
-                'UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?'
-              ).bind(chat_id)
-            )
-          );
+        for (const key of userStates.keys) {
+          const userState = JSON.parse(await kv.get(key.name));
+          if (userState.code_expiry && userState.code_expiry < nowSeconds) {
+            userState.verification_code = null;
+            userState.code_expiry = null;
+            await kv.put(key.name, JSON.stringify(userState));
+            expiredKeys.push(key.name);
+          }
         }
+
         lastCleanupTime = now;
       } catch (error) {
         console.error('Error cleaning expired verification codes:', error);
@@ -290,7 +203,7 @@ export default {
     }
 
     async function onMessage(message) {
-      const totalStart = Date.now();
+      const messageStart = Date.now();
       const timings = {};
 
       const chatId = message.chat.id.toString();
@@ -317,25 +230,19 @@ export default {
       }
 
       // 并行查询 user_states 和 message_rates
-      const dbStart = Date.now();
-      const [userStateResult, rateDataResult] = await Promise.all([
-        env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first(),
-        env.D1.prepare('SELECT message_count, window_start, start_count, start_window_start FROM message_rates WHERE chat_id = ?')
-          .bind(chatId)
-          .first()
+      const kvQueryStart = Date.now();
+      const [userStateRaw, rateDataRaw] = await Promise.all([
+        env.KV.get(`user_state:${chatId}`),
+        env.KV.get(`message_rate:${chatId}`)
       ]);
-      timings.dbQuery = Date.now() - dbStart;
+      timings.kvQuery = Date.now() - kvQueryStart;
 
-      let userState = userStateResult;
+      let userState = userStateRaw ? JSON.parse(userStateRaw) : null;
       if (!userState) {
-        const insertStart = Date.now();
-        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified) VALUES (?, ?, ?, ?)')
-          .bind(chatId, false, true, false)
-          .run();
-        timings.dbInsert = Date.now() - insertStart;
         userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null };
+        const kvInsertStart = Date.now();
+        await env.KV.put(`user_state:${chatId}`, JSON.stringify(userState));
+        timings.kvInsert = Date.now() - kvInsertStart;
       }
 
       const isBlocked = userState.is_blocked || false;
@@ -349,7 +256,9 @@ export default {
         const window = 5 * 60 * 1000;
         const maxStartsPerWindow = 1;
 
-        let startData = rateDataResult ? { count: rateDataResult.start_count, start: rateDataResult.start_window_start } : { count: 0, start: now };
+        let rateData = rateDataRaw ? JSON.parse(rateDataRaw) : { start_count: 0, start_window_start: now, message_count: 0, window_start: now };
+        let startData = { count: rateData.start_count, start: rateData.start_window_start };
+
         if (now - startData.start > window) {
           startData.count = 1;
           startData.start = now;
@@ -357,10 +266,11 @@ export default {
           startData.count += 1;
         }
 
+        rateData.start_count = startData.count;
+        rateData.start_window_start = startData.start;
+
         const rateUpdateStart = Date.now();
-        await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start, message_count, window_start) VALUES (?, ?, ?, ?, ?)')
-          .bind(chatId, startData.count, startData.start, rateDataResult?.message_count || 0, rateDataResult?.window_start || now)
-          .run();
+        await env.KV.put(`message_rate:${chatId}`, JSON.stringify(rateData));
         timings.rateUpdate = Date.now() - rateUpdateStart;
 
         if (startData.count > maxStartsPerWindow) {
@@ -389,22 +299,20 @@ export default {
       // 检查消息速率限制
       const now = Date.now();
       const window = 60 * 1000;
-      let rateData = rateDataResult ? { count: rateDataResult.message_count, start: rateDataResult.window_start } : { count: 0, start: now };
+      let rateData = rateDataRaw ? JSON.parse(rateDataRaw) : { message_count: 0, window_start: now, start_count: 0, start_window_start: now };
 
-      if (now - rateData.start > window) {
-        rateData.count = 1;
-        rateData.start = now;
+      if (now - rateData.window_start > window) {
+        rateData.message_count = 1;
+        rateData.window_start = now;
       } else {
-        rateData.count += 1;
+        rateData.message_count += 1;
       }
 
       const rateUpdateStart = Date.now();
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start, start_count, start_window_start) VALUES (?, ?, ?, ?, ?)')
-        .bind(chatId, rateData.count, rateData.start, rateDataResult?.start_count || 0, rateDataResult?.start_window_start || now)
-        .run();
+      await env.KV.put(`message_rate:${chatId}`, JSON.stringify(rateData));
       timings.rateUpdate = Date.now() - rateUpdateStart;
 
-      const isRateLimited = rateData.count > MAX_MESSAGES_PER_MINUTE;
+      const isRateLimited = rateData.message_count > MAX_MESSAGES_PER_MINUTE;
 
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
         await sendMessageToUser(chatId, "请完成验证后发送消息。");
@@ -416,7 +324,7 @@ export default {
         // 并行获取用户信息和话题 ID
         const userInfoStart = Date.now();
         const topicIdStart = Date.now();
-        const [userInfo, topicIdResult] = await Promise.all([
+        const [userInfo, topicId] = await Promise.all([
           getUserInfo(chatId),
           getExistingTopicId(chatId)
         ]);
@@ -427,39 +335,39 @@ export default {
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
-        let topicId = topicIdResult;
-        if (!topicId) {
+        let finalTopicId = topicId;
+        if (!finalTopicId) {
           const createTopicStart = Date.now();
-          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-          await saveTopicId(chatId, topicId);
+          finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+          await saveTopicId(chatId, finalTopicId);
           timings.createTopic = Date.now() - createTopicStart;
         }
 
         if (text) {
           const sendMessageStart = Date.now();
           const formattedMessage = `${nickname}:\n${text}`;
-          await sendMessageToTopic(topicId, formattedMessage);
+          await sendMessageToTopic(finalTopicId, formattedMessage);
           timings.sendMessage = Date.now() - sendMessageStart;
 
-          // 添加耗时信息
-          const totalTime = Date.now() - totalStart;
+          // 异步发送耗时信息
+          const totalTime = Date.now() - messageStart;
           const timingDetails = Object.entries(timings)
             .map(([key, value]) => `${key}: ${value}ms`)
             .join(', ');
           const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
-          await sendMessageToTopic(topicId, timingMessage);
+          setTimeout(() => sendMessageToTopic(finalTopicId, timingMessage), 0);
         } else {
           const copyMessageStart = Date.now();
-          await copyMessageToTopic(topicId, message);
+          await copyMessageToTopic(finalTopicId, message);
           timings.copyMessage = Date.now() - copyMessageStart;
 
-          // 添加耗时信息
-          const totalTime = Date.now() - totalStart;
+          // 异步发送耗时信息
+          const totalTime = Date.now() - messageStart;
           const timingDetails = Object.entries(timings)
             .map(([key, value]) => `${key}: ${value}ms`)
             .join(', ');
           const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
-          await sendMessageToTopic(topicId, timingMessage);
+          setTimeout(() => sendMessageToTopic(finalTopicId, timingMessage), 0);
         }
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
@@ -484,9 +392,9 @@ export default {
 
       const targetChatId = parts[1];
       try {
-        await env.D1.batch([
-          env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId),
-          env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId)
+        await Promise.all([
+          env.KV.delete(`user_state:${targetChatId}`),
+          env.KV.delete(`message_rate:${targetChatId}`)
         ]);
         await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
       } catch (error) {
@@ -496,7 +404,7 @@ export default {
     }
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
-      const totalStart = Date.now();
+      const adminStart = Date.now();
       const timings = {};
 
       try {
@@ -547,13 +455,13 @@ export default {
         timings.sendMessage = Date.now() - sendMessageStart;
         timings.deleteMessage = Date.now() - deleteMessageStart;
 
-        // 添加耗时信息
-        const totalTime = Date.now() - totalStart;
+        // 异步发送耗时信息
+        const totalTime = Date.now() - adminStart;
         const timingDetails = Object.entries(timings)
           .map(([key, value]) => `${key}: ${value}ms`)
           .join(', ');
         const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
-        await sendMessageToTopic(topicId, timingMessage);
+        setTimeout(() => sendMessageToTopic(topicId, timingMessage), 0);
       } catch (error) {
         console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
       }
@@ -586,23 +494,9 @@ export default {
       }
     }
 
-    async function getSetting(key, d1) {
-      try {
-        const result = await d1.prepare('SELECT value FROM settings WHERE key = ?')
-          .bind(key)
-          .first();
-        return result?.value || null;
-      } catch (error) {
-        console.error(`Error getting setting ${key}:`, error);
-        throw error;
-      }
-    }
-
     async function setSetting(key, value) {
       try {
-        await env.D1.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
-          .bind(key, value)
-          .run();
+        await env.KV.put(`settings:${key}`, value);
         if (key === 'verification_enabled') {
           settingsCache.verification_enabled = value === 'true';
         } else if (key === 'user_raw_enabled') {
@@ -657,11 +551,10 @@ export default {
             return;
           }
 
-          const verificationState = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          const storedCode = verificationState?.verification_code;
-          const codeExpiry = verificationState?.code_expiry;
+          const userStateRaw = await env.KV.get(`user_state:${chatId}`);
+          const userState = userStateRaw ? JSON.parse(userStateRaw) : {};
+          const storedCode = userState.verification_code;
+          const codeExpiry = userState.code_expiry;
           const nowSeconds = Math.floor(Date.now() / 1000);
 
           if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
@@ -671,9 +564,13 @@ export default {
 
           if (result === 'correct') {
             const verifiedExpiry = nowSeconds + 3600 * 24;
-            await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ? WHERE chat_id = ?')
-              .bind(true, verifiedExpiry, false, chatId)
-              .run();
+            userState.is_verified = true;
+            userState.verified_expiry = verifiedExpiry;
+            userState.verification_code = null;
+            userState.code_expiry = null;
+            userState.last_verification_message_id = null;
+            userState.is_first_verification = false;
+            await env.KV.put(`user_state:${chatId}`, JSON.stringify(userState));
 
             const successMessage = await getVerificationSuccessMessage();
             await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
@@ -700,14 +597,17 @@ export default {
           }
 
           if (action === 'block') {
-            await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
-              .bind(privateChatId, true)
-              .run();
+            const userStateRaw = await env.KV.get(`user_state:${privateChatId}`);
+            const userState = userStateRaw ? JSON.parse(userStateRaw) : {};
+            userState.is_blocked = true;
+            await env.KV.put(`user_state:${privateChatId}`, JSON.stringify(userState));
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
           } else if (action === 'unblock') {
-            await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
-              .bind(privateChatId, false, true)
-              .run();
+            const userStateRaw = await env.KV.get(`user_state:${privateChatId}`);
+            const userState = userStateRaw ? JSON.parse(userStateRaw) : {};
+            userState.is_blocked = false;
+            userState.is_first_verification = true;
+            await env.KV.put(`user_state:${privateChatId}`, JSON.stringify(userState));
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
           } else if (action === 'toggle_verification') {
             const currentState = settingsCache.verification_enabled;
@@ -715,11 +615,16 @@ export default {
             await setSetting('verification_enabled', newState.toString());
             await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'check_blocklist') {
-            const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
-              .bind(true)
-              .all();
-            const blockList = blockedUsers.results.length > 0 
-              ? blockedUsers.results.map(row => row.chat_id).join('\n')
+            const userStates = await env.KV.list({ prefix: 'user_state:' });
+            const blockedUsers = [];
+            for (const key of userStates.keys) {
+              const userState = JSON.parse(await env.KV.get(key.name));
+              if (userState.is_blocked) {
+                blockedUsers.push(key.name.replace('user_state:', ''));
+              }
+            }
+            const blockList = blockedUsers.length > 0 
+              ? blockedUsers.join('\n')
               : '当前没有被拉黑的用户。';
             await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`);
           } else if (action === 'toggle_user_raw') {
@@ -729,9 +634,9 @@ export default {
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
             try {
-              await env.D1.batch([
-                env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
-                env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId)
+              await Promise.all([
+                env.KV.delete(`user_state:${privateChatId}`),
+                env.KV.delete(`message_rate:${privateChatId}`)
               ]);
               await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息记录已删除，话题保留。`);
             } catch (error) {
@@ -759,14 +664,13 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
-      await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
-        .bind(chatId)
-        .run();
+      const userStateRaw = await env.KV.get(`user_state:${chatId}`);
+      let userState = userStateRaw ? JSON.parse(userStateRaw) : {};
+      userState.verification_code = null;
+      userState.code_expiry = null;
+      await env.KV.put(`user_state:${chatId}`, JSON.stringify(userState));
 
-      const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      const lastVerificationMessageId = lastVerification?.last_verification_message_id;
+      const lastVerificationMessageId = userState.last_verification_message_id;
 
       if (lastVerificationMessageId) {
         try {
@@ -781,9 +685,8 @@ export default {
         } catch (error) {
           console.error("Error deleting old verification message:", error);
         }
-        await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
-          .bind(chatId)
-          .run();
+        userState.last_verification_message_id = null;
+        await env.KV.put(`user_state:${chatId}`, JSON.stringify(userState));
       }
 
       await sendVerification(chatId);
@@ -811,9 +714,11 @@ export default {
       const nowSeconds = Math.floor(Date.now() / 1000);
       const codeExpiry = nowSeconds + 300;
 
-      await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
-        .bind(chatId, correctResult.toString(), codeExpiry)
-        .run();
+      const userStateRaw = await env.KV.get(`user_state:${chatId}`);
+      let userState = userStateRaw ? JSON.parse(userStateRaw) : {};
+      userState.verification_code = correctResult.toString();
+      userState.code_expiry = codeExpiry;
+      await env.KV.put(`user_state:${chatId}`, JSON.stringify(userState));
 
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -827,9 +732,8 @@ export default {
         });
         const data = await response.json();
         if (data.ok) {
-          await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
-            .bind(data.result.message_id.toString(), chatId)
-            .run();
+          userState.last_verification_message_id = data.result.message_id.toString();
+          await env.KV.put(`user_state:${chatId}`, JSON.stringify(userState));
         }
       } catch (error) {
         console.error("Error sending verification message:", error);
@@ -910,10 +814,8 @@ export default {
 
     async function getExistingTopicId(chatId) {
       try {
-        const mapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        return mapping?.topic_id || null;
+        const topicId = await env.KV.get(`chat_topic:${chatId}`);
+        return topicId || null;
       } catch (error) {
         console.error(`Error fetching topic ID for chatId ${chatId}:`, error);
         throw error;
@@ -948,9 +850,7 @@ export default {
 
     async function saveTopicId(chatId, topicId) {
       try {
-        await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-          .bind(chatId, topicId)
-          .run();
+        await env.KV.put(`chat_topic:${chatId}`, topicId);
       } catch (error) {
         console.error(`Error saving topic ID ${topicId} for chatId ${chatId}:`, error);
         throw error;
@@ -959,10 +859,14 @@ export default {
 
     async function getPrivateChatId(topicId) {
       try {
-        const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
-          .bind(topicId)
-          .first();
-        return mapping?.chat_id || null;
+        const chatTopics = await env.KV.list({ prefix: 'chat_topic:' });
+        for (const key of chatTopics.keys) {
+          const storedTopicId = await env.KV.get(key.name);
+          if (storedTopicId === topicId.toString()) {
+            return key.name.replace('chat_topic:', '');
+          }
+        }
+        return null;
       } catch (error) {
         console.error(`Error fetching private chat ID for topicId ${topicId}:`, error);
         throw error;
@@ -1087,7 +991,7 @@ export default {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 3000);
+          const timeoutId = setTimeout(() => controller.abort(), 2000); // 缩短超时时间
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
@@ -1131,7 +1035,11 @@ export default {
     }
 
     try {
-      return await handleRequest(request);
+      const response = await handleRequest(request);
+      const totalTime = Date.now() - totalStart;
+      timings.total = totalTime;
+      console.log(`Request timings: ${JSON.stringify(timings)}`);
+      return response;
     } catch (error) {
       console.error('Unhandled error in fetch handler:', error);
       return new Response('Internal Server Error', { status: 500 });
