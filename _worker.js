@@ -95,21 +95,27 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
+      // 处理群组消息
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
-          if (privateChatId && text === '/admin') {
-            await sendAdminPanel(chatId, topicId, privateChatId, messageId);
-            return;
-          }
-          if (privateChatId && text.startsWith('/reset_user')) {
-            await handleResetUser(chatId, topicId, text);
-            return;
-          }
           if (privateChatId) {
+            if (text === '/admin') {
+              await sendAdminPanel(chatId, topicId, privateChatId, messageId);
+              return;
+            }
+            if (text.startsWith('/reset_user')) {
+              await handleResetUser(chatId, topicId, text);
+              return;
+            }
+            // 转发群组消息到私聊
             await forwardMessageToPrivateChat(privateChatId, message);
+          } else {
+            console.error(`No private chat ID found for topicId ${topicId}`);
           }
+        } else {
+          console.error('No topic ID found for group message');
         }
         return;
       }
@@ -151,8 +157,8 @@ export default {
         const window = 5 * 60 * 1000;
         const maxStartsPerWindow = 1;
 
-        let startCount = userState.start_count;
-        let startWindowStart = userState.start_window_start;
+        let startCount = userState.start_count || 0;
+        let startWindowStart = userState.start_window_start || now;
 
         if (now - startWindowStart > window) {
           startCount = 1;
@@ -197,8 +203,8 @@ export default {
       // 速率限制
       const now = Date.now();
       const window = 60 * 1000;
-      let messageCount = userState.message_count;
-      let windowStart = userState.window_start;
+      let messageCount = userState.message_count || 0;
+      let windowStart = userState.window_start || now;
 
       if (now - windowStart > window) {
         messageCount = 1;
@@ -360,6 +366,7 @@ export default {
         await sendMessageToTopic(topicId, timingMessage);
       } catch (error) {
         console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
+        await sendMessageToTopic(topicId, `发送管理员面板失败：${error.message}`);
       }
     }
 
@@ -752,18 +759,23 @@ export default {
     }
 
     async function forwardMessageToPrivateChat(privateChatId, message) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: privateChatId,
-          from_chat_id: message.chat.id,
-          message_id: message.message_id,
-          disable_notification: true
-        })
-      });
-      const data = await response.json();
-      if (!data.ok) throw new Error(`Failed to forward message to private chat: ${data.description}`);
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: privateChatId,
+            from_chat_id: message.chat.id,
+            message_id: message.message_id,
+            disable_notification: true
+          })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(`Failed to forward message to private chat: ${data.description}`);
+      } catch (error) {
+        console.error(`Error forwarding message to private chat ${privateChatId}:`, error);
+        await sendMessageToTopic(null, `无法转发消息到用户 ${privateChatId}：${error.message}`);
+      }
     }
 
     async function sendMessageToTopic(topicId, text) {
@@ -812,23 +824,38 @@ export default {
     }
 
     async function sendMessageToUser(chatId, text) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: text
-        })
-      });
-      const data = await response.json();
-      if (!data.ok) throw new Error(`Failed to send message to user: ${data.description}`);
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: text
+          })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(`Failed to send message to user: ${data.description}`);
+      } catch (error) {
+        console.error(`Error sending message to user ${chatId}:`, error);
+      }
     }
 
     async function getPrivateChatId(topicId) {
+      // 先从缓存中查找
+      for (const [chatId, cachedTopicId] of topicIdCache.entries()) {
+        if (cachedTopicId === topicId.toString()) {
+          return chatId;
+        }
+      }
+      // 如果缓存中没有，则从数据库中查找
       const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
         .bind(topicId)
         .first();
-      return mapping?.chat_id || null;
+      const chatId = mapping?.chat_id || null;
+      if (chatId) {
+        topicIdCache.set(chatId, topicId.toString());
+      }
+      return chatId;
     }
 
     async function fetchWithRetry(url, options) {
