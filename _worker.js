@@ -152,7 +152,8 @@ export default {
           start_window_start: Date.now(),
           verification_code: null,
           code_expiry: null,
-          last_verification_message_id: null
+          last_verification_message_id: null,
+          last_updated: Date.now() // 添加时间戳用于同步
         };
         userStateCache.set(userStateKey, userState);
       }
@@ -180,6 +181,7 @@ export default {
 
         userState.start_count = startCount;
         userState.start_window_start = startWindowStart;
+        userState.last_updated = Date.now();
         userStateCache.set(userStateKey, userState);
 
         try {
@@ -219,6 +221,9 @@ export default {
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
       const isFirstVerification = userState.is_first_verification;
 
+      // 调试日志：检查验证状态
+      console.log(`User ${chatId} verification status: is_verified=${userState.is_verified}, verified_expiry=${userState.verified_expiry}, nowSeconds=${nowSeconds}, isVerified=${isVerified}`);
+
       // 速率限制
       const now = Date.now();
       const window = 60 * 1000;
@@ -234,6 +239,7 @@ export default {
 
       userState.message_count = messageCount;
       userState.window_start = windowStart;
+      userState.last_updated = Date.now();
       userStateCache.set(userStateKey, userState);
 
       try {
@@ -503,26 +509,32 @@ export default {
           }
 
           if (result === 'correct') {
-            const verifiedExpiry = nowSeconds + 3600 * 24;
+            const verifiedExpiry = nowSeconds + 3600 * 24; // 24 小时后过期
             userState.is_verified = true;
             userState.verified_expiry = verifiedExpiry;
             userState.verification_code = null;
             userState.code_expiry = null;
             userState.last_verification_message_id = null;
             userState.is_first_verification = false;
+            userState.last_updated = Date.now();
             userStateCache.set(userStateKey, userState);
+
+            // 调试日志：确认更新后的状态
+            console.log(`User ${chatId} passed verification: is_verified=${userState.is_verified}, verified_expiry=${userState.verified_expiry}`);
 
             try {
               await env.D1.prepare(
                 'UPDATE users SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ? WHERE chat_id = ?'
-              ).bind(true, verifiedExpiry, false, chatId).run();
+              ).bind(1, verifiedExpiry, 0, chatId).run();
             } catch (error) {
               console.error(`Error updating verification status for chatId ${chatId}:`, error);
               userState.is_verified = false;
               userState.verified_expiry = null;
               userState.is_first_verification = true;
               userStateCache.set(userStateKey, userState);
-              throw error;
+              await sendMessageToUser(chatId, '验证状态更新失败，请重新验证。');
+              await handleVerification(chatId, messageId);
+              return;
             }
 
             const successMessage = await getVerificationSuccessMessage();
@@ -553,11 +565,12 @@ export default {
             const userStateKey = `${privateChatId}:state`;
             const userState = userStateCache.get(userStateKey) || {};
             userState.is_blocked = true;
+            userState.last_updated = Date.now();
             userStateCache.set(userStateKey, userState);
 
             try {
               await env.D1.prepare('UPDATE users SET is_blocked = ? WHERE chat_id = ?')
-                .bind(true, privateChatId)
+                .bind(1, privateChatId)
                 .run();
             } catch (error) {
               console.error(`Error blocking user ${privateChatId}:`, error);
@@ -571,11 +584,12 @@ export default {
             const userState = userStateCache.get(userStateKey) || {};
             userState.is_blocked = false;
             userState.is_first_verification = true;
+            userState.last_updated = Date.now();
             userStateCache.set(userStateKey, userState);
 
             try {
               await env.D1.prepare('UPDATE users SET is_blocked = ?, is_first_verification = ? WHERE chat_id = ?')
-                .bind(false, true, privateChatId)
+                .bind(0, 1, privateChatId)
                 .run();
             } catch (error) {
               console.error(`Error unblocking user ${privateChatId}:`, error);
@@ -592,7 +606,7 @@ export default {
             await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'check_blocklist') {
             const blockedUsers = await env.D1.prepare('SELECT chat_id FROM users WHERE is_blocked = ?')
-              .bind(true)
+              .bind(1)
               .all();
             const blockList = blockedUsers.results.length > 0 
               ? blockedUsers.results.map(row => row.chat_id).join('\n')
@@ -646,6 +660,7 @@ export default {
       // 清除旧验证码
       userState.verification_code = null;
       userState.code_expiry = null;
+      userState.last_updated = Date.now();
       userStateCache.set(userStateKey, userState);
 
       try {
@@ -671,6 +686,7 @@ export default {
           console.error("Error deleting old verification message:", error);
         }
         userState.last_verification_message_id = null;
+        userState.last_updated = Date.now();
         userStateCache.set(userStateKey, userState);
         try {
           await env.D1.prepare('UPDATE users SET last_verification_message_id = NULL WHERE chat_id = ?')
@@ -710,6 +726,7 @@ export default {
       const userState = userStateCache.get(userStateKey) || {};
       userState.verification_code = correctResult.toString();
       userState.code_expiry = codeExpiry;
+      userState.last_updated = Date.now();
       userStateCache.set(userStateKey, userState);
 
       try {
@@ -737,6 +754,7 @@ export default {
         const data = await response.json();
         if (data.ok) {
           userState.last_verification_message_id = data.result.message_id.toString();
+          userState.last_updated = Date.now();
           userStateCache.set(userStateKey, userState);
           try {
             await env.D1.prepare('UPDATE users SET last_verification_message_id = ? WHERE chat_id = ?')
@@ -1069,6 +1087,7 @@ export default {
           if (userState) {
             userState.verification_code = null;
             userState.code_expiry = null;
+            userState.last_updated = Date.now();
             userStateCache.set(userStateKey, userState);
           }
         });
@@ -1086,7 +1105,11 @@ export default {
         const users = await env.D1.prepare('SELECT * FROM users').all();
         users.results.forEach(user => {
           const userStateKey = `${user.chat_id}:state`;
-          userStateCache.set(userStateKey, user);
+          const cachedState = userStateCache.get(userStateKey);
+          // 仅在数据库状态较新时更新缓存
+          if (!cachedState || (cachedState.last_updated && user.last_updated && cachedState.last_updated < user.last_updated)) {
+            userStateCache.set(userStateKey, { ...user, last_updated: Date.now() });
+          }
         });
         lastCacheSyncTime = now;
       } catch (error) {
