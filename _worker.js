@@ -975,8 +975,37 @@ export default {
       }
     }
 
+    async function canSendMessageToChat(chatId) {
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId })
+        });
+        const data = await response.json();
+        if (!data.ok) {
+          console.error(`Cannot access chat ${chatId}: ${data.description}`);
+          return false;
+        }
+        return true;
+      } catch (error) {
+        console.error(`Error checking access to chat ${chatId}:`, error);
+        return false;
+      }
+    }
+
     async function copyMessageToTopic(topicId, message) {
       try {
+        // 验证参数
+        if (!message.chat?.id || !message.message_id || !topicId || !GROUP_ID) {
+          throw new Error(`Invalid parameters: chat_id=${message.chat?.id}, message_id=${message.message_id}, topicId=${topicId}, GROUP_ID=${GROUP_ID}`);
+        }
+
+        // 检查机器人是否有权限向目标群组发送消息
+        if (!(await canSendMessageToChat(GROUP_ID))) {
+          throw new Error(`Bot cannot send messages to group ${GROUP_ID}`);
+        }
+
         const requestBody = {
           chat_id: GROUP_ID,
           from_chat_id: message.chat.id,
@@ -991,11 +1020,17 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          throw new Error(`Failed to copy message to topic: ${data.description} (chat_id: ${GROUP_ID}, from_chat_id: ${message.chat.id}, message_id: ${message.message_id})`);
+          throw new Error(`Failed to copy message to topic: ${data.description} (chat_id: ${GROUP_ID}, from_chat_id: ${message.chat.id}, message_id: ${message.message_id}, topic_id: ${topicId})`);
         }
       } catch (error) {
         console.error(`Error copying message to topic ${topicId}:`, error);
-        throw error;
+        // 回退机制：如果 copyMessage 失败，尝试直接发送文本
+        if (message.text) {
+          const fallbackMessage = `消息（来自 ${message.chat.id}）：\n${message.text}`;
+          await sendMessageToTopic(topicId, fallbackMessage);
+        } else {
+          throw error;
+        }
       }
     }
 
@@ -1023,6 +1058,16 @@ export default {
 
     async function forwardMessageToPrivateChat(privateChatId, message) {
       try {
+        // 验证参数
+        if (!privateChatId || !message.chat?.id || !message.message_id) {
+          throw new Error(`Invalid parameters: privateChatId=${privateChatId}, from_chat_id=${message.chat?.id}, message_id=${message.message_id}`);
+        }
+
+        // 检查机器人是否有权限向目标用户发送消息
+        if (!(await canSendMessageToChat(privateChatId))) {
+          throw new Error(`Bot cannot send messages to private chat ${privateChatId}`);
+        }
+
         const requestBody = {
           chat_id: privateChatId,
           from_chat_id: message.chat.id,
@@ -1040,7 +1085,13 @@ export default {
         }
       } catch (error) {
         console.error(`Error forwarding message to private chat ${privateChatId}:`, error);
-        throw error;
+        // 回退机制：如果 copyMessage 失败，尝试直接发送文本
+        if (message.text) {
+          const fallbackMessage = `消息（来自群组）：\n${message.text}`;
+          await sendMessageToUser(privateChatId, fallbackMessage);
+        } else {
+          throw error;
+        }
       }
     }
 
