@@ -12,11 +12,9 @@ const settingsCache = {
   user_raw_enabled: null
 };
 
-// 缓存用户信息、管理员状态、user_states 和 message_rates
+// 缓存用户信息和管理员状态
 const userInfoCache = new Map();
 const adminCache = new Map();
-const userStateCache = new Map();
-const messageRateCache = new Map();
 
 export default {
   async fetch(request, env) {
@@ -58,16 +56,6 @@ export default {
         console.error('Error auto-registering webhook:', error);
       }
       timings.webhookInit = Date.now() - webhookInitStart;
-    }
-
-    if (BOT_TOKEN && GROUP_ID) {
-      const checkPermissionsStart = Date.now();
-      try {
-        await checkBotPermissions();
-      } catch (error) {
-        console.error('Error checking bot permissions:', error);
-      }
-      timings.checkPermissions = Date.now() - checkPermissionsStart;
     }
 
     const cleanupStart = Date.now();
@@ -124,62 +112,10 @@ export default {
       }
     }
 
-    async function checkBotPermissions() {
-      try {
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: GROUP_ID })
-        });
-        const data = await response.json();
-        if (!data.ok) {
-          throw new Error(`Failed to access group: ${data.description}`);
-        }
-
-        const memberResponse = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            user_id: (await getBotId())
-          })
-        });
-        const memberData = await memberResponse.json();
-        if (!memberData.ok) {
-          throw new Error(`Failed to get bot member status: ${memberData.description}`);
-        }
-
-        const canSendMessages = memberData.result.can_send_messages !== false;
-        const canPostMessages = memberData.result.can_post_messages !== false;
-        const canManageTopics = memberData.result.can_manage_topics !== false;
-        if (!canSendMessages || !canPostMessages || !canManageTopics) {
-          console.error('Bot lacks necessary permissions in the group:', {
-            canSendMessages,
-            canPostMessages,
-            canManageTopics
-          });
-        }
-      } catch (error) {
-        console.error('Error checking bot permissions:', error);
-        throw error;
-      }
-    }
-
-    async function getBotId() {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-      });
-      const data = await response.json();
-      if (!data.ok) throw new Error(`Failed to get bot ID: ${data.description}`);
-      return data.result.id;
-    }
-
     async function checkAndRepairTables(d1) {
       try {
         const expectedTables = {
-          user_states: {
+          users: {
             columns: {
               chat_id: 'TEXT PRIMARY KEY',
               is_blocked: 'BOOLEAN DEFAULT FALSE',
@@ -189,12 +125,6 @@ export default {
               code_expiry: 'INTEGER',
               last_verification_message_id: 'TEXT',
               is_first_verification: 'BOOLEAN DEFAULT TRUE',
-              is_rate_limited: 'BOOLEAN DEFAULT FALSE'
-            }
-          },
-          message_rates: {
-            columns: {
-              chat_id: 'TEXT PRIMARY KEY',
               message_count: 'INTEGER DEFAULT 0',
               window_start: 'INTEGER',
               start_count: 'INTEGER DEFAULT 0',
@@ -228,7 +158,7 @@ export default {
           const columnsResult = await d1.prepare(
             `PRAGMA table_info(${tableName})`
           ).all();
-          
+
           const currentColumns = new Map(
             columnsResult.results.map(col => [col.name, {
               type: col.type,
@@ -281,14 +211,14 @@ export default {
       try {
         const nowSeconds = Math.floor(now / 1000);
         const expiredCodes = await d1.prepare(
-          'SELECT chat_id FROM user_states WHERE code_expiry IS NOT NULL AND code_expiry < ?'
+          'SELECT chat_id FROM users WHERE code_expiry IS NOT NULL AND code_expiry < ?'
         ).bind(nowSeconds).all();
 
         if (expiredCodes.results.length > 0) {
           await d1.batch(
             expiredCodes.results.map(({ chat_id }) =>
               d1.prepare(
-                'UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?'
+                'UPDATE users SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?'
               ).bind(chat_id)
             )
           );
@@ -334,38 +264,30 @@ export default {
         return;
       }
 
-      // 检查缓存中是否有 user_state 和 message_rate
-      let userState = userStateCache.get(chatId);
-      let rateData = messageRateCache.get(chatId);
-
-      // 如果缓存中没有，则从数据库查询，并存入缓存
+      // 查询 users 表
       const dbQueryStart = Date.now();
-      if (!userState || !rateData) {
-        const [userStateResult, rateDataResult] = await Promise.all([
-          env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first(),
-          env.D1.prepare('SELECT message_count, window_start, start_count, start_window_start FROM message_rates WHERE chat_id = ?')
-            .bind(chatId)
-            .first()
-        ]);
-        userState = userStateResult || { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null };
-        rateData = rateDataResult || { message_count: 0, window_start: Date.now(), start_count: 0, start_window_start: Date.now() };
-        userStateCache.set(chatId, userState);
-        messageRateCache.set(chatId, rateData);
-        setTimeout(() => {
-          userStateCache.delete(chatId);
-          messageRateCache.delete(chatId);
-        }, 5 * 60 * 1000); // 缓存 5 分钟
-      }
+      const userData = await env.D1.prepare(
+        'SELECT is_blocked, is_first_verification, is_verified, verified_expiry, message_count, window_start, start_count, start_window_start FROM users WHERE chat_id = ?'
+      ).bind(chatId).first();
       timings.dbQuery = Date.now() - dbQueryStart;
 
-      // 如果 user_state 不存在于数据库，则插入
-      if (!userStateCache.has(chatId)) {
+      let userState = userData || {
+        is_blocked: false,
+        is_first_verification: true,
+        is_verified: false,
+        verified_expiry: null,
+        message_count: 0,
+        window_start: Date.now(),
+        start_count: 0,
+        start_window_start: Date.now()
+      };
+
+      // 如果用户数据不存在，插入新记录
+      if (!userData) {
         const insertStart = Date.now();
-        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified) VALUES (?, ?, ?, ?)')
-          .bind(chatId, false, true, false)
-          .run();
+        await env.D1.prepare(
+          'INSERT INTO users (chat_id, is_blocked, is_first_verification, is_verified, message_count, window_start, start_count, start_window_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(chatId, false, true, false, 0, Date.now(), 0, Date.now()).run();
         timings.dbInsert = Date.now() - insertStart;
       }
 
@@ -380,25 +302,23 @@ export default {
         const window = 5 * 60 * 1000;
         const maxStartsPerWindow = 1;
 
-        let startData = { count: rateData.start_count, start: rateData.start_window_start };
-        if (now - startData.start > window) {
-          startData.count = 1;
-          startData.start = now;
+        let startCount = userState.start_count;
+        let startWindowStart = userState.start_window_start;
+
+        if (now - startWindowStart > window) {
+          startCount = 1;
+          startWindowStart = now;
         } else {
-          startData.count += 1;
+          startCount += 1;
         }
 
-        rateData.start_count = startData.count;
-        rateData.start_window_start = startData.start;
-
         const rateUpdateStart = Date.now();
-        await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start, message_count, window_start) VALUES (?, ?, ?, ?, ?)')
-          .bind(chatId, rateData.start_count, rateData.start_window_start, rateData.message_count, rateData.window_start)
-          .run();
-        messageRateCache.set(chatId, rateData);
+        await env.D1.prepare(
+          'UPDATE users SET start_count = ?, start_window_start = ? WHERE chat_id = ?'
+        ).bind(startCount, startWindowStart, chatId).run();
         timings.rateUpdate = Date.now() - rateUpdateStart;
 
-        if (startData.count > maxStartsPerWindow) {
+        if (startCount > maxStartsPerWindow) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
           return;
         }
@@ -424,22 +344,23 @@ export default {
       // 检查消息速率限制
       const now = Date.now();
       const window = 60 * 1000;
+      let messageCount = userState.message_count;
+      let windowStart = userState.window_start;
 
-      if (now - rateData.window_start > window) {
-        rateData.message_count = 1;
-        rateData.window_start = now;
+      if (now - windowStart > window) {
+        messageCount = 1;
+        windowStart = now;
       } else {
-        rateData.message_count += 1;
+        messageCount += 1;
       }
 
       const rateUpdateStart = Date.now();
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start, start_count, start_window_start) VALUES (?, ?, ?, ?, ?)')
-        .bind(chatId, rateData.message_count, rateData.window_start, rateData.start_count, rateData.start_window_start)
-        .run();
-      messageRateCache.set(chatId, rateData);
+      await env.D1.prepare(
+        'UPDATE users SET message_count = ?, window_start = ? WHERE chat_id = ?'
+      ).bind(messageCount, windowStart, chatId).run();
       timings.rateUpdate = Date.now() - rateUpdateStart;
 
-      const isRateLimited = rateData.message_count > MAX_MESSAGES_PER_MINUTE;
+      const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
         await sendMessageToUser(chatId, "请完成验证后发送消息。");
@@ -451,7 +372,7 @@ export default {
         // 并行获取用户信息和话题 ID
         const userInfoStart = Date.now();
         const topicIdStart = Date.now();
-        const [userInfo, topicIdResult] = await Promise.all([
+        const [userInfo, topicId] = await Promise.all([
           getUserInfo(chatId),
           getExistingTopicId(chatId)
         ]);
@@ -462,40 +383,32 @@ export default {
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
-        let topicId = topicIdResult;
-        if (!topicId) {
+        let finalTopicId = topicId;
+        if (!finalTopicId) {
           const createTopicStart = Date.now();
-          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-          await saveTopicId(chatId, topicId);
+          finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+          await saveTopicId(chatId, finalTopicId);
           timings.createTopic = Date.now() - createTopicStart;
         }
 
         if (text) {
           const sendMessageStart = Date.now();
           const formattedMessage = `${nickname}:\n${text}`;
-          await sendMessageToTopic(topicId, formattedMessage);
+          await sendMessageToTopic(finalTopicId, formattedMessage);
           timings.sendMessage = Date.now() - sendMessageStart;
-
-          // 异步发送耗时信息
-          const totalTime = Date.now() - messageStart;
-          const timingDetails = Object.entries(timings)
-            .map(([key, value]) => `${key}: ${value}ms`)
-            .join(', ');
-          const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
-          setTimeout(() => sendMessageToTopic(topicId, timingMessage), 0);
         } else {
           const copyMessageStart = Date.now();
-          await copyMessageToTopic(topicId, message);
+          await copyMessageToTopic(finalTopicId, message);
           timings.copyMessage = Date.now() - copyMessageStart;
-
-          // 异步发送耗时信息
-          const totalTime = Date.now() - messageStart;
-          const timingDetails = Object.entries(timings)
-            .map(([key, value]) => `${key}: ${value}ms`)
-            .join(', ');
-          const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
-          setTimeout(() => sendMessageToTopic(topicId, timingMessage), 0);
         }
+
+        // 同步发送耗时信息
+        const totalTime = Date.now() - messageStart;
+        const timingDetails = Object.entries(timings)
+          .map(([key, value]) => `${key}: ${value}ms`)
+          .join(', ');
+        const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
+        await sendMessageToTopic(finalTopicId, timingMessage);
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
         await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
@@ -519,12 +432,7 @@ export default {
 
       const targetChatId = parts[1];
       try {
-        await env.D1.batch([
-          env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId),
-          env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId)
-        ]);
-        userStateCache.delete(targetChatId);
-        messageRateCache.delete(targetChatId);
+        await env.D1.prepare('DELETE FROM users WHERE chat_id = ?').bind(targetChatId).run();
         await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
       } catch (error) {
         console.error(`Error resetting user ${targetChatId}:`, error);
@@ -584,13 +492,13 @@ export default {
         timings.sendMessage = Date.now() - sendMessageStart;
         timings.deleteMessage = Date.now() - deleteMessageStart;
 
-        // 异步发送耗时信息
+        // 同步发送耗时信息
         const totalTime = Date.now() - adminStart;
         const timingDetails = Object.entries(timings)
           .map(([key, value]) => `${key}: ${value}ms`)
           .join(', ');
         const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
-        setTimeout(() => sendMessageToTopic(topicId, timingMessage), 0);
+        await sendMessageToTopic(topicId, timingMessage);
       } catch (error) {
         console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
       }
@@ -694,9 +602,9 @@ export default {
             return;
           }
 
-          const userState = userStateCache.get(chatId) || (await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
+          const userState = await env.D1.prepare('SELECT verification_code, code_expiry FROM users WHERE chat_id = ?')
             .bind(chatId)
-            .first());
+            .first();
           const storedCode = userState?.verification_code;
           const codeExpiry = userState?.code_expiry;
           const nowSeconds = Math.floor(Date.now() / 1000);
@@ -708,10 +616,9 @@ export default {
 
           if (result === 'correct') {
             const verifiedExpiry = nowSeconds + 3600 * 24;
-            await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ? WHERE chat_id = ?')
+            await env.D1.prepare('UPDATE users SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ? WHERE chat_id = ?')
               .bind(true, verifiedExpiry, false, chatId)
               .run();
-            userStateCache.set(chatId, { is_verified: true, verified_expiry, verification_code: null, code_expiry: null, last_verification_message_id: null, is_first_verification: false });
 
             const successMessage = await getVerificationSuccessMessage();
             await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
@@ -738,16 +645,14 @@ export default {
           }
 
           if (action === 'block') {
-            await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
-              .bind(privateChatId, true)
+            await env.D1.prepare('UPDATE users SET is_blocked = ? WHERE chat_id = ?')
+              .bind(true, privateChatId)
               .run();
-            userStateCache.set(privateChatId, { is_blocked: true });
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
           } else if (action === 'unblock') {
-            await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
-              .bind(privateChatId, false, true)
+            await env.D1.prepare('UPDATE users SET is_blocked = ?, is_first_verification = ? WHERE chat_id = ?')
+              .bind(false, true, privateChatId)
               .run();
-            userStateCache.set(privateChatId, { is_blocked: false, is_first_verification: true });
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
           } else if (action === 'toggle_verification') {
             const currentState = settingsCache.verification_enabled;
@@ -755,7 +660,7 @@ export default {
             await setSetting('verification_enabled', newState.toString());
             await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'check_blocklist') {
-            const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
+            const blockedUsers = await env.D1.prepare('SELECT chat_id FROM users WHERE is_blocked = ?')
               .bind(true)
               .all();
             const blockList = blockedUsers.results.length > 0 
@@ -769,12 +674,7 @@ export default {
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
             try {
-              await env.D1.batch([
-                env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
-                env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId)
-              ]);
-              userStateCache.delete(privateChatId);
-              messageRateCache.delete(privateChatId);
+              await env.D1.prepare('DELETE FROM users WHERE chat_id = ?').bind(privateChatId).run();
               await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息记录已删除，话题保留。`);
             } catch (error) {
               console.error(`Error deleting user ${privateChatId}:`, error);
@@ -801,12 +701,11 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
-      await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
+      await env.D1.prepare('UPDATE users SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
         .bind(chatId)
         .run();
-      userStateCache.delete(chatId); // 清除缓存以确保获取最新数据
 
-      const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
+      const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM users WHERE chat_id = ?')
         .bind(chatId)
         .first();
       const lastVerificationMessageId = lastVerification?.last_verification_message_id;
@@ -824,7 +723,7 @@ export default {
         } catch (error) {
           console.error("Error deleting old verification message:", error);
         }
-        await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
+        await env.D1.prepare('UPDATE users SET last_verification_message_id = NULL WHERE chat_id = ?')
           .bind(chatId)
           .run();
       }
@@ -854,10 +753,9 @@ export default {
       const nowSeconds = Math.floor(Date.now() / 1000);
       const codeExpiry = nowSeconds + 300;
 
-      await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, verification_code, code_expiry) VALUES (?, ?, ?)')
-        .bind(chatId, correctResult.toString(), codeExpiry)
+      await env.D1.prepare('UPDATE users SET verification_code = ?, code_expiry = ? WHERE chat_id = ?')
+        .bind(correctResult.toString(), codeExpiry, chatId)
         .run();
-      userStateCache.delete(chatId); // 清除缓存以确保获取最新数据
 
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -871,7 +769,7 @@ export default {
         });
         const data = await response.json();
         if (data.ok) {
-          await env.D1.prepare('UPDATE user_states SET last_verification_message_id = ? WHERE chat_id = ?')
+          await env.D1.prepare('UPDATE users SET last_verification_message_id = ? WHERE chat_id = ?')
             .bind(data.result.message_id.toString(), chatId)
             .run();
         }
@@ -1131,7 +1029,7 @@ export default {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 2000); // 缩短超时时间
+          const timeoutId = setTimeout(() => controller.abort(), 2000);
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
