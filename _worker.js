@@ -4,6 +4,8 @@ let MAX_MESSAGES_PER_MINUTE = 40;
 
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
+const CACHE_SYNC_INTERVAL = 60 * 60 * 1000; // 1 小时
+let lastCacheSyncTime = 0;
 let isInitialized = false;
 
 // 内存缓存
@@ -49,6 +51,15 @@ export default {
       const mappings = await env.D1.prepare('SELECT chat_id, topic_id FROM chat_topic_mappings').all();
       mappings.results.forEach(({ chat_id, topic_id }) => topicIdCache.set(chat_id, topic_id));
       timings.preload = Date.now() - preloadStart;
+
+      // 预加载用户状态
+      const userStateLoadStart = Date.now();
+      const users = await env.D1.prepare('SELECT * FROM users').all();
+      users.results.forEach(user => {
+        const userStateKey = `${user.chat_id}:state`;
+        userStateCache.set(userStateKey, user);
+      });
+      timings.userStateLoad = Date.now() - userStateLoadStart;
 
       isInitialized = true;
       timings.init = Date.now() - initStart;
@@ -171,11 +182,19 @@ export default {
         userState.start_window_start = startWindowStart;
         userStateCache.set(userStateKey, userState);
 
-        const dbUpdateStart = Date.now();
-        await env.D1.prepare(
-          'INSERT INTO users (chat_id, start_count, start_window_start) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET start_count = ?, start_window_start = ?'
-        ).bind(chatId, startCount, startWindowStart, startCount, startWindowStart).run();
-        timings.dbUpdate = Date.now() - dbUpdateStart;
+        try {
+          const dbUpdateStart = Date.now();
+          await env.D1.prepare(
+            'INSERT INTO users (chat_id, start_count, start_window_start) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET start_count = ?, start_window_start = ?'
+          ).bind(chatId, startCount, startWindowStart, startCount, startWindowStart).run();
+          timings.dbUpdate = Date.now() - dbUpdateStart;
+        } catch (error) {
+          console.error(`Error updating start count for chatId ${chatId}:`, error);
+          userState.start_count = userState.start_count || 0; // 回滚缓存
+          userState.start_window_start = userState.start_window_start || now;
+          userStateCache.set(userStateKey, userState);
+          throw error;
+        }
 
         if (startCount > maxStartsPerWindow) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
@@ -217,15 +236,29 @@ export default {
       userState.window_start = windowStart;
       userStateCache.set(userStateKey, userState);
 
-      const dbUpdateStart = Date.now();
-      await env.D1.prepare(
-        'INSERT INTO users (chat_id, message_count, window_start) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET message_count = ?, window_start = ?'
-      ).bind(chatId, messageCount, windowStart, messageCount, windowStart).run();
-      timings.dbUpdate = Date.now() - dbUpdateStart;
+      try {
+        const dbUpdateStart = Date.now();
+        await env.D1.prepare(
+          'INSERT INTO users (chat_id, message_count, window_start) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET message_count = ?, window_start = ?'
+        ).bind(chatId, messageCount, windowStart, messageCount, windowStart).run();
+        timings.dbUpdate = Date.now() - dbUpdateStart;
+      } catch (error) {
+        console.error(`Error updating message count for chatId ${chatId}:`, error);
+        userState.message_count = userState.message_count || 0; // 回滚缓存
+        userState.window_start = userState.window_start || now;
+        userStateCache.set(userStateKey, userState);
+        throw error;
+      }
 
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
+        // 检查是否已有未完成验证码
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        if (userState.last_verification_message_id && userState.code_expiry && nowSeconds < userState.code_expiry) {
+          await sendMessageToUser(chatId, "请先完成当前验证码验证！");
+          return;
+        }
         await sendMessageToUser(chatId, "请完成验证后发送消息。");
         await handleVerification(chatId, messageId);
         return;
@@ -375,7 +408,7 @@ export default {
       if (!userRawEnabled) return '验证成功！您现在可以与客服聊天。';
 
       try {
-        const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/start.md');
+        const response = await fetchWithRetry('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/start.md');
         if (!response.ok) throw new Error(`Failed to fetch start.md: ${response.statusText}`);
         const message = await response.text();
         return message.trim() || '验证成功！您现在可以与客服聊天。';
@@ -387,7 +420,7 @@ export default {
 
     async function getNotificationContent() {
       try {
-        const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
+        const response = await fetchWithRetry('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
         if (!response.ok) throw new Error(`Failed to fetch notification.md: ${response.statusText}`);
         const content = await response.text();
         return content.trim() || '';
@@ -479,9 +512,18 @@ export default {
             userState.is_first_verification = false;
             userStateCache.set(userStateKey, userState);
 
-            await env.D1.prepare(
-              'UPDATE users SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ? WHERE chat_id = ?'
-            ).bind(true, verifiedExpiry, false, chatId).run();
+            try {
+              await env.D1.prepare(
+                'UPDATE users SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ? WHERE chat_id = ?'
+              ).bind(true, verifiedExpiry, false, chatId).run();
+            } catch (error) {
+              console.error(`Error updating verification status for chatId ${chatId}:`, error);
+              userState.is_verified = false;
+              userState.verified_expiry = null;
+              userState.is_first_verification = true;
+              userStateCache.set(userStateKey, userState);
+              throw error;
+            }
 
             const successMessage = await getVerificationSuccessMessage();
             await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
@@ -513,9 +555,16 @@ export default {
             userState.is_blocked = true;
             userStateCache.set(userStateKey, userState);
 
-            await env.D1.prepare('UPDATE users SET is_blocked = ? WHERE chat_id = ?')
-              .bind(true, privateChatId)
-              .run();
+            try {
+              await env.D1.prepare('UPDATE users SET is_blocked = ? WHERE chat_id = ?')
+                .bind(true, privateChatId)
+                .run();
+            } catch (error) {
+              console.error(`Error blocking user ${privateChatId}:`, error);
+              userState.is_blocked = false;
+              userStateCache.set(userStateKey, userState);
+              throw error;
+            }
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
           } else if (action === 'unblock') {
             const userStateKey = `${privateChatId}:state`;
@@ -524,9 +573,17 @@ export default {
             userState.is_first_verification = true;
             userStateCache.set(userStateKey, userState);
 
-            await env.D1.prepare('UPDATE users SET is_blocked = ?, is_first_verification = ? WHERE chat_id = ?')
-              .bind(false, true, privateChatId)
-              .run();
+            try {
+              await env.D1.prepare('UPDATE users SET is_blocked = ?, is_first_verification = ? WHERE chat_id = ?')
+                .bind(false, true, privateChatId)
+                .run();
+            } catch (error) {
+              console.error(`Error unblocking user ${privateChatId}:`, error);
+              userState.is_blocked = true;
+              userState.is_first_verification = false;
+              userStateCache.set(userStateKey, userState);
+              throw error;
+            }
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
           } else if (action === 'toggle_verification') {
             const currentState = settingsCache.verification_enabled;
@@ -578,13 +635,26 @@ export default {
     async function handleVerification(chatId, messageId) {
       const userStateKey = `${chatId}:state`;
       const userState = userStateCache.get(userStateKey) || {};
+
+      // 检查是否已有未完成验证码
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      if (userState.last_verification_message_id && userState.code_expiry && nowSeconds < userState.code_expiry) {
+        await sendMessageToUser(chatId, "请先完成当前验证码验证！");
+        return;
+      }
+
+      // 清除旧验证码
       userState.verification_code = null;
       userState.code_expiry = null;
       userStateCache.set(userStateKey, userState);
 
-      await env.D1.prepare('UPDATE users SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
-        .bind(chatId)
-        .run();
+      try {
+        await env.D1.prepare('UPDATE users SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
+          .bind(chatId)
+          .run();
+      } catch (error) {
+        console.error(`Error clearing verification code for chatId ${chatId}:`, error);
+      }
 
       const lastVerificationMessageId = userState.last_verification_message_id;
       if (lastVerificationMessageId) {
@@ -602,9 +672,13 @@ export default {
         }
         userState.last_verification_message_id = null;
         userStateCache.set(userStateKey, userState);
-        await env.D1.prepare('UPDATE users SET last_verification_message_id = NULL WHERE chat_id = ?')
-          .bind(chatId)
-          .run();
+        try {
+          await env.D1.prepare('UPDATE users SET last_verification_message_id = NULL WHERE chat_id = ?')
+            .bind(chatId)
+            .run();
+        } catch (error) {
+          console.error(`Error clearing last verification message ID for chatId ${chatId}:`, error);
+        }
       }
 
       await sendVerification(chatId);
@@ -638,9 +712,17 @@ export default {
       userState.code_expiry = codeExpiry;
       userStateCache.set(userStateKey, userState);
 
-      await env.D1.prepare('UPDATE users SET verification_code = ?, code_expiry = ? WHERE chat_id = ?')
-        .bind(correctResult.toString(), codeExpiry, chatId)
-        .run();
+      try {
+        await env.D1.prepare('UPDATE users SET verification_code = ?, code_expiry = ? WHERE chat_id = ?')
+          .bind(correctResult.toString(), codeExpiry, chatId)
+          .run();
+      } catch (error) {
+        console.error(`Error setting verification code for chatId ${chatId}:`, error);
+        userState.verification_code = null;
+        userState.code_expiry = null;
+        userStateCache.set(userStateKey, userState);
+        throw error;
+      }
 
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -656,9 +738,16 @@ export default {
         if (data.ok) {
           userState.last_verification_message_id = data.result.message_id.toString();
           userStateCache.set(userStateKey, userState);
-          await env.D1.prepare('UPDATE users SET last_verification_message_id = ? WHERE chat_id = ?')
-            .bind(data.result.message_id.toString(), chatId)
-            .run();
+          try {
+            await env.D1.prepare('UPDATE users SET last_verification_message_id = ? WHERE chat_id = ?')
+              .bind(data.result.message_id.toString(), chatId)
+              .run();
+          } catch (error) {
+            console.error(`Error setting last verification message ID for chatId ${chatId}:`, error);
+            userState.last_verification_message_id = null;
+            userStateCache.set(userStateKey, userState);
+            throw error;
+          }
         }
       } catch (error) {
         console.error("Error sending verification message:", error);
@@ -858,23 +947,27 @@ export default {
       return chatId;
     }
 
-    async function fetchWithRetry(url, options) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1000);
-      try {
-        const response = await fetch(url, { ...options, signal: controller.signal });
-        clearTimeout(timeoutId);
-        if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
-        return response;
-      } catch (error) {
-        clearTimeout(timeoutId);
-        throw error;
+    async function fetchWithRetry(url, options, retries = 1, backoff = 500) {
+      for (let i = 0; i <= retries; i++) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1000);
+        try {
+          const response = await fetch(url, { ...options, signal: controller.signal });
+          clearTimeout(timeoutId);
+          if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+          return response;
+        } catch (error) {
+          clearTimeout(timeoutId);
+          if (i === retries) throw error;
+          await new Promise(resolve => setTimeout(resolve, backoff));
+        }
       }
+      throw new Error(`Failed to fetch ${url} after ${retries + 1} attempts`);
     }
 
     async function registerWebhook(request) {
       const webhookUrl = `${new URL(request.url).origin}/webhook`;
-      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: webhookUrl })
@@ -883,7 +976,7 @@ export default {
     }
 
     async function unRegisterWebhook() {
-      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: '' })
@@ -983,7 +1076,26 @@ export default {
       lastCleanupTime = now;
     }
 
+    async function syncCacheWithDatabase() {
+      const now = Date.now();
+      if (now - lastCacheSyncTime < CACHE_SYNC_INTERVAL) {
+        return;
+      }
+
+      try {
+        const users = await env.D1.prepare('SELECT * FROM users').all();
+        users.results.forEach(user => {
+          const userStateKey = `${user.chat_id}:state`;
+          userStateCache.set(userStateKey, user);
+        });
+        lastCacheSyncTime = now;
+      } catch (error) {
+        console.error('Error syncing cache with database:', error);
+      }
+    }
+
     await cleanExpiredVerificationCodes();
+    await syncCacheWithDatabase();
 
     try {
       const response = await handleRequest(request);
