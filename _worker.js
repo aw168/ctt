@@ -58,7 +58,6 @@ export default {
       }
     }
 
-    // 检查机器人权限
     if (BOT_TOKEN && GROUP_ID) {
       try {
         await checkBotPermissions();
@@ -676,7 +675,7 @@ export default {
           }
 
           if (result === 'correct') {
-            const verifiedExpiry = nowSeconds + 3600 * 24; // 验证有效期设为24小时
+            const verifiedExpiry = nowSeconds + 3600 * 24;
             await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ? WHERE chat_id = ?')
               .bind(true, verifiedExpiry, false, chatId)
               .run();
@@ -960,7 +959,7 @@ export default {
           message_thread_id: topicId,
           parse_mode: 'Markdown'
         };
-        const response = await fetchWithRetry(`https:// `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody)
@@ -983,9 +982,8 @@ export default {
           from_chat_id: message.chat.id,
           message_id: message.message_id,
           message_thread_id: topicId,
-          disable_notification: true // 添加此参数避免频繁通知
-       –
-
+          disable_notification: true
+        };
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1029,7 +1027,7 @@ export default {
           chat_id: privateChatId,
           from_chat_id: message.chat.id,
           message_id: message.message_id,
-          disable_notification: true // 添加此参数避免频繁通知
+          disable_notification: true
         };
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
           method: 'POST',
