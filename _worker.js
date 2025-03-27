@@ -11,6 +11,7 @@ let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
 let isWebhookInitialized = false; // 用于标记 webhook 是否已初始化
 const processedMessages = new Set(); // 用于存储已处理的消息 ID，防止重复处理
+let logTopicId = null; // 用于存储日志话题的 ID
 
 // 缓存 settings 表中的常用值
 const settingsCache = {
@@ -38,15 +39,24 @@ export default {
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
     if (!env.D1) {
-      console.error('D1 database is not bound');
+      await logToGroup('D1 database is not bound');
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
     try {
       await checkAndRepairTables(env.D1);
     } catch (error) {
-      console.error('Error checking and repairing tables:', error);
+      await logToGroup(`Error checking and repairing tables: ${error.message}`);
       return new Response('Database initialization error', { status: 500 });
+    }
+
+    // 初始化日志话题
+    if (!logTopicId && BOT_TOKEN && GROUP_ID) {
+      try {
+        logTopicId = await initializeLogTopic();
+      } catch (error) {
+        console.error('Error initializing log topic:', error);
+      }
     }
 
     if (!isWebhookInitialized && BOT_TOKEN) {
@@ -54,7 +64,7 @@ export default {
         await autoRegisterWebhook(request);
         isWebhookInitialized = true;
       } catch (error) {
-        console.error('Error auto-registering webhook:', error);
+        await logToGroup(`Error auto-registering webhook: ${error.message}`);
       }
     }
 
@@ -62,19 +72,63 @@ export default {
       try {
         await checkBotPermissions();
       } catch (error) {
-        console.error('Error checking bot permissions:', error);
+        await logToGroup(`Error checking bot permissions: ${error.message}`);
       }
     }
 
     try {
       await cleanExpiredVerificationCodes(env.D1);
     } catch (error) {
-      console.error('Error cleaning expired verification codes:', error);
+      await logToGroup(`Error cleaning expired verification codes: ${error.message}`);
+    }
+
+    async function initializeLogTopic() {
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: GROUP_ID, name: 'Bot Logs' })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(`Failed to create log topic: ${data.description}`);
+        return data.result.message_thread_id;
+      } catch (error) {
+        console.error(`Error creating log topic: ${error.message}`);
+        throw error;
+      }
+    }
+
+    async function logToGroup(message) {
+      if (!logTopicId || !BOT_TOKEN || !GROUP_ID) {
+        console.error(`Cannot log to group: logTopicId=${logTopicId}, BOT_TOKEN=${!!BOT_TOKEN}, GROUP_ID=${GROUP_ID}`);
+        console.error(message);
+        return;
+      }
+
+      try {
+        const requestBody = {
+          chat_id: GROUP_ID,
+          text: `[LOG] ${new Date().toISOString()}: ${message}`,
+          message_thread_id: logTopicId,
+          parse_mode: 'Markdown'
+        };
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody)
+        });
+        const data = await response.json();
+        if (!data.ok) {
+          console.error(`Failed to send log to group: ${data.description}`);
+        }
+      } catch (error) {
+        console.error(`Error sending log to group: ${error.message}`);
+      }
     }
 
     async function handleRequest(request) {
       if (!BOT_TOKEN || !GROUP_ID) {
-        console.error('Missing required environment variables');
+        await logToGroup('Missing required environment variables');
         return new Response('Server configuration error: Missing required environment variables', { status: 500 });
       }
 
@@ -85,7 +139,7 @@ export default {
           await handleUpdate(update);
           return new Response('OK');
         } catch (error) {
-          console.error('Error parsing request or handling update:', error);
+          await logToGroup(`Error parsing request or handling update: ${error.message}`);
           return new Response('Bad Request', { status: 400 });
         }
       } else if (url.pathname === '/registerWebhook') {
@@ -108,10 +162,10 @@ export default {
           body: JSON.stringify({ url: webhookUrl }),
         }).then(r => r.json());
         if (!response.ok) {
-          console.error('Webhook auto-registration failed:', JSON.stringify(response, null, 2));
+          await logToGroup(`Webhook auto-registration failed: ${JSON.stringify(response, null, 2)}`);
         }
       } catch (error) {
-        console.error('Error during webhook auto-registration:', error);
+        await logToGroup(`Error during webhook auto-registration: ${error.message}`);
       }
     }
 
@@ -141,12 +195,17 @@ export default {
         }
 
         const canSendMessages = memberData.result.can_send_messages !== false;
-        const canPostMessages = memberData.result.can_post_messages !== false;
-        if (!canSendMessages || !canPostMessages) {
-          console.error('Bot lacks permission to send messages in the group');
+        const canManageTopics = memberData.result.can_manage_topics !== false;
+        if (!canSendMessages) {
+          await logToGroup('Bot lacks permission to send messages in the group');
+          throw new Error('Bot lacks permission to send messages in the group');
+        }
+        if (!canManageTopics) {
+          await logToGroup('Bot lacks permission to manage topics in the group');
+          throw new Error('Bot lacks permission to manage topics in the group');
         }
       } catch (error) {
-        console.error('Error checking bot permissions:', error);
+        await logToGroup(`Error checking bot permissions: ${error.message}`);
         throw error;
       }
     }
@@ -236,7 +295,7 @@ export default {
               await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
             }
           } catch (error) {
-            console.error(`Error checking ${tableName}:`, error);
+            await logToGroup(`Error checking ${tableName}: ${error.message}`);
             await d1.exec(`DROP TABLE IF EXISTS ${tableName}`);
             await createTable(d1, tableName, structure);
           }
@@ -250,7 +309,7 @@ export default {
         settingsCache.verification_enabled = (await getSetting('verification_enabled', d1)) === 'true';
         settingsCache.user_raw_enabled = (await getSetting('user_raw_enabled', d1)) === 'true';
       } catch (error) {
-        console.error('Error in checkAndRepairTables:', error);
+        await logToGroup(`Error in checkAndRepairTables: ${error.message}`);
         throw error;
       }
     }
@@ -286,7 +345,7 @@ export default {
         }
         lastCleanupTime = now;
       } catch (error) {
-        console.error('Error cleaning expired verification codes:', error);
+        await logToGroup(`Error cleaning expired verification codes: ${error.message}`);
       }
     }
 
@@ -402,7 +461,7 @@ export default {
           await copyMessageToTopic(topicId, message);
         }
       } catch (error) {
-        console.error(`Error handling message from chatId ${chatId}:`, error);
+        await logToGroup(`Error handling message from chatId ${chatId}: ${error.message}`);
         await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
         await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
       }
@@ -433,6 +492,7 @@ export default {
         }
         return false;
       } catch (error) {
+        await logToGroup(`Error checking topic existence for topicId ${topicId}: ${error.message}`);
         return false;
       }
     }
@@ -459,7 +519,7 @@ export default {
         ]);
         await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
       } catch (error) {
-        console.error(`Error resetting user ${targetChatId}:`, error);
+        await logToGroup(`Error resetting user ${targetChatId}: ${error.message}`);
         await sendMessageToTopic(topicId, `重置用户 ${targetChatId} 失败：${error.message}`);
       }
     }
@@ -507,10 +567,10 @@ export default {
             message_id: messageId
           })
         }).catch(error => {
-          console.error(`Error deleting message ${messageId}:`, error);
+          logToGroup(`Error deleting message ${messageId}: ${error.message}`);
         });
       } catch (error) {
-        console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
+        await logToGroup(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}: ${error.message}`);
       }
     }
 
@@ -524,7 +584,7 @@ export default {
         const message = await response.text();
         return message.trim() || '验证成功！您现在可以与客服聊天。';
       } catch (error) {
-        console.error("Error fetching verification success message:", error);
+        await logToGroup(`Error fetching verification success message: ${error.message}`);
         return '验证成功！您现在可以与客服聊天。';
       }
     }
@@ -536,7 +596,7 @@ export default {
         const content = await response.text();
         return content.trim() || '';
       } catch (error) {
-        console.error("Error fetching notification content:", error);
+        await logToGroup(`Error fetching notification content: ${error.message}`);
         return '';
       }
     }
@@ -595,7 +655,7 @@ export default {
           .first();
         return result?.value || null;
       } catch (error) {
-        console.error(`Error getting setting ${key}:`, error);
+        await logToGroup(`Error getting setting ${key}: ${error.message}`);
         throw error;
       }
     }
@@ -611,7 +671,7 @@ export default {
           settingsCache.user_raw_enabled = value === 'true';
         }
       } catch (error) {
-        console.error(`Error setting ${key} to ${value}:`, error);
+        await logToGroup(`Error setting ${key} to ${value}: ${error.message}`);
         throw error;
       }
     }
@@ -749,7 +809,7 @@ export default {
               ]);
               await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息记录已删除，话题保留。`);
             } catch (error) {
-              console.error(`Error deleting user ${privateChatId}:`, error);
+              await logToGroup(`Error deleting user ${privateChatId}: ${error.message}`);
               await sendMessageToTopic(topicId, `删除用户 ${privateChatId} 失败：${error.message}`);
             }
           } else {
@@ -767,7 +827,7 @@ export default {
           })
         });
       } catch (error) {
-        console.error(`Error processing callback query ${data}:`, error);
+        await logToGroup(`Error processing callback query ${data}: ${error.message}`);
         await sendMessageToTopic(topicId, `处理操作 ${action} 失败：${error.message}`);
       }
     }
@@ -793,7 +853,7 @@ export default {
             })
           });
         } catch (error) {
-          console.error("Error deleting old verification message:", error);
+          await logToGroup(`Error deleting old verification message: ${error.message}`);
         }
         await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
           .bind(chatId)
@@ -846,7 +906,7 @@ export default {
             .run();
         }
       } catch (error) {
-        console.error("Error sending verification message:", error);
+        await logToGroup(`Error sending verification message: ${error.message}`);
       }
     }
 
@@ -865,7 +925,7 @@ export default {
         const data = await response.json();
         return data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
       } catch (error) {
-        console.error(`Error checking admin status for user ${userId}:`, error);
+        await logToGroup(`Error checking admin status for user ${userId}: ${error.message}`);
         return false;
       }
     }
@@ -881,7 +941,7 @@ export default {
         if (!data.ok) throw new Error(`Failed to get user info: ${data.description}`);
         return data.result;
       } catch (error) {
-        console.error(`Error fetching user info for chatId ${chatId}:`, error);
+        await logToGroup(`Error fetching user info for chatId ${chatId}: ${error.message}`);
         throw error;
       }
     }
@@ -893,7 +953,7 @@ export default {
           .first();
         return mapping?.topic_id || null;
       } catch (error) {
-        console.error(`Error fetching topic ID for chatId ${chatId}:`, error);
+        await logToGroup(`Error fetching topic ID for chatId ${chatId}: ${error.message}`);
         throw error;
       }
     }
@@ -919,7 +979,7 @@ export default {
 
         return topicId;
       } catch (error) {
-        console.error(`Error creating forum topic for user ${userId}:`, error);
+        await logToGroup(`Error creating forum topic for user ${userId}: ${error.message}`);
         throw error;
       }
     }
@@ -930,7 +990,7 @@ export default {
           .bind(chatId, topicId)
           .run();
       } catch (error) {
-        console.error(`Error saving topic ID ${topicId} for chatId ${chatId}:`, error);
+        await logToGroup(`Error saving topic ID ${topicId} for chatId ${chatId}: ${error.message}`);
         throw error;
       }
     }
@@ -942,7 +1002,7 @@ export default {
           .first();
         return mapping?.chat_id || null;
       } catch (error) {
-        console.error(`Error fetching private chat ID for topicId ${topicId}:`, error);
+        await logToGroup(`Error fetching private chat ID for topicId ${topicId}: ${error.message}`);
         throw error;
       }
     }
@@ -970,7 +1030,7 @@ export default {
         }
         return data;
       } catch (error) {
-        console.error(`Error sending message to topic ${topicId}:`, error);
+        await logToGroup(`Error sending message to topic ${topicId}: ${error.message}`);
         throw error;
       }
     }
@@ -984,12 +1044,12 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          console.error(`Cannot access chat ${chatId}: ${data.description}`);
+          await logToGroup(`Cannot access chat ${chatId}: ${data.description}`);
           return false;
         }
         return true;
       } catch (error) {
-        console.error(`Error checking access to chat ${chatId}:`, error);
+        await logToGroup(`Error checking access to chat ${chatId}: ${error.message}`);
         return false;
       }
     }
@@ -1023,7 +1083,7 @@ export default {
           throw new Error(`Failed to copy message to topic: ${data.description} (chat_id: ${GROUP_ID}, from_chat_id: ${message.chat.id}, message_id: ${message.message_id}, topic_id: ${topicId})`);
         }
       } catch (error) {
-        console.error(`Error copying message to topic ${topicId}:`, error);
+        await logToGroup(`Error copying message to topic ${topicId}: ${error.message}`);
         // 回退机制：如果 copyMessage 失败，尝试直接发送文本
         if (message.text) {
           const fallbackMessage = `消息（来自 ${message.chat.id}）：\n${message.text}`;
@@ -1051,7 +1111,7 @@ export default {
           throw new Error(`Failed to pin message: ${data.description}`);
         }
       } catch (error) {
-        console.error(`Error pinning message ${messageId} in topic ${topicId}:`, error);
+        await logToGroup(`Error pinning message ${messageId} in topic ${topicId}: ${error.message}`);
         throw error;
       }
     }
@@ -1084,7 +1144,7 @@ export default {
           throw new Error(`Failed to forward message to private chat: ${data.description} (chat_id: ${privateChatId}, from_chat_id: ${message.chat.id}, message_id: ${message.message_id})`);
         }
       } catch (error) {
-        console.error(`Error forwarding message to private chat ${privateChatId}:`, error);
+        await logToGroup(`Error forwarding message to private chat ${privateChatId}: ${error.message}`);
         // 回退机制：如果 copyMessage 失败，尝试直接发送文本
         if (message.text) {
           const fallbackMessage = `消息（来自群组）：\n${message.text}`;
@@ -1108,7 +1168,7 @@ export default {
           throw new Error(`Failed to send message to user: ${data.description}`);
         }
       } catch (error) {
-        console.error(`Error sending message to user ${chatId}:`, error);
+        await logToGroup(`Error sending message to user ${chatId}: ${error.message}`);
         throw error;
       }
     }
@@ -1163,7 +1223,7 @@ export default {
     try {
       return await handleRequest(request);
     } catch (error) {
-      console.error('Unhandled error in fetch handler:', error);
+      await logToGroup(`Unhandled error in fetch handler: ${error.message}`);
       return new Response('Internal Server Error', { status: 500 });
     }
   }
