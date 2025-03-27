@@ -3,14 +3,11 @@ let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 
-// 临时管理员白名单（用于调试）
-const ADMIN_WHITELIST = ['YOUR_ADMIN_USER_ID']; // 替换为你的 Telegram 用户 ID
-
 // 全局变量，用于控制清理频率和 webhook 初始化
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
-let isWebhookInitialized = false; // 用于标记 webhook 是否已初始化
-const processedMessages = new Set(); // 用于存储已处理的消息 ID，防止重复处理
+let isWebhookInitialized = false;
+const processedMessages = new Set();
 
 // 缓存 settings 表中的常用值
 const settingsCache = {
@@ -390,62 +387,26 @@ export default {
 
       try {
         const userInfo = await getUserInfo(chatId);
-        const userName = userInfo.username || `User_${chatId}`; // 备用用户名
-        const nickname = userInfo.nickname || userName; // 备用昵称
+        const userName = userInfo.username || `User_${chatId}`;
+        const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
         let topicId = await getExistingTopicId(chatId);
-        if (!topicId || !(await checkTopicExists(topicId))) {
-          console.log(`Creating new topic for chatId ${chatId}, topicName: ${topicName}`);
+        if (!topicId) {
           topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
           await saveTopicId(chatId, topicId);
         }
 
         if (text) {
-          const formattedMessage = `*${nickname}:*\n------------------------------------------------\n\n${text}`;
-          console.log(`Sending message to topic ${topicId}: ${formattedMessage}`);
+          const formattedMessage = `${nickname}:\n------------------------------------------------\n\n${text}`;
           await sendMessageToTopic(topicId, formattedMessage);
         } else {
-          console.log(`Copying message to topic ${topicId} from chatId ${chatId}, messageId: ${messageId}`);
           await copyMessageToTopic(topicId, message);
         }
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
         await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
         await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
-      }
-    }
-
-    async function checkTopicExists(topicId) {
-      try {
-        console.log(`Checking if topic ${topicId} exists in group ${GROUP_ID}`);
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_thread_id: topicId,
-            text: 'Checking topic existence...'
-          })
-        });
-        const data = await response.json();
-        if (data.ok) {
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: GROUP_ID,
-              message_id: data.result.message_id
-            })
-          });
-          console.log(`Topic ${topicId} exists`);
-          return true;
-        }
-        console.log(`Topic ${topicId} does not exist: ${data.description}`);
-        return false;
-      } catch (error) {
-        console.error(`Error checking topic ${topicId} existence:`, error);
-        return false;
       }
     }
 
@@ -630,7 +591,7 @@ export default {
 
     async function onCallbackQuery(callbackQuery) {
       const chatId = callbackQuery.message.chat.id.toString();
-      let topicId = callbackQuery.message.message_thread_id;
+      const topicId = callbackQuery.message.message_thread_id;
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
 
@@ -655,9 +616,6 @@ export default {
         privateChatId = parts.slice(1).join('_');
       } else if (data.startsWith('unblock_')) {
         action = 'unblock';
-        privateChatId = parts.slice(1).join('_');
-      } else if (data.startsWith('github_')) {
-        action = 'github';
         privateChatId = parts.slice(1).join('_');
       } else if (data.startsWith('delete_user_')) {
         action = 'delete_user';
@@ -714,15 +672,6 @@ export default {
             await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
             await sendAdminPanel(chatId, topicId, privateChatId, messageId);
             return;
-          }
-
-          if (!(await checkTopicExists(topicId))) {
-            const userInfo = await getUserInfo(privateChatId);
-            const userName = userInfo.username || `User_${privateChatId}`;
-            const nickname = userInfo.nickname || userName;
-            const topicName = nickname;
-            topicId = await createForumTopic(topicName, userName, nickname, privateChatId);
-            await saveTopicId(privateChatId, topicId);
           }
 
           if (action === 'block') {
@@ -863,8 +812,6 @@ export default {
     }
 
     async function checkIfAdmin(userId) {
-      if (ADMIN_WHITELIST.includes(userId)) return true;
-
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
           method: 'POST',
@@ -891,7 +838,6 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          console.warn(`Failed to get user info for chatId ${chatId}: ${data.description}`);
           return {
             id: chatId,
             username: `User_${chatId}`,
@@ -931,7 +877,6 @@ export default {
 
     async function createForumTopic(topicName, userName, nickname, userId) {
       try {
-        console.log(`Creating forum topic for user ${userId}, topicName: ${topicName}`);
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -945,14 +890,9 @@ export default {
         const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
         const notificationContent = await getNotificationContent();
         const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
-        try {
-          const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
-          const messageId = messageResponse.result.message_id;
-          await pinMessage(topicId, messageId);
-        } catch (error) {
-          console.error(`Failed to send pinned message for topic ${topicId}:`, error);
-          // 即使置顶消息失败，仍然返回 topicId
-        }
+        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
+        const messageId = messageResponse.result.message_id;
+        await pinMessage(topicId, messageId);
 
         return topicId;
       } catch (error) {
@@ -993,31 +933,16 @@ export default {
         const requestBody = {
           chat_id: GROUP_ID,
           text: text,
-          message_thread_id: topicId,
-          parse_mode: 'Markdown'
+          message_thread_id: topicId
         };
-        console.log(`Sending message to topic ${topicId} with body:`, JSON.stringify(requestBody, null, 2));
-        let response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody)
         });
-        let data = await response.json();
+        const data = await response.json();
         if (!data.ok) {
-          console.warn(`Markdown parsing failed for topic ${topicId}: ${data.description}`);
-          // 如果 Markdown 解析失败，尝试不使用 Markdown
-          delete requestBody.parse_mode;
-          console.log(`Retrying without Markdown for topic ${topicId}:`, JSON.stringify(requestBody, null, 2));
-          response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(requestBody)
-          });
-          data = await response.json();
-          if (!data.ok) {
-            console.error(`Failed to send message to topic ${topicId}: ${data.description}`, JSON.stringify(data, null, 2));
-            throw new Error(`Failed to send message to topic: ${data.description} (chat_id: ${GROUP_ID}, topic_id: ${topicId})`);
-          }
+          throw new Error(`Failed to send message to topic: ${data.description} (chat_id: ${GROUP_ID}, topic_id: ${topicId})`);
         }
         return data;
       } catch (error) {
@@ -1035,7 +960,6 @@ export default {
           message_thread_id: topicId,
           disable_notification: true
         };
-        console.log(`Copying message to topic ${topicId} with body:`, JSON.stringify(requestBody, null, 2));
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1043,7 +967,6 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          console.error(`Failed to copy message to topic ${topicId}: ${data.description}`, JSON.stringify(data, null, 2));
           throw new Error(`Failed to copy message to topic: ${data.description} (chat_id: ${GROUP_ID}, from_chat_id: ${message.chat.id}, message_id: ${message.message_id}, topic_id: ${topicId})`);
         }
       } catch (error) {
@@ -1059,7 +982,6 @@ export default {
           message_id: messageId,
           message_thread_id: topicId
         };
-        console.log(`Pinning message ${messageId} in topic ${topicId}`);
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1067,7 +989,6 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          console.error(`Failed to pin message: ${data.description}`, JSON.stringify(data, null, 2));
           throw new Error(`Failed to pin message: ${data.description}`);
         }
       } catch (error) {
@@ -1084,7 +1005,6 @@ export default {
           message_id: message.message_id,
           disable_notification: true
         };
-        console.log(`Forwarding message to private chat ${privateChatId} with body:`, JSON.stringify(requestBody, null, 2));
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1092,7 +1012,6 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          console.error(`Failed to forward message to private chat ${privateChatId}: ${data.description}`, JSON.stringify(data, null, 2));
           throw new Error(`Failed to forward message to private chat: ${data.description} (chat_id: ${privateChatId}, from_chat_id: ${message.chat.id}, message_id: ${message.message_id})`);
         }
       } catch (error) {
@@ -1104,7 +1023,6 @@ export default {
     async function sendMessageToUser(chatId, text) {
       try {
         const requestBody = { chat_id: chatId, text: text };
-        console.log(`Sending message to user ${chatId}: ${text}`);
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1112,7 +1030,6 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          console.error(`Failed to send message to user ${chatId}: ${data.description}`, JSON.stringify(data, null, 2));
           throw new Error(`Failed to send message to user: ${data.description}`);
         }
       } catch (error) {
@@ -1121,11 +1038,11 @@ export default {
       }
     }
 
-    async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
+    async function fetchWithRetry(url, options, retries = 2, backoff = 1000) {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 10000);
+          const timeoutId = setTimeout(() => controller.abort(), 5000);
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
@@ -1135,7 +1052,6 @@ export default {
           if (response.status === 429) {
             const retryAfter = response.headers.get('Retry-After');
             const delay = retryAfter ? parseInt(retryAfter) * 1000 : backoff * Math.pow(2, i);
-            console.log(`Rate limited, retrying after ${delay}ms`);
             await new Promise(resolve => setTimeout(resolve, delay));
           } else {
             throw new Error(`Request failed with status ${response.status}: ${response.statusText}`);
@@ -1144,7 +1060,6 @@ export default {
           if (i === retries - 1) {
             throw error;
           }
-          console.log(`Retrying request (${i + 1}/${retries}) after error: ${error.message}`);
           await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
         }
       }
