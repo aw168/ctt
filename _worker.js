@@ -262,29 +262,20 @@ export default {
 
         console.log(`Chat ${chatId}: Using topic ID ${finalTopicId} for message forwarding`);
 
+        // 记录消息内容
+        console.log(`Chat ${chatId}: Forwarding message - Text: ${text || 'No text'}, Message ID: ${messageId}`);
+
         // 发送消息
         const formattedMessage = text ? `${nickname}:\n${text}` : null;
         await (formattedMessage ? sendMessageToTopic(finalTopicId, formattedMessage) : copyMessageToTopic(finalTopicId, message));
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
-        let errorMessage = error.message;
-        if (error.message.includes('Request failed with status')) {
-          try {
-            const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`);
-            const data = await response.json();
-            if (data.description) {
-              errorMessage += ` (Telegram API: ${data.description})`;
-            }
-          } catch (fetchError) {
-            console.error('Failed to fetch Telegram API error details:', fetchError);
-          }
-        }
         if (error.message.includes('429')) {
           await sendMessageToUser(chatId, `消息“${text}”转发失败：消息发送过于频繁，请稍后再试。`);
           await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：Telegram API 速率限制 (429)`);
         } else {
-          await sendMessageToUser(chatId, `消息“${text}”转发失败：${errorMessage}，请稍后再试或联系管理员。`);
-          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${errorMessage}`);
+          await sendMessageToUser(chatId, `消息“${text}”转发失败：${error.message}，请稍后再试或联系管理员。`);
+          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
         }
       }
     }
@@ -599,19 +590,7 @@ export default {
         });
       } catch (error) {
         console.error(`Error processing callback query ${data}:`, error);
-        let errorMessage = error.message;
-        if (error.message.includes('Request failed with status')) {
-          try {
-            const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`);
-            const data = await response.json();
-            if (data.description) {
-              errorMessage += ` (Telegram API: ${data.description})`;
-            }
-          } catch (fetchError) {
-            console.error('Failed to fetch Telegram API error details:', fetchError);
-          }
-        }
-        await sendMessageToTopic(topicId, `处理操作 ${action} 失败：${errorMessage}`);
+        await sendMessageToTopic(topicId, `处理操作 ${action} 失败：${error.message}`);
       }
     }
 
