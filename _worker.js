@@ -202,7 +202,7 @@ export default {
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
       const isFirstVerification = userState.is_first_verification;
 
-      // 速率限制（仅每分钟限制）
+      // 速率限制（每分钟限制）
       const now = Date.now();
       const window = 60 * 1000;
       let messageCount = userState.message_count || 0;
@@ -228,13 +228,14 @@ export default {
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
-        // 检查是否已有未完成验证
-        if (userState.last_verification_message_id) {
+        // 如果已有验证码且未过期，直接提示验证
+        if (userState.verification_code && userState.code_expiry && nowSeconds < userState.code_expiry) {
           await sendMessageToUser(chatId, "请验证上方验证码后再发送信息。");
-          return;
+        } else {
+          // 否则生成新的验证码
+          await sendMessageToUser(chatId, "请完成验证后发送消息。");
+          await handleVerification(chatId, messageId);
         }
-        await sendMessageToUser(chatId, "请完成验证后发送消息。");
-        await handleVerification(chatId, messageId);
         return;
       }
 
@@ -871,17 +872,21 @@ export default {
     }
 
     async function fetchWithRetry(url, options) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1000);
-      try {
-        const response = await fetch(url, { ...options, signal: controller.signal });
-        clearTimeout(timeoutId);
-        if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
-        return response;
-      } catch (error) {
-        clearTimeout(timeoutId);
-        throw error;
+      const maxRetries = 2;
+      let lastError;
+
+      for (let i = 0; i <= maxRetries; i++) {
+        try {
+          const response = await fetch(url, options);
+          if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+          return response;
+        } catch (error) {
+          lastError = error;
+          if (i === maxRetries) break;
+          await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // 指数退避
+        }
       }
+      throw lastError;
     }
 
     async function registerWebhook(request) {
