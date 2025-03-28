@@ -226,6 +226,7 @@ export default {
           rate_limit_window_start: Date.now()
         };
         userStateCache.set(userStateKey, userState);
+        console.log(`Chat ${chatId}: Initialized user state - is_blocked: ${userState.is_blocked}, is_first_verification: ${userState.is_first_verification}`);
       }
 
       const isBlocked = userState.is_blocked || false;
@@ -413,9 +414,17 @@ export default {
 
       const targetChatId = parts[1];
       try {
+        // 删除用户相关数据
         await env.D1.prepare('DELETE FROM users WHERE chat_id = ?').bind(targetChatId).run();
+        await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(targetChatId).run();
+        
+        // 清理缓存
         userStateCache.delete(`${targetChatId}:state`);
-        await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
+        topicIdCache.delete(targetChatId);
+        userInfoCache.delete(targetChatId);
+
+        console.log(`Chat ${targetChatId}: User data and topic mappings deleted, caches cleared`);
+        await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置，相关话题映射已删除。`);
       } catch (error) {
         console.error(`Error resetting user ${targetChatId}:`, error);
         await sendMessageToTopic(topicId, `重置用户 ${targetChatId} 失败：${error.message}`);
@@ -684,9 +693,17 @@ export default {
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
             try {
+              // 删除用户相关数据
               await env.D1.prepare('DELETE FROM users WHERE chat_id = ?').bind(privateChatId).run();
+              await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId).run();
+              
+              // 清理缓存
               userStateCache.delete(`${privateChatId}:state`);
-              await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息记录已删除，话题保留。`);
+              topicIdCache.delete(privateChatId);
+              userInfoCache.delete(privateChatId);
+
+              console.log(`Chat ${privateChatId}: User data and topic mappings deleted, caches cleared`);
+              await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态和消息记录已删除，相关话题映射已删除。`);
             } catch (error) {
               console.error(`Error deleting user ${privateChatId}:`, error);
               await sendMessageToTopic(topicId, `删除用户 ${privateChatId} 失败：${error.message}`);
