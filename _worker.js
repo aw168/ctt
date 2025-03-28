@@ -190,6 +190,8 @@ export default {
         if (verificationEnabled && isFirstVerification) {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
           await handleVerification(chatId, messageId);
+          // 添加提示
+          await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
         } else {
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
@@ -227,21 +229,17 @@ export default {
 
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
-      // 如果达到速率限制，直接提示用户
-      if (isRateLimited) {
-        await sendMessageToUser(chatId, "消息发送过于频繁，请稍后再试。");
-        return;
-      }
-
-      // 调整验证码触发逻辑：仅在未验证时触发验证码
-      if (verificationEnabled && !isVerified) {
+      // 恢复验证码触发逻辑：未验证或达到速率限制时触发验证码
+      if (verificationEnabled && (!isVerified || isRateLimited)) {
         // 如果已有验证码且未过期，直接提示验证
         if (userState.verification_code && userState.code_expiry && nowSeconds < userState.code_expiry) {
           await sendMessageToUser(chatId, "请验证上方验证码后再发送信息。");
+          await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
         } else {
           // 否则生成新的验证码
           await sendMessageToUser(chatId, "请完成验证后发送消息。");
           await handleVerification(chatId, messageId);
+          await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
         }
         return;
       }
@@ -295,10 +293,10 @@ export default {
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
         if (error.message.includes('429')) {
-          await sendMessageToUser(chatId, "消息发送过于频繁，请稍后再试。");
+          await sendMessageToUser(chatId, `消息“${text}”转发失败：消息发送过于频繁，请稍后再试。`);
           await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：Telegram API 速率限制 (429)`);
         } else {
-          await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
+          await sendMessageToUser(chatId, `消息“${text}”转发失败：${error.message}，请稍后再试或联系管理员。`);
           await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
         }
       }
