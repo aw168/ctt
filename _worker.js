@@ -40,6 +40,9 @@ export default {
       const mappings = await env.D1.prepare('SELECT chat_id, topic_id FROM chat_topic_mappings').all();
       mappings.results.forEach(({ chat_id, topic_id }) => topicIdCache.set(chat_id, topic_id));
 
+      // 检查群组设置
+      await checkGroupSettings();
+
       isInitialized = true;
     }
 
@@ -71,6 +74,64 @@ export default {
       } else if (update.callback_query) {
         await onCallbackQuery(update.callback_query);
       }
+    }
+
+    async function checkGroupSettings() {
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: GROUP_ID })
+        });
+        const data = await response.json();
+        if (!data.ok) {
+          console.error(`Failed to get group info: ${data.description}`);
+          throw new Error(`Failed to get group info: ${data.description}`);
+        }
+        const hasForum = data.result.has_forum || false;
+        if (!hasForum) {
+          console.error('Group does not have forum/topics enabled. Please enable topics in the group settings.');
+          throw new Error('Group does not have forum/topics enabled');
+        }
+
+        // 检查机器人权限
+        const botResponse = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            user_id: (await getBotId())
+          })
+        });
+        const botData = await botResponse.json();
+        if (!botData.ok) {
+          console.error(`Failed to get bot permissions: ${botData.description}`);
+          throw new Error(`Failed to get bot permissions: ${botData.description}`);
+        }
+        const botStatus = botData.result.status;
+        const canPostMessages = botStatus === 'administrator' ? (botData.result.can_post_messages || false) : false;
+        const canManageTopics = botStatus === 'administrator' ? (botData.result.can_manage_topics || false) : false;
+        if (!canPostMessages || !canManageTopics) {
+          console.error(`Bot lacks required permissions: can_post_messages=${canPostMessages}, can_manage_topics=${canManageTopics}`);
+          throw new Error('Bot lacks required permissions in the group');
+        }
+      } catch (error) {
+        console.error('Group settings check failed:', error);
+        throw error;
+      }
+    }
+
+    async function getBotId() {
+      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await response.json();
+      if (!data.ok) {
+        throw new Error(`Failed to get bot ID: ${data.description}`);
+      }
+      return data.result.id;
     }
 
     async function onMessage(message) {
@@ -256,8 +317,8 @@ export default {
         }
 
         // 验证话题 ID 是否有效
-        if (!finalTopicId) {
-          throw new Error('Invalid topic ID after creation');
+        if (!finalTopicId || isNaN(finalTopicId)) {
+          throw new Error(`Invalid topic ID: ${finalTopicId}`);
         }
 
         console.log(`Chat ${chatId}: Using topic ID ${finalTopicId} for message forwarding`);
@@ -270,12 +331,16 @@ export default {
         await (formattedMessage ? sendMessageToTopic(finalTopicId, formattedMessage) : copyMessageToTopic(finalTopicId, message));
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
-        if (error.message.includes('429')) {
+        let errorMessage = error.message;
+        if (errorMessage.includes('Request failed with status')) {
+          errorMessage = error.message; // 确保包含 Telegram API 的详细错误描述
+        }
+        if (errorMessage.includes('429')) {
           await sendMessageToUser(chatId, `消息“${text}”转发失败：消息发送过于频繁，请稍后再试。`);
           await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：Telegram API 速率限制 (429)`);
         } else {
-          await sendMessageToUser(chatId, `消息“${text}”转发失败：${error.message}，请稍后再试或联系管理员。`);
-          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
+          await sendMessageToUser(chatId, `消息“${text}”转发失败：${errorMessage}，请稍后再试或联系管理员。`);
+          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${errorMessage}`);
         }
       }
     }
@@ -822,6 +887,9 @@ export default {
     }
 
     async function sendMessageToTopic(topicId, text) {
+      if (!text || text.length > 4096) {
+        throw new Error(`Message text is invalid: ${text ? 'Text too long' : 'Text is empty'}`);
+      }
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
@@ -835,7 +903,7 @@ export default {
         const data = await response.json();
         if (!data.ok) {
           console.error(`Failed to send message to topic ${topicId}: ${data.description}`);
-          throw new Error(`Failed to send message to topic: ${data.description}`);
+          throw new Error(`Request failed with status 400 (Telegram API: ${data.description})`);
         }
         return data;
       } catch (error) {
@@ -860,7 +928,7 @@ export default {
         const data = await response.json();
         if (!data.ok) {
           console.error(`Failed to copy message to topic ${topicId}: ${data.description}`);
-          throw new Error(`Failed to copy message to topic: ${data.description}`);
+          throw new Error(`Request failed with status 400 (Telegram API: ${data.description})`);
         }
       } catch (error) {
         console.error(`Error in copyMessageToTopic for topic ${topicId}:`, error);
