@@ -115,6 +115,8 @@ export default {
         const canPostMessages = botStatus === 'administrator' ? (botData.result.can_post_messages || false) : false;
         const canManageTopics = botStatus === 'administrator' ? (botData.result.can_manage_topics || false) : false;
 
+        console.log(`Bot permissions - status: ${botStatus}, can_post_messages: ${canPostMessages}, can_manage_topics: ${canManageTopics}`);
+
         if (!canPostMessages) {
           console.error(`Bot lacks required permission: can_post_messages=${canPostMessages}`);
           return { success: false, error: `Bot lacks required permission: can_post_messages=${canPostMessages}`, hasForum };
@@ -348,8 +350,19 @@ export default {
       const groupCheckResult = await checkGroupSettings();
       if (!groupCheckResult.success) {
         console.error(`Chat ${chatId}: Group settings check failed: ${groupCheckResult.error}`);
-        await sendMessageToUser(chatId, `消息“${text}”转发失败：群组设置检查失败 (${groupCheckResult.error})，请联系管理员。`);
-        await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：群组设置检查失败 (${groupCheckResult.error})`);
+        let userErrorMessage = `消息“${text}”转发失败：群组设置检查失败 (${groupCheckResult.error})，请联系管理员。`;
+        let groupErrorMessage = `无法转发用户 ${chatId} 的消息：群组设置检查失败 (${groupCheckResult.error})`;
+        
+        if (groupCheckResult.error.includes('can_post_messages')) {
+          userErrorMessage = `消息“${text}”转发失败：机器人缺少发送消息权限 (can_post_messages)，请联系群组管理员修复。`;
+          groupErrorMessage = `无法转发用户 ${chatId} 的消息：机器人缺少发送消息权限 (can_post_messages)，请管理员授予机器人“发送消息”权限。`;
+        } else if (groupCheckResult.error.includes('can_manage_topics')) {
+          userErrorMessage = `消息“${text}”转发失败：机器人缺少管理话题权限 (can_manage_topics)，请联系群组管理员修复。`;
+          groupErrorMessage = `无法转发用户 ${chatId} 的消息：机器人缺少管理话题权限 (can_manage_topics)，请管理员授予机器人“管理话题”权限。`;
+        }
+
+        await sendMessageToUser(chatId, userErrorMessage);
+        await sendMessageToTopic(null, groupErrorMessage);
         return;
       }
       groupSupportsTopics = groupCheckResult.hasForum;
@@ -1041,7 +1054,7 @@ export default {
       }
     }
 
-    async function pinMessage(topicId, messageId) {
+    async  function pinMessage(topicId, messageId) {
       if (!groupSupportsTopics) return;
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
