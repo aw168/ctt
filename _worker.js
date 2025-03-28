@@ -134,6 +134,42 @@ export default {
       return data.result.id;
     }
 
+    async function validateTopicId(topicId) {
+      if (!topicId || isNaN(topicId)) {
+        return false;
+      }
+      try {
+        // 尝试发送一条测试消息来验证话题是否存在
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            text: 'Test message to validate topic',
+            message_thread_id: topicId,
+            disable_notification: true
+          })
+        });
+        const data = await response.json();
+        if (data.ok) {
+          // 如果消息发送成功，删除测试消息
+          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: GROUP_ID,
+              message_id: data.result.message_id
+            })
+          });
+          return true;
+        }
+        return false;
+      } catch (error) {
+        console.error(`Topic ID ${topicId} validation failed:`, error);
+        return false;
+      }
+    }
+
     async function onMessage(message) {
       const chatId = message.chat.id.toString();
       const text = message.text || '';
@@ -293,6 +329,9 @@ export default {
       }
 
       try {
+        // 动态检查群组设置
+        await checkGroupSettings();
+
         // 并行获取用户信息和话题 ID
         const [userInfo, topicId] = await Promise.all([
           getUserInfo(chatId),
@@ -304,8 +343,21 @@ export default {
         const topicName = nickname;
 
         let finalTopicId = topicId;
+        // 验证话题 ID 是否有效
+        if (finalTopicId) {
+          const isValid = await validateTopicId(finalTopicId);
+          if (!isValid) {
+            console.log(`Chat ${chatId}: Topic ID ${finalTopicId} is invalid, removing and recreating`);
+            topicIdCache.delete(chatId);
+            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+              .bind(chatId)
+              .run();
+            finalTopicId = null;
+          }
+        }
+
         if (!finalTopicId) {
-          console.log(`Chat ${chatId}: No topic ID found, creating new topic`);
+          console.log(`Chat ${chatId}: No valid topic ID found, creating new topic`);
           finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
           if (!finalTopicId) {
             throw new Error('Failed to create forum topic');
@@ -316,9 +368,9 @@ export default {
             .run();
         }
 
-        // 验证话题 ID 是否有效
+        // 再次验证话题 ID
         if (!finalTopicId || isNaN(finalTopicId)) {
-          throw new Error(`Invalid topic ID: ${finalTopicId}`);
+          throw new Error(`Invalid topic ID after creation: ${finalTopicId}`);
         }
 
         console.log(`Chat ${chatId}: Using topic ID ${finalTopicId} for message forwarding`);
