@@ -18,12 +18,8 @@ const settingsCache = {
 
 export default {
   async fetch(request, env) {
-    const totalStart = Date.now();
-    const timings = {};
-
     // 一次性初始化
     if (!isInitialized) {
-      const initStart = Date.now();
       BOT_TOKEN = env.BOT_TOKEN_ENV || null;
       GROUP_ID = env.GROUP_ID_ENV || null;
       MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
@@ -34,30 +30,20 @@ export default {
       }
 
       // 初始化数据库表
-      const dbInitStart = Date.now();
       await checkAndRepairTables(env.D1);
-      timings.dbInit = Date.now() - dbInitStart;
 
       // 预加载 settings
-      const settingsLoadStart = Date.now();
       settingsCache.verification_enabled = (await getSetting('verification_enabled', env.D1)) === 'true';
       settingsCache.user_raw_enabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-      timings.settingsLoad = Date.now() - settingsLoadStart;
 
       // 预加载话题映射
-      const preloadStart = Date.now();
       const mappings = await env.D1.prepare('SELECT chat_id, topic_id FROM chat_topic_mappings').all();
       mappings.results.forEach(({ chat_id, topic_id }) => topicIdCache.set(chat_id, topic_id));
-      timings.preload = Date.now() - preloadStart;
 
       isInitialized = true;
-      timings.init = Date.now() - initStart;
     }
 
     async function handleRequest(request) {
-      const handleStart = Date.now();
-      timings.handleRequestStart = Date.now() - totalStart;
-
       const url = new URL(request.url);
       if (url.pathname === '/webhook') {
         try {
@@ -88,9 +74,6 @@ export default {
     }
 
     async function onMessage(message) {
-      const messageStart = Date.now();
-      const timings = {};
-
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
@@ -126,11 +109,9 @@ export default {
       const userStateKey = `${chatId}:state`;
       let userState = userStateCache.get(userStateKey);
       if (!userState) {
-        const dbQueryStart = Date.now();
         const userData = await env.D1.prepare(
           'SELECT is_blocked, is_first_verification, is_verified, verified_expiry, message_count, window_start, start_count, start_window_start, verification_code, code_expiry, last_verification_message_id FROM users WHERE chat_id = ?'
         ).bind(chatId).first();
-        timings.dbQuery = Date.now() - dbQueryStart;
 
         userState = userData || {
           is_blocked: false,
@@ -173,11 +154,9 @@ export default {
         userState.start_window_start = startWindowStart;
         userStateCache.set(userStateKey, userState);
 
-        const dbUpdateStart = Date.now();
         await env.D1.prepare(
           'INSERT INTO users (chat_id, start_count, start_window_start) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET start_count = ?, start_window_start = ?'
         ).bind(chatId, startCount, startWindowStart, startCount, startWindowStart).run();
-        timings.dbUpdate = Date.now() - dbUpdateStart;
 
         if (startCount > maxStartsPerWindow) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
@@ -190,7 +169,6 @@ export default {
         if (verificationEnabled && isFirstVerification) {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
           await handleVerification(chatId, messageId);
-          // 添加提示
           await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
         } else {
           const successMessage = await getVerificationSuccessMessage();
@@ -202,7 +180,6 @@ export default {
       const verificationEnabled = settingsCache.verification_enabled;
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
-      const isFirstVerification = userState.is_first_verification;
 
       // 速率限制（每分钟限制）
       const now = Date.now();
@@ -221,23 +198,26 @@ export default {
       userState.window_start = windowStart;
       userStateCache.set(userStateKey, userState);
 
-      const dbUpdateStart = Date.now();
       await env.D1.prepare(
         'INSERT INTO users (chat_id, message_count, window_start) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET message_count = ?, window_start = ?'
       ).bind(chatId, messageCount, windowStart, messageCount, windowStart).run();
-      timings.dbUpdate = Date.now() - dbUpdateStart;
 
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
-      // 恢复验证码触发逻辑：未验证或达到速率限制时触发验证码
-      if (verificationEnabled && (!isVerified || isRateLimited)) {
+      // 如果达到速率限制，直接提示用户
+      if (isRateLimited) {
+        await sendMessageToUser(chatId, "消息发送过于频繁，请稍后再试。");
+        return;
+      }
+
+      // 调整验证码触发逻辑：仅在未验证时触发验证码
+      if (verificationEnabled && !isVerified) {
         // 如果已有验证码且未过期，直接提示验证
         if (userState.verification_code && userState.code_expiry && nowSeconds < userState.code_expiry) {
           await sendMessageToUser(chatId, "请验证上方验证码后再发送信息。");
           await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
         } else {
           // 否则生成新的验证码
-          await sendMessageToUser(chatId, "请完成验证后发送消息。");
           await handleVerification(chatId, messageId);
           await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
         }
@@ -246,14 +226,10 @@ export default {
 
       try {
         // 并行获取用户信息和话题 ID
-        const userInfoStart = Date.now();
-        const topicIdStart = Date.now();
         const [userInfo, topicId] = await Promise.all([
           getUserInfo(chatId),
           getTopicId(chatId)
         ]);
-        timings.getUserInfo = Date.now() - userInfoStart;
-        timings.getTopicId = Date.now() - topicIdStart;
 
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
@@ -261,15 +237,11 @@ export default {
 
         let finalTopicId = topicId;
         if (!finalTopicId) {
-          const createTopicStart = Date.now();
           finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
           topicIdCache.set(chatId, finalTopicId);
-          const saveStart = Date.now();
           await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
             .bind(chatId, finalTopicId)
             .run();
-          timings.saveTopic = Date.now() - saveStart;
-          timings.createTopic = Date.now() - createTopicStart;
         }
 
         // 验证话题 ID 是否有效
@@ -278,18 +250,8 @@ export default {
         }
 
         // 发送消息
-        const sendStart = Date.now();
         const formattedMessage = text ? `${nickname}:\n${text}` : null;
         await (formattedMessage ? sendMessageToTopic(finalTopicId, formattedMessage) : copyMessageToTopic(finalTopicId, message));
-        timings.send = Date.now() - sendStart;
-
-        // 发送耗时信息
-        const totalTime = Date.now() - messageStart;
-        const timingDetails = Object.entries(timings)
-          .map(([key, value]) => `${key}: ${value}ms`)
-          .join(', ');
-        const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
-        await sendMessageToTopic(finalTopicId, timingMessage);
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
         if (error.message.includes('429')) {
@@ -328,9 +290,6 @@ export default {
     }
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
-      const adminStart = Date.now();
-      const timings = {};
-
       try {
         const verificationEnabled = settingsCache.verification_enabled;
         const userRawEnabled = settingsCache.user_raw_enabled;
@@ -354,8 +313,6 @@ export default {
         ];
 
         const adminMessage = '管理员面板：请选择操作';
-        const sendMessageStart = Date.now();
-        const deleteMessageStart = Date.now();
         await Promise.all([
           fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
@@ -376,15 +333,6 @@ export default {
             })
           })
         ]);
-        timings.sendMessage = Date.now() - sendMessageStart;
-        timings.deleteMessage = Date.now() - deleteMessageStart;
-
-        const totalTime = Date.now() - adminStart;
-        const timingDetails = Object.entries(timings)
-          .map(([key, value]) => `${key}: ${value}ms`)
-          .join(', ');
-        const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
-        await sendMessageToTopic(topicId, timingMessage);
       } catch (error) {
         console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
         await sendMessageToTopic(topicId, `发送管理员面板失败：${error.message}`);
@@ -610,7 +558,6 @@ export default {
         });
       } catch (error) {
         console.error(`Error processing callback query ${data}:`, error);
-        // 记录 Telegram API 返回的详细错误信息
         let errorMessage = error.message;
         if (error.message.includes('Request failed with status')) {
           try {
@@ -1065,11 +1012,7 @@ export default {
     await cleanExpiredVerificationCodes();
 
     try {
-      const response = await handleRequest(request);
-      const totalTime = Date.now() - totalStart;
-      timings.total = totalTime;
-      console.log(`Request timings: ${JSON.stringify(timings)}`);
-      return response;
+      return await handleRequest(request);
     } catch (error) {
       console.error('Unhandled error in fetch handler:', error);
       return new Response('Internal Server Error', { status: 500 });
