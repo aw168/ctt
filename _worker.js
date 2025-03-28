@@ -41,7 +41,10 @@ export default {
       mappings.results.forEach(({ chat_id, topic_id }) => topicIdCache.set(chat_id, topic_id));
 
       // 检查群组设置
-      await checkGroupSettings();
+      const groupCheckResult = await checkGroupSettings();
+      if (!groupCheckResult.success) {
+        console.error('Initial group settings check failed:', groupCheckResult.error);
+      }
 
       isInitialized = true;
     }
@@ -86,12 +89,12 @@ export default {
         const data = await response.json();
         if (!data.ok) {
           console.error(`Failed to get group info: ${data.description}`);
-          throw new Error(`Failed to get group info: ${data.description}`);
+          return { success: false, error: `Failed to get group info: ${data.description}` };
         }
         const hasForum = data.result.has_forum || false;
         if (!hasForum) {
           console.error('Group does not have forum/topics enabled. Please enable topics in the group settings.');
-          throw new Error('Group does not have forum/topics enabled');
+          return { success: false, error: 'Group does not have forum/topics enabled' };
         }
 
         // 检查机器人权限
@@ -106,18 +109,21 @@ export default {
         const botData = await botResponse.json();
         if (!botData.ok) {
           console.error(`Failed to get bot permissions: ${botData.description}`);
-          throw new Error(`Failed to get bot permissions: ${botData.description}`);
+          return { success: false, error: `Failed to get bot permissions: ${botData.description}` };
         }
         const botStatus = botData.result.status;
         const canPostMessages = botStatus === 'administrator' ? (botData.result.can_post_messages || false) : false;
         const canManageTopics = botStatus === 'administrator' ? (botData.result.can_manage_topics || false) : false;
         if (!canPostMessages || !canManageTopics) {
           console.error(`Bot lacks required permissions: can_post_messages=${canPostMessages}, can_manage_topics=${canManageTopics}`);
-          throw new Error('Bot lacks required permissions in the group');
+          return { success: false, error: `Bot lacks required permissions: can_post_messages=${canPostMessages}, can_manage_topics=${canManageTopics}` };
         }
+
+        console.log(`Group settings check passed: has_forum=${hasForum}, can_post_messages=${canPostMessages}, can_manage_topics=${canManageTopics}`);
+        return { success: true };
       } catch (error) {
         console.error('Group settings check failed:', error);
-        throw error;
+        return { success: false, error: error.message };
       }
     }
 
@@ -136,10 +142,10 @@ export default {
 
     async function validateTopicId(topicId) {
       if (!topicId || isNaN(topicId)) {
-        return false;
+        console.log(`Topic ID ${topicId} is invalid (empty or not a number)`);
+        return { success: false, error: 'Topic ID is invalid' };
       }
       try {
-        // 尝试发送一条测试消息来验证话题是否存在
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -152,7 +158,6 @@ export default {
         });
         const data = await response.json();
         if (data.ok) {
-          // 如果消息发送成功，删除测试消息
           await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -161,12 +166,14 @@ export default {
               message_id: data.result.message_id
             })
           });
-          return true;
+          console.log(`Topic ID ${topicId} is valid`);
+          return { success: true };
         }
-        return false;
+        console.log(`Topic ID ${topicId} is invalid: ${data.description}`);
+        return { success: false, error: data.description };
       } catch (error) {
         console.error(`Topic ID ${topicId} validation failed:`, error);
-        return false;
+        return { success: false, error: error.message };
       }
     }
 
@@ -174,6 +181,8 @@ export default {
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
+
+      console.log(`Chat ${chatId}: Received message - Text: ${text || 'No text'}, Message ID: ${messageId}`);
 
       // 处理群组消息
       if (chatId === GROUP_ID) {
@@ -189,14 +198,14 @@ export default {
               await handleResetUser(chatId, topicId, text);
               return;
             }
-            // 转发群组消息到私聊
+            console.log(`Chat ${chatId}: Forwarding group message to private chat ${privateChatId}`);
             await forwardMessageToPrivateChat(privateChatId, message);
           } else {
-            console.error(`No private chat ID found for topicId ${topicId}`);
+            console.error(`Chat ${chatId}: No private chat ID found for topicId ${topicId}`);
             await sendMessageToTopic(topicId, `无法找到对应的私聊用户，topicId: ${topicId}`);
           }
         } else {
-          console.error('No topic ID found for group message');
+          console.error(`Chat ${chatId}: No topic ID found for group message`);
           await sendMessageToTopic(null, '群组消息缺少话题 ID，无法转发');
         }
         return;
@@ -231,6 +240,7 @@ export default {
 
       const isBlocked = userState.is_blocked || false;
       if (isBlocked) {
+        console.log(`Chat ${chatId}: User is blocked, cannot send messages`);
         await sendMessageToUser(chatId, "您已被拉黑，无法发送消息。请联系管理员解除拉黑。");
         return;
       }
@@ -259,6 +269,7 @@ export default {
         ).bind(chatId, startCount, startWindowStart, startCount, startWindowStart).run();
 
         if (startCount > maxStartsPerWindow) {
+          console.log(`Chat ${chatId}: Too many /start commands`);
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
           return;
         }
@@ -291,7 +302,6 @@ export default {
       let rateLimitVerified = userState.rate_limit_verified || false;
       let rateLimitWindowStart = userState.rate_limit_window_start || now;
 
-      // 检查速率限制窗口是否重置
       if (now - windowStart > window) {
         console.log(`Chat ${chatId}: Rate limit window reset, resetting rate_limit_verified`);
         messageCount = 1;
@@ -314,51 +324,55 @@ export default {
 
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
-      // 验证码触发逻辑：未通过初次验证或（达到速率限制且未通过速率限制验证）时触发验证码
       if (verificationEnabled && (!isVerified || (isRateLimited && !rateLimitVerified))) {
         console.log(`Chat ${chatId}: Triggering verification - isVerified: ${isVerified}, isRateLimited: ${isRateLimited}, rateLimitVerified: ${rateLimitVerified}`);
-        // 如果已有验证码且未过期，直接提示验证
         if (userState.verification_code && userState.code_expiry && nowSeconds < userState.code_expiry) {
           await sendMessageToUser(chatId, "请验证上方验证码后再发送信息。");
           await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
         } else {
-          // 否则生成新的验证码
           await handleVerification(chatId, messageId);
           await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
         }
         return;
       }
 
-      try {
-        // 动态检查群组设置
-        await checkGroupSettings();
+      console.log(`Chat ${chatId}: User passed verification and rate limit checks, proceeding to forward message`);
 
-        // 并行获取用户信息和话题 ID
-        const [userInfo, topicId] = await Promise.all([
-          getUserInfo(chatId),
-          getTopicId(chatId)
-        ]);
+      // 动态检查群组设置
+      const groupCheckResult = await checkGroupSettings();
+      if (!groupCheckResult.success) {
+        console.error(`Chat ${chatId}: Group settings check failed: ${groupCheckResult.error}`);
+        await sendMessageToUser(chatId, `消息“${text}”转发失败：群组设置检查失败 (${groupCheckResult.error})，请联系管理员。`);
+        await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：群组设置检查失败 (${groupCheckResult.error})`);
+        return;
+      }
 
-        const userName = userInfo.username || `User_${chatId}`;
-        const nickname = userInfo.nickname || userName;
-        const topicName = nickname;
+      // 并行获取用户信息和话题 ID
+      const [userInfo, topicId] = await Promise.all([
+        getUserInfo(chatId),
+        getTopicId(chatId)
+      ]);
 
-        let finalTopicId = topicId;
-        // 验证话题 ID 是否有效
-        if (finalTopicId) {
-          const isValid = await validateTopicId(finalTopicId);
-          if (!isValid) {
-            console.log(`Chat ${chatId}: Topic ID ${finalTopicId} is invalid, removing and recreating`);
-            topicIdCache.delete(chatId);
-            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
-              .bind(chatId)
-              .run();
-            finalTopicId = null;
-          }
+      const userName = userInfo.username || `User_${chatId}`;
+      const nickname = userInfo.nickname || userName;
+      const topicName = nickname;
+
+      let finalTopicId = topicId;
+      if (finalTopicId) {
+        const validationResult = await validateTopicId(finalTopicId);
+        if (!validationResult.success) {
+          console.log(`Chat ${chatId}: Topic ID ${finalTopicId} is invalid: ${validationResult.error}, removing and recreating`);
+          topicIdCache.delete(chatId);
+          await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+            .bind(chatId)
+            .run();
+          finalTopicId = null;
         }
+      }
 
-        if (!finalTopicId) {
-          console.log(`Chat ${chatId}: No valid topic ID found, creating new topic`);
+      if (!finalTopicId) {
+        console.log(`Chat ${chatId}: No valid topic ID found, creating new topic`);
+        try {
           finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
           if (!finalTopicId) {
             throw new Error('Failed to create forum topic');
@@ -367,26 +381,33 @@ export default {
           await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
             .bind(chatId, finalTopicId)
             .run();
+        } catch (error) {
+          console.error(`Chat ${chatId}: Failed to create forum topic: ${error.message}`);
+          await sendMessageToUser(chatId, `消息“${text}”转发失败：无法创建话题 (${error.message})，请联系管理员。`);
+          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：无法创建话题 (${error.message})`);
+          return;
         }
+      }
 
-        // 再次验证话题 ID
-        if (!finalTopicId || isNaN(finalTopicId)) {
-          throw new Error(`Invalid topic ID after creation: ${finalTopicId}`);
-        }
+      if (!finalTopicId || isNaN(finalTopicId)) {
+        console.error(`Chat ${chatId}: Invalid topic ID after creation: ${finalTopicId}`);
+        await sendMessageToUser(chatId, `消息“${text}”转发失败：话题 ID 无效，请联系管理员。`);
+        await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：话题 ID 无效 (${finalTopicId})`);
+        return;
+      }
 
-        console.log(`Chat ${chatId}: Using topic ID ${finalTopicId} for message forwarding`);
+      console.log(`Chat ${chatId}: Using topic ID ${finalTopicId} for message forwarding`);
 
-        // 记录消息内容
-        console.log(`Chat ${chatId}: Forwarding message - Text: ${text || 'No text'}, Message ID: ${messageId}`);
-
-        // 发送消息
-        const formattedMessage = text ? `${nickname}:\n${text}` : null;
+      // 发送消息
+      const formattedMessage = text ? `${nickname}:\n${text}` : null;
+      try {
         await (formattedMessage ? sendMessageToTopic(finalTopicId, formattedMessage) : copyMessageToTopic(finalTopicId, message));
+        console.log(`Chat ${chatId}: Message forwarded successfully to topic ${finalTopicId}`);
       } catch (error) {
-        console.error(`Error handling message from chatId ${chatId}:`, error);
+        console.error(`Chat ${chatId}: Error forwarding message to topic ${finalTopicId}: ${error.message}`);
         let errorMessage = error.message;
         if (errorMessage.includes('Request failed with status')) {
-          errorMessage = error.message; // 确保包含 Telegram API 的详细错误描述
+          errorMessage = error.message;
         }
         if (errorMessage.includes('429')) {
           await sendMessageToUser(chatId, `消息“${text}”转发失败：消息发送过于频繁，请稍后再试。`);
@@ -414,11 +435,9 @@ export default {
 
       const targetChatId = parts[1];
       try {
-        // 删除用户相关数据
         await env.D1.prepare('DELETE FROM users WHERE chat_id = ?').bind(targetChatId).run();
         await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(targetChatId).run();
         
-        // 清理缓存
         userStateCache.delete(`${targetChatId}:state`);
         topicIdCache.delete(targetChatId);
         userInfoCache.delete(targetChatId);
@@ -521,7 +540,6 @@ export default {
         .run();
       if (key === 'verification_enabled') {
         settingsCache.verification_enabled = value === 'true';
-        // 如果关闭验证码，重置所有用户的验证状态
         if (value === 'false') {
           await env.D1.prepare('UPDATE users SET is_verified = ?, verified_expiry = NULL, rate_limit_verified = ?').bind(false, false).run();
           userStateCache.forEach((userState, userStateKey) => {
@@ -626,7 +644,6 @@ export default {
             await handleVerification(chatId, messageId);
           }
 
-          // 删除验证码消息，忽略 400 错误
           try {
             await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
               method: 'POST',
@@ -693,11 +710,9 @@ export default {
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
             try {
-              // 删除用户相关数据
               await env.D1.prepare('DELETE FROM users WHERE chat_id = ?').bind(privateChatId).run();
               await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId).run();
               
-              // 清理缓存
               userStateCache.delete(`${privateChatId}:state`);
               topicIdCache.delete(privateChatId);
               userInfoCache.delete(privateChatId);
