@@ -227,7 +227,8 @@ export default {
 
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
-      if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
+      // 调整验证码触发逻辑：如果开启验证码，且（未验证或达到速率限制），则触发验证码
+      if (verificationEnabled && (!isVerified || isRateLimited)) {
         // 如果已有验证码且未过期，直接提示验证
         if (userState.verification_code && userState.code_expiry && nowSeconds < userState.code_expiry) {
           await sendMessageToUser(chatId, "请验证上方验证码后再发送信息。");
@@ -272,25 +273,28 @@ export default {
           throw new Error('Invalid topic ID');
         }
 
-        // 并行发送消息和耗时信息
+        // 发送消息
         const sendStart = Date.now();
         const formattedMessage = text ? `${nickname}:\n${text}` : null;
-        await Promise.all([
-          formattedMessage ? sendMessageToTopic(finalTopicId, formattedMessage) : copyMessageToTopic(finalTopicId, message),
-          (async () => {
-            const totalTime = Date.now() - messageStart;
-            const timingDetails = Object.entries(timings)
-              .map(([key, value]) => `${key}: ${value}ms`)
-              .join(', ');
-            const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
-            await sendMessageToTopic(finalTopicId, timingMessage);
-          })()
-        ]);
+        await (formattedMessage ? sendMessageToTopic(finalTopicId, formattedMessage) : copyMessageToTopic(finalTopicId, message));
         timings.send = Date.now() - sendStart;
+
+        // 发送耗时信息
+        const totalTime = Date.now() - messageStart;
+        const timingDetails = Object.entries(timings)
+          .map(([key, value]) => `${key}: ${value}ms`)
+          .join(', ');
+        const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
+        await sendMessageToTopic(finalTopicId, timingMessage);
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
-        await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
-        await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
+        if (error.message.includes('429')) {
+          await sendMessageToUser(chatId, "消息发送过于频繁，请稍后再试。");
+          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：Telegram API 速率限制 (429)`);
+        } else {
+          await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
+          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
+        }
       }
     }
 
@@ -423,6 +427,15 @@ export default {
         .run();
       if (key === 'verification_enabled') {
         settingsCache.verification_enabled = value === 'true';
+        // 如果关闭验证码，重置所有用户的验证状态
+        if (value === 'false') {
+          await env.D1.prepare('UPDATE users SET is_verified = ?, verified_expiry = NULL').bind(false).run();
+          userStateCache.forEach((userState, userStateKey) => {
+            userState.is_verified = false;
+            userState.verified_expiry = null;
+            userStateCache.set(userStateKey, userState);
+          });
+        }
       } else if (key === 'user_raw_enabled') {
         settingsCache.user_raw_enabled = value === 'true';
       }
@@ -787,7 +800,11 @@ export default {
         if (!data.ok) throw new Error(`Failed to forward message to private chat: ${data.description}`);
       } catch (error) {
         console.error(`Error forwarding message to private chat ${privateChatId}:`, error);
-        await sendMessageToTopic(null, `无法转发消息到用户 ${privateChatId}：${error.message}`);
+        if (error.message.includes('429')) {
+          throw new Error('Telegram API 速率限制 (429)');
+        } else {
+          throw error;
+        }
       }
     }
 
@@ -850,6 +867,11 @@ export default {
         if (!data.ok) throw new Error(`Failed to send message to user: ${data.description}`);
       } catch (error) {
         console.error(`Error sending message to user ${chatId}:`, error);
+        if (error.message.includes('429')) {
+          throw new Error('Telegram API 速率限制 (429)');
+        } else {
+          throw error;
+        }
       }
     }
 
@@ -872,18 +894,28 @@ export default {
     }
 
     async function fetchWithRetry(url, options) {
-      const maxRetries = 2;
+      const maxRetries = 3;
       let lastError;
 
       for (let i = 0; i <= maxRetries; i++) {
         try {
           const response = await fetch(url, options);
-          if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+          if (!response.ok) {
+            if (response.status === 429) {
+              // Telegram API 速率限制，等待更长时间
+              await new Promise(resolve => setTimeout(resolve, 5000 * (i + 1))); // 5 秒起步，指数退避
+              if (i === maxRetries) {
+                throw new Error('Request failed with status 429');
+              }
+              continue;
+            }
+            throw new Error(`Request failed with status ${response.status}`);
+          }
           return response;
         } catch (error) {
           lastError = error;
           if (i === maxRetries) break;
-          await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // 指数退避
+          await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // 普通错误，1 秒起步，指数退避
         }
       }
       throw lastError;
