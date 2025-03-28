@@ -227,8 +227,14 @@ export default {
 
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
-      // 调整验证码触发逻辑：如果开启验证码，且（未验证或达到速率限制），则触发验证码
-      if (verificationEnabled && (!isVerified || isRateLimited)) {
+      // 如果达到速率限制，直接提示用户
+      if (isRateLimited) {
+        await sendMessageToUser(chatId, "消息发送过于频繁，请稍后再试。");
+        return;
+      }
+
+      // 调整验证码触发逻辑：仅在未验证时触发验证码
+      if (verificationEnabled && !isVerified) {
         // 如果已有验证码且未过期，直接提示验证
         if (userState.verification_code && userState.code_expiry && nowSeconds < userState.code_expiry) {
           await sendMessageToUser(chatId, "请验证上方验证码后再发送信息。");
@@ -516,14 +522,23 @@ export default {
             await handleVerification(chatId, messageId);
           }
 
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: chatId,
-              message_id: messageId
-            })
-          });
+          // 删除验证码消息，忽略 400 错误
+          try {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId
+              })
+            });
+          } catch (error) {
+            if (error.message.includes('400')) {
+              console.warn(`Failed to delete verification message (likely already deleted): ${error.message}`);
+            } else {
+              throw error;
+            }
+          }
         } else {
           const senderId = callbackQuery.from.id.toString();
           const isAdmin = await checkIfAdmin(senderId);
@@ -597,7 +612,20 @@ export default {
         });
       } catch (error) {
         console.error(`Error processing callback query ${data}:`, error);
-        await sendMessageToTopic(topicId, `处理操作 ${action} 失败：${error.message}`);
+        // 记录 Telegram API 返回的详细错误信息
+        let errorMessage = error.message;
+        if (error.message.includes('Request failed with status')) {
+          try {
+            const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`);
+            const data = await response.json();
+            if (data.description) {
+              errorMessage += ` (Telegram API: ${data.description})`;
+            }
+          } catch (fetchError) {
+            console.error('Failed to fetch Telegram API error details:', fetchError);
+          }
+        }
+        await sendMessageToTopic(topicId, `处理操作 ${action} 失败：${errorMessage}`);
       }
     }
 
@@ -624,7 +652,11 @@ export default {
             })
           });
         } catch (error) {
-          console.error("Error deleting old verification message:", error);
+          if (error.message.includes('400')) {
+            console.warn(`Failed to delete old verification message (likely already deleted): ${error.message}`);
+          } else {
+            console.error("Error deleting old verification message:", error);
+          }
         }
         userState.last_verification_message_id = null;
         userStateCache.set(userStateKey, userState);
