@@ -110,7 +110,7 @@ export default {
       let userState = userStateCache.get(userStateKey);
       if (!userState) {
         const userData = await env.D1.prepare(
-          'SELECT is_blocked, is_first_verification, is_verified, verified_expiry, message_count, window_start, start_count, start_window_start, verification_code, code_expiry, last_verification_message_id FROM users WHERE chat_id = ?'
+          'SELECT is_blocked, is_first_verification, is_verified, verified_expiry, message_count, window_start, start_count, start_window_start, verification_code, code_expiry, last_verification_message_id, rate_limit_verified, rate_limit_window_start FROM users WHERE chat_id = ?'
         ).bind(chatId).first();
 
         userState = userData || {
@@ -124,7 +124,9 @@ export default {
           start_window_start: Date.now(),
           verification_code: null,
           code_expiry: null,
-          last_verification_message_id: null
+          last_verification_message_id: null,
+          rate_limit_verified: false,
+          rate_limit_window_start: Date.now()
         };
         userStateCache.set(userStateKey, userState);
       }
@@ -167,6 +169,7 @@ export default {
         const isFirstVerification = userState.is_first_verification;
 
         if (verificationEnabled && isFirstVerification) {
+          console.log(`Chat ${chatId}: Triggering first-time verification`);
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
           await handleVerification(chatId, messageId);
           await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
@@ -180,38 +183,43 @@ export default {
       const verificationEnabled = settingsCache.verification_enabled;
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+      const isFirstVerification = userState.is_first_verification;
 
       // 速率限制（每分钟限制）
       const now = Date.now();
       const window = 60 * 1000;
       let messageCount = userState.message_count || 0;
       let windowStart = userState.window_start || now;
+      let rateLimitVerified = userState.rate_limit_verified || false;
+      let rateLimitWindowStart = userState.rate_limit_window_start || now;
 
+      // 检查速率限制窗口是否重置
       if (now - windowStart > window) {
+        console.log(`Chat ${chatId}: Rate limit window reset, resetting rate_limit_verified`);
         messageCount = 1;
         windowStart = now;
+        // 速率限制窗口重置时，重置 rate_limit_verified
+        rateLimitVerified = false;
+        rateLimitWindowStart = now;
       } else {
         messageCount += 1;
       }
 
       userState.message_count = messageCount;
       userState.window_start = windowStart;
+      userState.rate_limit_verified = rateLimitVerified;
+      userState.rate_limit_window_start = rateLimitWindowStart;
       userStateCache.set(userStateKey, userState);
 
       await env.D1.prepare(
-        'INSERT INTO users (chat_id, message_count, window_start) VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET message_count = ?, window_start = ?'
-      ).bind(chatId, messageCount, windowStart, messageCount, windowStart).run();
+        'INSERT INTO users (chat_id, message_count, window_start, rate_limit_verified, rate_limit_window_start) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET message_count = ?, window_start = ?, rate_limit_verified = ?, rate_limit_window_start = ?'
+      ).bind(chatId, messageCount, windowStart, rateLimitVerified ? 1 : 0, rateLimitWindowStart, messageCount, windowStart, rateLimitVerified ? 1 : 0, rateLimitWindowStart).run();
 
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
-      // 如果达到速率限制，直接提示用户
-      if (isRateLimited) {
-        await sendMessageToUser(chatId, "消息发送过于频繁，请稍后再试。");
-        return;
-      }
-
-      // 调整验证码触发逻辑：仅在未验证时触发验证码
-      if (verificationEnabled && !isVerified) {
+      // 验证码触发逻辑：未通过初次验证或（达到速率限制且未通过速率限制验证）时触发验证码
+      if (verificationEnabled && (!isVerified || (isRateLimited && !rateLimitVerified))) {
+        console.log(`Chat ${chatId}: Triggering verification - isVerified: ${isVerified}, isRateLimited: ${isRateLimited}, rateLimitVerified: ${rateLimitVerified}`);
         // 如果已有验证码且未过期，直接提示验证
         if (userState.verification_code && userState.code_expiry && nowSeconds < userState.code_expiry) {
           await sendMessageToUser(chatId, "请验证上方验证码后再发送信息。");
@@ -381,10 +389,11 @@ export default {
         settingsCache.verification_enabled = value === 'true';
         // 如果关闭验证码，重置所有用户的验证状态
         if (value === 'false') {
-          await env.D1.prepare('UPDATE users SET is_verified = ?, verified_expiry = NULL').bind(false).run();
+          await env.D1.prepare('UPDATE users SET is_verified = ?, verified_expiry = NULL, rate_limit_verified = ?').bind(false, false).run();
           userStateCache.forEach((userState, userStateKey) => {
             userState.is_verified = false;
             userState.verified_expiry = null;
+            userState.rate_limit_verified = false;
             userStateCache.set(userStateKey, userState);
           });
         }
@@ -449,17 +458,34 @@ export default {
 
           if (result === 'correct') {
             const verifiedExpiry = nowSeconds + 3600 * 24;
-            userState.is_verified = true;
-            userState.verified_expiry = verifiedExpiry;
+            const isFirstVerification = userState.is_first_verification;
+
+            if (isFirstVerification) {
+              // 初次验证通过
+              console.log(`Chat ${chatId}: First-time verification passed`);
+              userState.is_verified = true;
+              userState.verified_expiry = verifiedExpiry;
+              userState.is_first_verification = false;
+            } else {
+              // 因频繁限制触发的验证通过
+              console.log(`Chat ${chatId}: Rate limit verification passed`);
+              userState.rate_limit_verified = true;
+            }
+
             userState.verification_code = null;
             userState.code_expiry = null;
             userState.last_verification_message_id = null;
-            userState.is_first_verification = false;
             userStateCache.set(userStateKey, userState);
 
             await env.D1.prepare(
-              'UPDATE users SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ? WHERE chat_id = ?'
-            ).bind(true, verifiedExpiry, false, chatId).run();
+              'UPDATE users SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, rate_limit_verified = ? WHERE chat_id = ?'
+            ).bind(
+              userState.is_verified ? 1 : 0,
+              userState.verified_expiry,
+              userState.is_first_verification ? 1 : 0,
+              userState.rate_limit_verified ? 1 : 0,
+              chatId
+            ).run();
 
             const successMessage = await getVerificationSuccessMessage();
             await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
@@ -932,7 +958,9 @@ export default {
             message_count: 'INTEGER DEFAULT 0',
             window_start: 'INTEGER',
             start_count: 'INTEGER DEFAULT 0',
-            start_window_start: 'INTEGER'
+            start_window_start: 'INTEGER',
+            rate_limit_verified: 'BOOLEAN DEFAULT FALSE',
+            rate_limit_window_start: 'INTEGER'
           }
         },
         chat_topic_mappings: {
@@ -960,6 +988,19 @@ export default {
             .join(', ');
           const createSQL = `CREATE TABLE ${tableName} (${columnsDef})`;
           await d1.exec(createSQL);
+        } else {
+          // 检查并添加新字段
+          const columns = Object.keys(structure.columns);
+          const existingColumns = await d1.prepare(
+            `PRAGMA table_info(${tableName})`
+          ).all().then(res => res.results.map(col => col.name));
+
+          for (const column of columns) {
+            if (!existingColumns.includes(column)) {
+              const def = structure.columns[column];
+              await d1.exec(`ALTER TABLE ${tableName} ADD COLUMN ${column} ${def.split(' ').slice(1).join(' ')}`);
+            }
+          }
         }
 
         if (tableName === 'chat_topic_mappings') {
