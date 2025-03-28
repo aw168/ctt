@@ -16,9 +16,6 @@ const settingsCache = {
   user_raw_enabled: null
 };
 
-// 本地速率限制（每用户每秒 1 条消息）
-const messageRateLimit = new Map();
-
 export default {
   async fetch(request, env) {
     const totalStart = Date.now();
@@ -50,7 +47,7 @@ export default {
       // 预加载话题映射
       const preloadStart = Date.now();
       const mappings = await env.D1.prepare('SELECT chat_id, topic_id FROM chat_topic_mappings').all();
-      mappings.results.forEach(({ chat_id, topic_id }) => topicIdCache.set(chat_id, topic_id.toString()));
+      mappings.results.forEach(({ chat_id, topic_id }) => topicIdCache.set(chat_id, topic_id));
       timings.preload = Date.now() - preloadStart;
 
       isInitialized = true;
@@ -97,16 +94,6 @@ export default {
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
-
-      // 本地速率限制（每用户每秒 1 条消息）
-      const now = Date.now();
-      const rateLimitKey = `${chatId}:msg`;
-      const lastMessageTime = messageRateLimit.get(rateLimitKey) || 0;
-      if (now - lastMessageTime < 1000) {
-        await sendMessageToUser(chatId, "消息发送过于频繁，请稍等 1 秒后再试。");
-        return;
-      }
-      messageRateLimit.set(rateLimitKey, now);
 
       // 处理群组消息
       if (chatId === GROUP_ID) {
@@ -215,7 +202,8 @@ export default {
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
       const isFirstVerification = userState.is_first_verification;
 
-      // 速率限制
+      // 速率限制（仅每分钟限制）
+      const now = Date.now();
       const window = 60 * 1000;
       let messageCount = userState.message_count || 0;
       let windowStart = userState.window_start || now;
@@ -240,6 +228,11 @@ export default {
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
+        // 检查是否已有未完成验证
+        if (userState.last_verification_message_id) {
+          await sendMessageToUser(chatId, "请验证上方验证码后再发送信息。");
+          return;
+        }
         await sendMessageToUser(chatId, "请完成验证后发送消息。");
         await handleVerification(chatId, messageId);
         return;
@@ -264,13 +257,18 @@ export default {
         if (!finalTopicId) {
           const createTopicStart = Date.now();
           finalTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-          topicIdCache.set(chatId, finalTopicId.toString());
+          topicIdCache.set(chatId, finalTopicId);
           const saveStart = Date.now();
           await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
             .bind(chatId, finalTopicId)
             .run();
           timings.saveTopic = Date.now() - saveStart;
           timings.createTopic = Date.now() - createTopicStart;
+        }
+
+        // 验证话题 ID 是否有效
+        if (!finalTopicId) {
+          throw new Error('Invalid topic ID');
         }
 
         // 并行发送消息和耗时信息
@@ -289,15 +287,9 @@ export default {
         ]);
         timings.send = Date.now() - sendStart;
       } catch (error) {
-        console.error(`Error handling message from chatId ${chatId}:`, error.message, error.stack);
-        let errorMessage = "消息转发失败，请稍后再试或联系管理员。";
-        if (error.message.includes('403')) {
-          errorMessage = "机器人无权限发送消息，请检查群组权限或重新添加机器人。";
-        } else if (error.message.includes('429')) {
-          errorMessage = "消息发送过于频繁，请稍后再试。";
-        }
+        console.error(`Error handling message from chatId ${chatId}:`, error);
         await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
-        await sendMessageToUser(chatId, errorMessage);
+        await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
       }
     }
 
@@ -385,12 +377,8 @@ export default {
         const timingMessage = `耗时: 总计 ${totalTime}ms (${timingDetails})`;
         await sendMessageToTopic(topicId, timingMessage);
       } catch (error) {
-        console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error.message, error.stack);
-        let errorMessage = `发送管理员面板失败：${error.message}`;
-        if (error.message.includes('403')) {
-          errorMessage = "机器人无权限发送消息，请检查群组权限或重新添加机器人。";
-        }
-        await sendMessageToTopic(topicId, errorMessage);
+        console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
+        await sendMessageToTopic(topicId, `发送管理员面板失败：${error.message}`);
       }
     }
 
@@ -594,7 +582,7 @@ export default {
           })
         });
       } catch (error) {
-        console.error(`Error processing callback query ${data}:`, error.message, error.stack);
+        console.error(`Error processing callback query ${data}:`, error);
         await sendMessageToTopic(topicId, `处理操作 ${action} 失败：${error.message}`);
       }
     }
@@ -683,11 +671,9 @@ export default {
           await env.D1.prepare('UPDATE users SET last_verification_message_id = ? WHERE chat_id = ?')
             .bind(data.result.message_id.toString(), chatId)
             .run();
-        } else {
-          console.error(`Failed to send verification message: ${JSON.stringify(data)}`);
         }
       } catch (error) {
-        console.error("Error sending verification message:", error.message, error.stack);
+        console.error("Error sending verification message:", error);
       }
     }
 
@@ -706,16 +692,12 @@ export default {
           })
         });
         const data = await response.json();
-        if (!data.ok) {
-          console.error(`Failed to check admin status for user ${userId}: ${JSON.stringify(data)}`);
-          return false;
-        }
-        const isAdmin = data.result.status === 'administrator' || data.result.status === 'creator';
+        const isAdmin = data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
         adminCache.set(userId, isAdmin);
         setTimeout(() => adminCache.delete(userId), 60 * 60 * 1000); // 缓存 1 小时
         return isAdmin;
       } catch (error) {
-        console.error(`Error checking admin status for user ${userId}:`, error.message, error.stack);
+        console.error(`Error checking admin status for user ${userId}:`, error);
         return false;
       }
     }
@@ -746,11 +728,9 @@ export default {
           userInfo.id = result.id || chatId;
           userInfo.username = result.username || `User_${chatId}`;
           userInfo.nickname = nickname;
-        } else {
-          console.error(`Failed to get user info for chatId ${chatId}: ${JSON.stringify(data)}`);
         }
       } catch (error) {
-        console.error(`Error fetching user info for chatId ${chatId}:`, error.message, error.stack);
+        console.error(`Error fetching user info for chatId ${chatId}:`, error);
       }
 
       userInfoCache.set(chatId, userInfo);
@@ -766,37 +746,28 @@ export default {
         .bind(chatId)
         .first();
       const topicId = mapping?.topic_id || null;
-      if (topicId) {
-        topicIdCache.set(chatId, topicId.toString());
-      } else {
-        console.warn(`No topic ID found for chatId ${chatId}`);
-      }
+      if (topicId) topicIdCache.set(chatId, topicId);
       return topicId;
     }
 
     async function createForumTopic(topicName, userName, nickname, userId) {
-      try {
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: GROUP_ID, name: topicName })
-        });
-        const data = await response.json();
-        if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
-        const topicId = data.result.message_thread_id;
+      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: GROUP_ID, name: topicName })
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
+      const topicId = data.result.message_thread_id;
 
-        const now = new Date();
-        const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
-        const notificationContent = await getNotificationContent();
-        const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
-        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
-        await pinMessage(topicId, messageResponse.result.message_id);
+      const now = new Date();
+      const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
+      const notificationContent = await getNotificationContent();
+      const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+      const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
+      await pinMessage(topicId, messageResponse.result.message_id);
 
-        return topicId;
-      } catch (error) {
-        console.error(`Error creating forum topic for user ${userId}:`, error.message, error.stack);
-        throw error;
-      }
+      return topicId;
     }
 
     async function forwardMessageToPrivateChat(privateChatId, message) {
@@ -814,76 +785,54 @@ export default {
         const data = await response.json();
         if (!data.ok) throw new Error(`Failed to forward message to private chat: ${data.description}`);
       } catch (error) {
-        console.error(`Error forwarding message to private chat ${privateChatId}:`, error.message, error.stack);
-        let errorMessage = `无法转发消息到用户 ${privateChatId}：${error.message}`;
-        if (error.message.includes('403')) {
-          errorMessage = `无法转发消息到用户 ${privateChatId}：机器人无权限，可能已被用户拉黑。`;
-        } else if (error.message.includes('429')) {
-          errorMessage = `无法转发消息到用户 ${privateChatId}：消息发送过于频繁，请稍后再试。`;
-        }
-        await sendMessageToTopic(null, errorMessage);
-        throw error;
+        console.error(`Error forwarding message to private chat ${privateChatId}:`, error);
+        await sendMessageToTopic(null, `无法转发消息到用户 ${privateChatId}：${error.message}`);
       }
     }
 
     async function sendMessageToTopic(topicId, text) {
-      try {
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            text: text,
-            message_thread_id: topicId
-          })
-        });
-        const data = await response.json();
-        if (!data.ok) throw new Error(`Failed to send message to topic: ${data.description}`);
-        return data;
-      } catch (error) {
-        console.error(`Error sending message to topic ${topicId}:`, error.message, error.stack);
-        throw error;
-      }
+      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: GROUP_ID,
+          text: text,
+          message_thread_id: topicId
+        })
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(`Failed to send message to topic: ${data.description}`);
+      return data;
     }
 
     async function copyMessageToTopic(topicId, message) {
-      try {
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            from_chat_id: message.chat.id,
-            message_id: message.message_id,
-            message_thread_id: topicId,
-            disable_notification: true
-          })
-        });
-        const data = await response.json();
-        if (!data.ok) throw new Error(`Failed to copy message to topic: ${data.description}`);
-      } catch (error) {
-        console.error(`Error copying message to topic ${topicId}:`, error.message, error.stack);
-        throw error;
-      }
+      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: GROUP_ID,
+          from_chat_id: message.chat.id,
+          message_id: message.message_id,
+          message_thread_id: topicId,
+          disable_notification: true
+        })
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(`Failed to copy message to topic: ${data.description}`);
     }
 
     async function pinMessage(topicId, messageId) {
-      try {
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_id: messageId,
-            message_thread_id: topicId
-          })
-        });
-        const data = await response.json();
-        if (!data.ok) throw new Error(`Failed to pin message: ${data.description}`);
-      } catch (error) {
-        console.error(`Error pinning message ${messageId} in topic ${topicId}:`, error.message, error.stack);
-        throw error;
-      }
+      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: GROUP_ID,
+          message_id: messageId,
+          message_thread_id: topicId
+        })
+      });
+      const data = await response.json();
+      if (!data.ok) throw new Error(`Failed to pin message: ${data.description}`);
     }
 
     async function sendMessageToUser(chatId, text) {
@@ -899,7 +848,7 @@ export default {
         const data = await response.json();
         if (!data.ok) throw new Error(`Failed to send message to user: ${data.description}`);
       } catch (error) {
-        console.error(`Error sending message to user ${chatId}:`, error.message, error.stack);
+        console.error(`Error sending message to user ${chatId}:`, error);
       }
     }
 
@@ -917,35 +866,22 @@ export default {
       const chatId = mapping?.chat_id || null;
       if (chatId) {
         topicIdCache.set(chatId, topicId.toString());
-      } else {
-        console.warn(`No chat ID found for topicId ${topicId}`);
       }
       return chatId;
     }
 
-    async function fetchWithRetry(url, options, retries = 1, backoff = 500) {
-      for (let i = 0; i <= retries; i++) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 1000);
-        try {
-          const response = await fetch(url, { ...options, signal: controller.signal });
-          clearTimeout(timeoutId);
-          if (!response.ok) {
-            const data = await response.json().catch(() => ({}));
-            const errorMessage = data.description || `Request failed with status ${response.status}`;
-            throw new Error(errorMessage);
-          }
-          return response;
-        } catch (error) {
-          clearTimeout(timeoutId);
-          if (i === retries) {
-            throw error;
-          }
-          console.warn(`Retrying request to ${url} (attempt ${i + 1}/${retries}): ${error.message}`);
-          await new Promise(resolve => setTimeout(resolve, backoff));
-        }
+    async function fetchWithRetry(url, options) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 1000);
+      try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+        return response;
+      } catch (error) {
+        clearTimeout(timeoutId);
+        throw error;
       }
-      throw new Error(`Failed to fetch ${url} after ${retries + 1} attempts`);
     }
 
     async function registerWebhook(request) {
@@ -1068,7 +1004,7 @@ export default {
       console.log(`Request timings: ${JSON.stringify(timings)}`);
       return response;
     } catch (error) {
-      console.error('Unhandled error in fetch handler:', error.message, error.stack);
+      console.error('Unhandled error in fetch handler:', error);
       return new Response('Internal Server Error', { status: 500 });
     }
   }
