@@ -158,7 +158,7 @@ export default {
               last_verification_message_id: 'TEXT',
               is_first_verification: 'BOOLEAN DEFAULT TRUE',
               is_rate_limited: 'BOOLEAN DEFAULT FALSE',
-              is_verifying: 'BOOLEAN DEFAULT FALSE' // 新增 is_verifying 字段
+              is_verifying: 'BOOLEAN DEFAULT FALSE'
             }
           },
           message_rates: {
@@ -391,11 +391,35 @@ export default {
           await saveTopicId(chatId, topicId);
         }
 
-        if (text) {
-          const formattedMessage = `${nickname}:\n------------------------------------------------\n\n${text}`;
-          await sendMessageToTopic(topicId, formattedMessage);
-        } else {
-          await copyMessageToTopic(topicId, message);
+        try {
+          if (text) {
+            const formattedMessage = `${nickname}:\n------------------------------------------------\n\n${text}`;
+            await sendMessageToTopic(topicId, formattedMessage);
+          } else {
+            await copyMessageToTopic(topicId, message);
+          }
+        } catch (error) {
+          if (error.message.includes('Request failed with status 400')) {
+            // 检查话题是否存在
+            const existingTopicId = await getExistingTopicId(chatId);
+            if (!existingTopicId) {
+              // 如果话题不存在，创建一个新话题并重新转发
+              topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+              setCacheWithExpiry(topicIdCache, chatId, topicId);
+              await saveTopicId(chatId, topicId);
+
+              if (text) {
+                const formattedMessage = `${nickname}:\n------------------------------------------------\n\n${text}`;
+                await sendMessageToTopic(topicId, formattedMessage);
+              } else {
+                await copyMessageToTopic(topicId, message);
+              }
+            } else {
+              throw error; // 如果话题存在但仍失败，抛出错误
+            }
+          } else {
+            throw error; // 其他错误直接抛出
+          }
         }
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
@@ -662,12 +686,10 @@ export default {
             verificationState.is_verifying = false;
             setCacheWithExpiry(userStateCache, chatId, verificationState);
 
-            // 数据库写入完成后再发送欢迎消息
             await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
               .bind(true, verifiedExpiry, false, false, chatId)
               .run();
 
-            // 重置 message_count
             let rateData = messageRateCache.get(chatId);
             if (rateData) {
               rateData.message_count = 0;
