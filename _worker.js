@@ -380,12 +380,19 @@ export default {
       const isFirstVerification = userState.is_first_verification;
       const isRateLimited = await checkMessageRate(chatId);
 
+      // 从数据库重新获取最新状态，确保一致性
+      const latestState = await env.D1.prepare('SELECT is_verifying FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      const isVerifying = latestState?.is_verifying || false;
+
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
-        if (userState.is_verifying) {
+        if (isVerifying) {
           await sendMessageToUser(chatId, "您正在验证中，请完成当前验证。");
           return;
         }
-        await sendMessageToUser(chatId, "请完成验证后发送消息。");
+        const userInfo = await getUserInfo(chatId);
+        await sendMessageToUser(chatId, `请完成验证后发送消息“${userInfo.nickname || userInfo.username || '用户'}${userInfo.id || chatId}的具体信息”。`);
         await handleVerification(chatId, messageId);
         return;
       }
@@ -408,7 +415,7 @@ export default {
 
         try {
           if (text) {
-            const formattedMessage = `${nickname}:\n${text}`; // 修改格式
+            const formattedMessage = `${nickname}:\n${text}`;
             await sendMessageToTopic(topicId, formattedMessage);
           } else {
             await copyMessageToTopic(topicId, message);
@@ -420,7 +427,7 @@ export default {
             await saveTopicId(chatId, topicId);
 
             if (text) {
-              const formattedMessage = `${nickname}:\n${text}`; // 修改格式
+              const formattedMessage = `${nickname}:\n${text}`;
               await sendMessageToTopic(topicId, formattedMessage);
             } else {
               await copyMessageToTopic(topicId, message);
@@ -685,18 +692,23 @@ export default {
 
           if (result === 'correct') {
             const verifiedExpiry = nowSeconds + 3600 * 24;
-            verificationState.is_verified = true;
-            verificationState.verified_expiry = verifiedExpiry;
-            verificationState.verification_code = null;
-            verificationState.code_expiry = null;
-            verificationState.last_verification_message_id = null;
-            verificationState.is_first_verification = false;
-            verificationState.is_verifying = false;
-            userStateCache.set(chatId, verificationState);
-
+            // 更新数据库状态
             await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
               .bind(true, verifiedExpiry, false, false, chatId)
               .run();
+
+            // 更新缓存状态
+            verificationState = {
+              ...verificationState,
+              is_verified: true,
+              verified_expiry: verifiedExpiry,
+              verification_code: null,
+              code_expiry: null,
+              last_verification_message_id: null,
+              is_first_verification: false,
+              is_verifying: false
+            };
+            userStateCache.set(chatId, verificationState);
 
             let rateData = messageRateCache.get(chatId);
             if (rateData) {
