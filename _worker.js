@@ -12,17 +12,33 @@ const settingsCache = new Map([
   ['user_raw_enabled', null]
 ]);
 
-const userInfoCache = new Map();
-const topicIdCache = new Map();
-const userStateCache = new Map();
-const messageRateCache = new Map();
-
-const CACHE_EXPIRY = 60 * 60 * 1000; // 1 小时过期
-
-function setCacheWithExpiry(cache, key, value) {
-  cache.set(key, value);
-  setTimeout(() => cache.delete(key), CACHE_EXPIRY);
+// LRU 缓存实现
+class LRUCache {
+  constructor(maxSize) {
+    this.maxSize = maxSize;
+    this.cache = new Map();
+  }
+  get(key) {
+    const value = this.cache.get(key);
+    if (value !== undefined) {
+      this.cache.delete(key);
+      this.cache.set(key, value);
+    }
+    return value;
+  }
+  set(key, value) {
+    if (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
+    this.cache.set(key, value);
+  }
 }
+
+const userInfoCache = new LRUCache(1000); // 最大 1000 条
+const topicIdCache = new LRUCache(1000);
+const userStateCache = new LRUCache(1000);
+const messageRateCache = new LRUCache(1000);
 
 export default {
   async fetch(request, env) {
@@ -321,7 +337,7 @@ export default {
       }
 
       let userState = userStateCache.get(chatId);
-      if (!userState) {
+      if (userState === undefined) {
         userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
@@ -331,7 +347,7 @@ export default {
             .run();
           userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
         }
-        setCacheWithExpiry(userStateCache, chatId, userState);
+        userStateCache.set(chatId, userState);
       }
 
       const isBlocked = userState.is_blocked || false;
@@ -378,41 +394,40 @@ export default {
       try {
         const [userInfo] = await Promise.all([
           getUserInfo(chatId),
-          getExistingTopicId(chatId).then(topicId => topicId ? setCacheWithExpiry(topicIdCache, chatId, topicId) : null)
+          getExistingTopicId(chatId).then(topicId => topicId ? topicIdCache.set(chatId, topicId) : null)
         ]);
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
         let topicId = topicIdCache.get(chatId);
-        if (!topicId) {
+        if (topicId === undefined) {
           topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-          setCacheWithExpiry(topicIdCache, chatId, topicId);
+          topicIdCache.set(chatId, topicId);
           await saveTopicId(chatId, topicId);
         }
 
         try {
           if (text) {
-            const formattedMessage = `${nickname}:\n------------------------------------------------\n\n${text}`;
+            const formattedMessage = `${nickname} @${userName}:\n${text}`; // 修改转发消息样式
             await sendMessageToTopic(topicId, formattedMessage);
           } else {
             await copyMessageToTopic(topicId, message);
           }
         } catch (error) {
           if (error.message.includes('Request failed with status 400')) {
-            // 直接重建新话题并重新转发
             topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-            setCacheWithExpiry(topicIdCache, chatId, topicId);
+            topicIdCache.set(chatId, topicId);
             await saveTopicId(chatId, topicId);
 
             if (text) {
-              const formattedMessage = `${nickname}:\n------------------------------------------------\n\n${text}`;
+              const formattedMessage = `${nickname} @${userName}:\n${text}`; // 修改转发消息样式
               await sendMessageToTopic(topicId, formattedMessage);
             } else {
               await copyMessageToTopic(topicId, message);
             }
           } else {
-            throw error; // 其他错误直接抛出
+            throw error;
           }
         }
       } catch (error) {
@@ -442,8 +457,8 @@ export default {
           env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId),
           env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId)
         ]);
-        userStateCache.delete(targetChatId);
-        messageRateCache.delete(targetChatId);
+        userStateCache.set(targetChatId, undefined);
+        messageRateCache.set(targetChatId, undefined);
         await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
       } catch (error) {
         console.error(`Error resetting user ${targetChatId}:`, error);
@@ -533,11 +548,11 @@ export default {
       const maxStartsPerWindow = 1;
 
       let data = messageRateCache.get(chatId);
-      if (!data) {
+      if (data === undefined) {
         data = await env.D1.prepare('SELECT start_count, start_window_start FROM message_rates WHERE chat_id = ?')
           .bind(chatId)
           .first() || { start_count: 0, start_window_start: now };
-        setCacheWithExpiry(messageRateCache, chatId, data);
+        messageRateCache.set(chatId, data);
       }
 
       if (now - data.start_window_start > window) {
@@ -547,7 +562,7 @@ export default {
         data.start_count += 1;
       }
 
-      setCacheWithExpiry(messageRateCache, chatId, data);
+      messageRateCache.set(chatId, data);
       await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
         .bind(chatId, data.start_count, data.start_window_start)
         .run();
@@ -560,11 +575,11 @@ export default {
       const window = 60 * 1000;
 
       let data = messageRateCache.get(chatId);
-      if (!data) {
+      if (data === undefined) {
         data = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
           .bind(chatId)
           .first() || { message_count: 0, window_start: now };
-        setCacheWithExpiry(messageRateCache, chatId, data);
+        messageRateCache.set(chatId, data);
       }
 
       if (now - data.window_start > window) {
@@ -574,7 +589,7 @@ export default {
         data.message_count += 1;
       }
 
-      setCacheWithExpiry(messageRateCache, chatId, data);
+      messageRateCache.set(chatId, data);
       await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
         .bind(chatId, data.message_count, data.window_start)
         .run();
@@ -654,11 +669,11 @@ export default {
           }
 
           let verificationState = userStateCache.get(chatId);
-          if (!verificationState) {
+          if (verificationState === undefined) {
             verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
               .bind(chatId)
               .first();
-            setCacheWithExpiry(userStateCache, chatId, verificationState);
+            userStateCache.set(chatId, verificationState);
           }
           const storedCode = verificationState?.verification_code;
           const codeExpiry = verificationState?.code_expiry;
@@ -678,7 +693,7 @@ export default {
             verificationState.last_verification_message_id = null;
             verificationState.is_first_verification = false;
             verificationState.is_verifying = false;
-            setCacheWithExpiry(userStateCache, chatId, verificationState);
+            userStateCache.set(chatId, verificationState);
 
             await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
               .bind(true, verifiedExpiry, false, false, chatId)
@@ -687,7 +702,7 @@ export default {
             let rateData = messageRateCache.get(chatId);
             if (rateData) {
               rateData.message_count = 0;
-              setCacheWithExpiry(messageRateCache, chatId, rateData);
+              messageRateCache.set(chatId, rateData);
             }
             await env.D1.prepare('UPDATE message_rates SET message_count = 0 WHERE chat_id = ?')
               .bind(chatId)
@@ -718,18 +733,26 @@ export default {
           }
 
           if (action === 'block') {
-            let state = userStateCache.get(privateChatId) || {};
-            state.is_blocked = true;
-            setCacheWithExpiry(userStateCache, privateChatId, state);
+            let state = userStateCache.get(privateChatId);
+            if (state === undefined) {
+              state = { is_blocked: true };
+            } else {
+              state.is_blocked = true;
+            }
+            userStateCache.set(privateChatId, state);
             await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
               .bind(privateChatId, true)
               .run();
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
           } else if (action === 'unblock') {
-            let state = userStateCache.get(privateChatId) || {};
-            state.is_blocked = false;
-            state.is_first_verification = true;
-            setCacheWithExpiry(userStateCache, privateChatId, state);
+            let state = userStateCache.get(privateChatId);
+            if (state === undefined) {
+              state = { is_blocked: false, is_first_verification: true };
+            } else {
+              state.is_blocked = false;
+              state.is_first_verification = true;
+            }
+            userStateCache.set(privateChatId, state);
             await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
               .bind(privateChatId, false, true)
               .run();
@@ -756,8 +779,8 @@ export default {
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
             try {
-              userStateCache.delete(privateChatId);
-              messageRateCache.delete(privateChatId);
+              userStateCache.set(privateChatId, undefined);
+              messageRateCache.set(privateChatId, undefined);
               await env.D1.batch([
                 env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
                 env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId)
@@ -788,7 +811,17 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
-      let userState = userStateCache.get(chatId) || {};
+      let userState = userStateCache.get(chatId);
+      if (userState === undefined) {
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        if (!userState) {
+          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+        }
+        userStateCache.set(chatId, userState);
+      }
+
       if (userState.is_verifying) {
         await sendMessageToUser(chatId, "您正在验证中，请完成当前验证。");
         return;
@@ -797,7 +830,7 @@ export default {
       userState.verification_code = null;
       userState.code_expiry = null;
       userState.is_verifying = true;
-      setCacheWithExpiry(userStateCache, chatId, userState);
+      userStateCache.set(chatId, userState);
       await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = ? WHERE chat_id = ?')
         .bind(true, chatId)
         .run();
@@ -820,7 +853,7 @@ export default {
           console.error("Error deleting old verification message:", error);
         }
         userState.last_verification_message_id = null;
-        setCacheWithExpiry(userStateCache, chatId, userState);
+        userStateCache.set(chatId, userState);
         await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
           .bind(chatId)
           .run();
@@ -851,12 +884,16 @@ export default {
       const nowSeconds = Math.floor(Date.now() / 1000);
       const codeExpiry = nowSeconds + 300;
 
-      let userState = userStateCache.get(chatId) || {};
-      userState.verification_code = correctResult.toString();
-      userState.code_expiry = codeExpiry;
-      userState.last_verification_message_id = null;
-      userState.is_verifying = true;
-      setCacheWithExpiry(userStateCache, chatId, userState);
+      let userState = userStateCache.get(chatId);
+      if (userState === undefined) {
+        userState = { verification_code: correctResult.toString(), code_expiry: codeExpiry, last_verification_message_id: null, is_verifying: true };
+      } else {
+        userState.verification_code = correctResult.toString();
+        userState.code_expiry = codeExpiry;
+        userState.last_verification_message_id = null;
+        userState.is_verifying = true;
+      }
+      userStateCache.set(chatId, userState);
 
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -871,7 +908,7 @@ export default {
         const data = await response.json();
         if (data.ok) {
           userState.last_verification_message_id = data.result.message_id.toString();
-          setCacheWithExpiry(userStateCache, chatId, userState);
+          userStateCache.set(chatId, userState);
           await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
             .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
             .run();
@@ -900,53 +937,54 @@ export default {
     }
 
     async function getUserInfo(chatId) {
-      if (userInfoCache.has(chatId)) return userInfoCache.get(chatId);
-
-      try {
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId })
-        });
-        const data = await response.json();
-        if (!data.ok) {
-          const userInfo = {
+      let userInfo = userInfoCache.get(chatId);
+      if (userInfo === undefined) {
+        try {
+          const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId })
+          });
+          const data = await response.json();
+          if (!data.ok) {
+            userInfo = {
+              id: chatId,
+              username: `User_${chatId}`,
+              nickname: `User_${chatId}`
+            };
+          } else {
+            const result = data.result;
+            const nickname = result.first_name
+              ? `${result.first_name}${result.last_name ? ` ${result.last_name}` : ''}`.trim()
+              : result.username || `User_${chatId}`;
+            userInfo = {
+              id: result.id || chatId,
+              username: result.username || `User_${chatId}`,
+              nickname: nickname
+            };
+          }
+          userInfoCache.set(chatId, userInfo);
+        } catch (error) {
+          console.error(`Error fetching user info for chatId ${chatId}:`, error);
+          userInfo = {
             id: chatId,
             username: `User_${chatId}`,
             nickname: `User_${chatId}`
           };
-          setCacheWithExpiry(userInfoCache, chatId, userInfo);
-          return userInfo;
+          userInfoCache.set(chatId, userInfo);
         }
-        const result = data.result;
-        const nickname = result.first_name
-          ? `${result.first_name}${result.last_name ? ` ${result.last_name}` : ''}`.trim()
-          : result.username || `User_${chatId}`;
-        const userInfo = {
-          id: result.id || chatId,
-          username: result.username || `User_${chatId}`,
-          nickname: nickname
-        };
-        setCacheWithExpiry(userInfoCache, chatId, userInfo);
-        return userInfo;
-      } catch (error) {
-        console.error(`Error fetching user info for chatId ${chatId}:`, error);
-        const userInfo = {
-          id: chatId,
-          username: `User_${chatId}`,
-          nickname: `User_${chatId}`
-        };
-        setCacheWithExpiry(userInfoCache, chatId, userInfo);
-        return userInfo;
       }
+      return userInfo;
     }
 
     async function getExistingTopicId(chatId) {
-      if (topicIdCache.has(chatId)) return topicIdCache.get(chatId);
-      const topicId = (await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-        .bind(chatId)
-        .first())?.topic_id || null;
-      if (topicId) setCacheWithExpiry(topicIdCache, chatId, topicId);
+      let topicId = topicIdCache.get(chatId);
+      if (topicId === undefined) {
+        topicId = (await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
+          .bind(chatId)
+          .first())?.topic_id || null;
+        if (topicId) topicIdCache.set(chatId, topicId);
+      }
       return topicId;
     }
 
@@ -977,7 +1015,7 @@ export default {
     }
 
     async function saveTopicId(chatId, topicId) {
-      setCacheWithExpiry(topicIdCache, chatId, topicId);
+      topicIdCache.set(chatId, topicId);
       try {
         await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
           .bind(chatId, topicId)
@@ -989,7 +1027,7 @@ export default {
     }
 
     async function getPrivateChatId(topicId) {
-      for (const [chatId, tid] of topicIdCache) if (tid === topicId) return chatId;
+      for (const [chatId, tid] of topicIdCache.cache) if (tid === topicId) return chatId;
       try {
         const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
           .bind(topicId)
