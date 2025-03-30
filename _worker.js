@@ -12,7 +12,6 @@ const settingsCache = new Map([
   ['user_raw_enabled', null]
 ]);
 
-// LRU 缓存实现
 class LRUCache {
   constructor(maxSize) {
     this.maxSize = maxSize;
@@ -409,7 +408,7 @@ export default {
 
         try {
           if (text) {
-            const formattedMessage = `${nickname} @${userName}:\n${text}`; // 修改转发消息样式
+            const formattedMessage = `${nickname}:\n${text}`; // 修改格式
             await sendMessageToTopic(topicId, formattedMessage);
           } else {
             await copyMessageToTopic(topicId, message);
@@ -421,7 +420,7 @@ export default {
             await saveTopicId(chatId, topicId);
 
             if (text) {
-              const formattedMessage = `${nickname} @${userName}:\n${text}`; // 修改转发消息样式
+              const formattedMessage = `${nickname}:\n${text}`; // 修改格式
               await sendMessageToTopic(topicId, formattedMessage);
             } else {
               await copyMessageToTopic(topicId, message);
