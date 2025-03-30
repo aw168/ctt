@@ -273,31 +273,6 @@ export default {
         if (error.message.includes('429')) {
           await sendMessageToUser(chatId, `消息“${text}”转发失败：消息发送过于频繁，请稍后再试。`);
           await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：Telegram API 速率限制 (429)`);
-        } else if (error.message.includes('400')) {
-          // 检测分论坛是否存在，如果不存在则新建
-          const currentTopicId = await getTopicId(chatId);
-          if (!currentTopicId) {
-            const userInfo = await getUserInfo(chatId);
-            const userName = userInfo.username || `User_${chatId}`;
-            const nickname = userInfo.nickname || userName;
-            const newTopicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
-            if (newTopicId) {
-              topicIdCache.set(chatId, newTopicId);
-              await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-                .bind(chatId, newTopicId)
-                .run();
-              await sendMessageToUser(chatId, `分论坛已自动创建并重试发送消息“${text}”。`);
-              // 重新尝试发送消息
-              const formattedMessage = text ? `${nickname}:\n${text}` : null;
-              await (formattedMessage ? sendMessageToTopic(newTopicId, formattedMessage) : copyMessageToTopic(newTopicId, message));
-              return;
-            } else {
-              await sendMessageToUser(chatId, `创建分论坛失败，请稍后再试或联系管理员。`);
-            }
-          } else {
-            await sendMessageToUser(chatId, `消息“${text}”转发失败：请求失败，请稍后再试或联系管理员。`);
-          }
-          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
         } else {
           await sendMessageToUser(chatId, `消息“${text}”转发失败：${error.message}，请稍后再试或联系管理员。`);
           await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
