@@ -33,18 +33,15 @@ export default {
         return new Response('Server configuration error', { status: 500 });
       }
 
-      // Initialize database tables
       const dbInitStart = Date.now();
       await checkAndRepairTables(env.D1);
       timings.dbInit = Date.now() - dbInitStart;
 
-      // Preload settings
       const settingsLoadStart = Date.now();
       settingsCache.verification_enabled = (await getSetting('verification_enabled', env.D1)) === 'true';
       settingsCache.user_raw_enabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
       timings.settingsLoad = Date.now() - settingsLoadStart;
 
-      // Preload topic mappings
       const preloadStart = Date.now();
       const mappings = await env.D1.prepare('SELECT chat_id, topic_id FROM chat_topic_mappings').all();
       mappings.results.forEach(({ chat_id, topic_id }) => topicIdCache.set(chat_id, topic_id));
@@ -94,6 +91,7 @@ export default {
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
+      const senderId = message.from.id.toString();
 
       // Handle group messages
       if (chatId === GROUP_ID) {
@@ -102,15 +100,29 @@ export default {
           const privateChatId = await getPrivateChatId(topicId);
           if (privateChatId) {
             if (text === '/admin') {
+              const isAdmin = await checkIfAdmin(senderId);
+              if (!isAdmin) {
+                await sendMessageToTopic(topicId, '只有管理员可以使用 /admin 命令。');
+                return;
+              }
               await sendAdminPanel(chatId, topicId, privateChatId, messageId);
               return;
             }
             if (text.startsWith('/reset_user')) {
-              await handleResetUser(chatId, topicId, text);
+              await handleResetUser(chatId, topicId, text, senderId);
               return;
             }
-            // Forward group message to private chat
-            await forwardMessageToPrivateChat(privateChatId, message);
+            // Forward group message to private chat with retry logic
+            try {
+              await forwardMessageToPrivateChat(privateChatId, message);
+            } catch (error) {
+              console.error(`Failed to forward message from group to private chat ${privateChatId}:`, error);
+              if (error.message.includes('429')) {
+                await sendMessageToTopic(topicId, `无法转发消息到用户 ${privateChatId}：Telegram API 速率限制 (429)，请稍后重试。`);
+              } else {
+                await sendMessageToTopic(topicId, `无法转发消息到用户 ${privateChatId}：${error.message}`);
+              }
+            }
           } else {
             console.error(`No private chat ID found for topicId ${topicId}`);
             await sendMessageToTopic(topicId, `无法找到对应的私聊用户，topicId: ${topicId}`);
@@ -190,7 +202,6 @@ export default {
         if (verificationEnabled && isFirstVerification) {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
           await handleVerification(chatId, messageId);
-          // Add prompt
           await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
         } else {
           const successMessage = await getVerificationSuccessMessage();
@@ -202,9 +213,7 @@ export default {
       const verificationEnabled = settingsCache.verification_enabled;
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
-      const isFirstVerification = userState.is_first_verification;
 
-      // Rate limiting (per minute limit)
       const now = Date.now();
       const window = 60 * 1000;
       let messageCount = userState.message_count || 0;
@@ -229,14 +238,11 @@ export default {
 
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
-      // Verification trigger logic: trigger verification when not verified or rate limited
       if (verificationEnabled && (!isVerified || isRateLimited)) {
-        // If there is an existing verification code and it's not expired, prompt for verification
         if (userState.verification_code && userState.code_expiry && nowSeconds < userState.code_expiry) {
           await sendMessageToUser(chatId, "请验证上方验证码后再发送信息。");
           await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
         } else {
-          // Otherwise generate a new verification code
           await sendMessageToUser(chatId, "请完成验证后发送消息。");
           await handleVerification(chatId, messageId);
           await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
@@ -245,7 +251,6 @@ export default {
       }
 
       try {
-        // Parallel fetch user info and topic ID
         const userInfoStart = Date.now();
         const topicIdStart = Date.now();
         const [userInfo, topicId] = await Promise.all([
@@ -272,18 +277,15 @@ export default {
           timings.createTopic = Date.now() - createTopicStart;
         }
 
-        // Verify topic ID is valid
         if (!finalTopicId) {
           throw new Error('Invalid topic ID');
         }
 
-        // Send message
         const sendStart = Date.now();
         const formattedMessage = text ? `${nickname}:\n${text}` : null;
         await (formattedMessage ? sendMessageToTopic(finalTopicId, formattedMessage) : copyMessageToTopic(finalTopicId, message));
         timings.send = Date.now() - sendStart;
 
-        // Send timing information
         const totalTime = Date.now() - messageStart;
         const timingDetails = Object.entries(timings)
           .map(([key, value]) => `${key}: ${value}ms`)
@@ -293,7 +295,6 @@ export default {
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
         if (error.message.includes('话题无效') || error.message.includes('400')) {
-          // Handle invalid topic by creating a new one and retrying
           const privateChatId = chatId;
           const userInfo = await getUserInfo(privateChatId);
           const userName = userInfo.username || `User_${privateChatId}`;
@@ -310,17 +311,14 @@ export default {
               .run();
             timings.createNewTopic = Date.now() - createTopicStart;
 
-            // Retry sending the message to the new topic
             const retrySendStart = Date.now();
             const formattedMessage = text ? `${nickname}:\n${text}` : null;
             await (formattedMessage ? sendMessageToTopic(newTopicId, formattedMessage) : copyMessageToTopic(newTopicId, message));
             timings.retrySend = Date.now() - retrySendStart;
 
-            // Send success notification
             await sendMessageToUser(chatId, `话题已重新创建，消息已成功转发。`);
             await sendMessageToTopic(newTopicId, `新话题创建成功，用户 ${nickname} 的消息已转发。`);
 
-            // Update timing information
             const totalRetryTime = Date.now() - messageStart;
             const retryTimingDetails = Object.entries(timings)
               .map(([key, value]) => `${key}: ${value}ms`)
@@ -333,7 +331,6 @@ export default {
             await sendMessageToTopic(null, `无法为用户 ${privateChatId} 创建新话题：${createError.message}`);
           }
         } else if (error.message.includes('429')) {
-          // Enhanced handling for Telegram API rate limit (429)
           await sendMessageToUser(chatId, `消息“${text}”转发失败：当前消息发送过于频繁，请等待几分钟后重试。`);
           await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：Telegram API 速率限制 (429)，已尝试重试但仍失败，请稍后处理。`);
           console.warn(`Rate limit exceeded for chatId ${chatId}. Message: "${text}" could not be forwarded after retries.`);
@@ -344,8 +341,7 @@ export default {
       }
     }
 
-    async function handleResetUser(chatId, topicId, text) {
-      const senderId = chatId;
+    async function handleResetUser(chatId, topicId, text, senderId) {
       const isAdmin = await checkIfAdmin(senderId);
       if (!isAdmin) {
         await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
@@ -416,6 +412,12 @@ export default {
               chat_id: chatId,
               message_id: messageId
             })
+          }).catch(err => {
+            if (err.message.includes('400')) {
+              console.warn(`Failed to delete message ${messageId} (likely already deleted): ${err.message}`);
+            } else {
+              throw err;
+            }
           })
         ]);
         timings.sendMessage = Date.now() - sendMessageStart;
@@ -473,7 +475,6 @@ export default {
         .run();
       if (key === 'verification_enabled') {
         settingsCache.verification_enabled = value === 'true';
-        // If verification is disabled, reset all users' verification status
         if (value === 'false') {
           await env.D1.prepare('UPDATE users SET is_verified = ?, verified_expiry = NULL').bind(false).run();
           userStateCache.forEach((userState, userStateKey) => {
@@ -562,7 +563,6 @@ export default {
             await handleVerification(chatId, messageId);
           }
 
-          // Delete verification message, ignore 400 error
           try {
             await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
               method: 'POST',
@@ -652,7 +652,6 @@ export default {
         });
       } catch (error) {
         console.error(`Error processing callback query ${data}:`, error);
-        // Log detailed Telegram API error information
         let errorMessage = error.message;
         if (error.message.includes('Request failed with status')) {
           try {
@@ -872,11 +871,7 @@ export default {
         if (!data.ok) throw new Error(`Failed to forward message to private chat: ${data.description}`);
       } catch (error) {
         console.error(`Error forwarding message to private chat ${privateChatId}:`, error);
-        if (error.message.includes('429')) {
-          throw new Error('Telegram API 速率限制 (429)');
-        } else {
-          throw error;
-        }
+        throw error; // Re-throw to be caught by the caller
       }
     }
 
@@ -948,13 +943,11 @@ export default {
     }
 
     async function getPrivateChatId(topicId) {
-      // First check cache
       for (const [chatId, cachedTopicId] of topicIdCache.entries()) {
         if (cachedTopicId === topicId.toString()) {
           return chatId;
         }
       }
-      // If not in cache, check database
       const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
         .bind(topicId)
         .first();
@@ -974,7 +967,6 @@ export default {
           const response = await fetch(url, options);
           if (!response.ok) {
             if (response.status === 429) {
-              // Telegram API rate limit, wait longer
               await new Promise(resolve => setTimeout(resolve, 5000 * (i + 1))); // 5 seconds initial, exponential backoff
               if (i === maxRetries) {
                 throw new Error('Request failed with status 429');
