@@ -292,34 +292,45 @@ export default {
         await sendMessageToTopic(finalTopicId, timingMessage);
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
-        if (error.message.includes('400')) {
-          // Handle 400 error by checking and potentially creating a new topic
+        if (error.message.includes('话题无效') || error.message.includes('400')) {
+          // Handle invalid topic by creating a new one and retrying
           const privateChatId = chatId;
-          let topicId = await getTopicId(privateChatId);
-          
-          if (!topicId) {
-            // If no topic exists, create a new one
-            const userInfo = await getUserInfo(privateChatId);
-            const userName = userInfo.username || `User_${privateChatId}`;
-            const nickname = userInfo.nickname || userName;
-            const topicName = nickname;
+          const userInfo = await getUserInfo(privateChatId);
+          const userName = userInfo.username || `User_${privateChatId}`;
+          const nickname = userInfo.nickname || userName;
+          const topicName = nickname;
 
-            topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || privateChatId);
-            topicIdCache.set(privateChatId, topicId);
+          let newTopicId;
+          try {
+            const createTopicStart = Date.now();
+            newTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id || privateChatId);
+            topicIdCache.set(privateChatId, newTopicId);
             await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-              .bind(privateChatId, topicId)
+              .bind(privateChatId, newTopicId)
               .run();
+            timings.createNewTopic = Date.now() - createTopicStart;
 
-            // Retry sending the message
+            // Retry sending the message to the new topic
+            const retrySendStart = Date.now();
             const formattedMessage = text ? `${nickname}:\n${text}` : null;
-            await (formattedMessage ? sendMessageToTopic(topicId, formattedMessage) : copyMessageToTopic(topicId, message));
+            await (formattedMessage ? sendMessageToTopic(newTopicId, formattedMessage) : copyMessageToTopic(newTopicId, message));
+            timings.retrySend = Date.now() - retrySendStart;
 
-            const retryTime = Date.now() - messageStart;
-            const retryTimingMessage = `重新创建话题后耗时: ${retryTime}ms`;
-            await sendMessageToTopic(topicId, retryTimingMessage);
-          } else {
-            await sendMessageToUser(chatId, `消息“${text}”转发失败：话题无效，请联系管理员。`);
-            await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：话题无效`);
+            // Send success notification
+            await sendMessageToUser(chatId, `话题已重新创建，消息已成功转发。`);
+            await sendMessageToTopic(newTopicId, `新话题创建成功，用户 ${nickname} 的消息已转发。`);
+
+            // Update timing information
+            const totalRetryTime = Date.now() - messageStart;
+            const retryTimingDetails = Object.entries(timings)
+              .map(([key, value]) => `${key}: ${value}ms`)
+              .join(', ');
+            const retryTimingMessage = `重新创建话题并转发耗时: 总计 ${totalRetryTime}ms (${retryTimingDetails})`;
+            await sendMessageToTopic(newTopicId, retryTimingMessage);
+          } catch (createError) {
+            console.error(`Failed to create new topic for chatId ${privateChatId}:`, createError);
+            await sendMessageToUser(chatId, `消息“${text}”转发失败：无法创建新话题，请联系管理员。`);
+            await sendMessageToTopic(null, `无法为用户 ${privateChatId} 创建新话题：${createError.message}`);
           }
         } else if (error.message.includes('429')) {
           await sendMessageToUser(chatId, `消息“${text}”转发失败：消息发送过于频繁，请稍后再试。`);
