@@ -333,8 +333,10 @@ export default {
             await sendMessageToTopic(null, `无法为用户 ${privateChatId} 创建新话题：${createError.message}`);
           }
         } else if (error.message.includes('429')) {
-          await sendMessageToUser(chatId, `消息“${text}”转发失败：消息发送过于频繁，请稍后再试。`);
-          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：Telegram API 速率限制 (429)`);
+          // Enhanced handling for Telegram API rate limit (429)
+          await sendMessageToUser(chatId, `消息“${text}”转发失败：当前消息发送过于频繁，请等待几分钟后重试。`);
+          await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：Telegram API 速率限制 (429)，已尝试重试但仍失败，请稍后处理。`);
+          console.warn(`Rate limit exceeded for chatId ${chatId}. Message: "${text}" could not be forwarded after retries.`);
         } else {
           await sendMessageToUser(chatId, `消息“${text}”转发失败：${error.message}，请稍后再试或联系管理员。`);
           await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
