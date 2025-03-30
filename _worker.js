@@ -391,8 +391,7 @@ export default {
           await sendMessageToUser(chatId, "您正在验证中，请完成当前验证。");
           return;
         }
-        const userInfo = await getUserInfo(chatId);
-        await sendMessageToUser(chatId, `请完成验证后发送消息“${userInfo.nickname || userInfo.username || '用户'}${userInfo.id || chatId}的具体信息”。`);
+        await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
         await handleVerification(chatId, messageId);
         return;
       }
