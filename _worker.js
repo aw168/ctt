@@ -400,22 +400,16 @@ export default {
           }
         } catch (error) {
           if (error.message.includes('Request failed with status 400')) {
-            // 检查话题是否存在
-            const existingTopicId = await getExistingTopicId(chatId);
-            if (!existingTopicId) {
-              // 如果话题不存在，创建一个新话题并重新转发
-              topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-              setCacheWithExpiry(topicIdCache, chatId, topicId);
-              await saveTopicId(chatId, topicId);
+            // 直接重建新话题并重新转发
+            topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+            setCacheWithExpiry(topicIdCache, chatId, topicId);
+            await saveTopicId(chatId, topicId);
 
-              if (text) {
-                const formattedMessage = `${nickname}:\n------------------------------------------------\n\n${text}`;
-                await sendMessageToTopic(topicId, formattedMessage);
-              } else {
-                await copyMessageToTopic(topicId, message);
-              }
+            if (text) {
+              const formattedMessage = `${nickname}:\n------------------------------------------------\n\n${text}`;
+              await sendMessageToTopic(topicId, formattedMessage);
             } else {
-              throw error; // 如果话题存在但仍失败，抛出错误
+              await copyMessageToTopic(topicId, message);
             }
           } else {
             throw error; // 其他错误直接抛出
