@@ -388,7 +388,7 @@ export default {
 
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
         if (isVerifying) {
-          await sendMessageToUser(chatId, "您正在验证中，请完成当前验证。");
+          await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
           return;
         }
         await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
@@ -686,6 +686,19 @@ export default {
 
           if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
             await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
+            // 清理过期状态并触发新验证码
+            await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
+              .bind(chatId)
+              .run();
+            userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId
+              })
+            });
             return;
           }
 
@@ -832,11 +845,7 @@ export default {
         userStateCache.set(chatId, userState);
       }
 
-      if (userState.is_verifying) {
-        await sendMessageToUser(chatId, "您正在验证中，请完成当前验证。");
-        return;
-      }
-
+      // 清理旧状态并设置为验证中
       userState.verification_code = null;
       userState.code_expiry = null;
       userState.is_verifying = true;
