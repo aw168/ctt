@@ -4,7 +4,7 @@ let MAX_MESSAGES_PER_MINUTE;
 
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
-let isInitialized = false; // 改为 isInitialized
+let isInitialized = false;
 const processedMessages = new Set();
 
 const settingsCache = new Map([
@@ -157,7 +157,8 @@ export default {
               code_expiry: 'INTEGER',
               last_verification_message_id: 'TEXT',
               is_first_verification: 'BOOLEAN DEFAULT TRUE',
-              is_rate_limited: 'BOOLEAN DEFAULT FALSE'
+              is_rate_limited: 'BOOLEAN DEFAULT FALSE',
+              is_verifying: 'BOOLEAN DEFAULT FALSE' // 新增 is_verifying 字段
             }
           },
           message_rates: {
@@ -263,7 +264,7 @@ export default {
           await d1.batch(
             expiredCodes.results.map(({ chat_id }) =>
               d1.prepare(
-                'UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?'
+                'UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?'
               ).bind(chat_id)
             )
           );
@@ -321,14 +322,14 @@ export default {
 
       let userState = userStateCache.get(chatId);
       if (!userState) {
-        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
         if (!userState) {
-          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified) VALUES (?, ?, ?, ?)')
-            .bind(chatId, false, true, false)
+          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
+            .bind(chatId, false, true, false, false)
             .run();
-          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null };
+          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
         }
         setCacheWithExpiry(userStateCache, chatId, userState);
       }
@@ -365,6 +366,10 @@ export default {
       const isRateLimited = await checkMessageRate(chatId);
 
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
+        if (userState.is_verifying) {
+          await sendMessageToUser(chatId, "您正在验证中，请完成当前验证。");
+          return;
+        }
         await sendMessageToUser(chatId, "请完成验证后发送消息。");
         await handleVerification(chatId, messageId);
         return;
@@ -632,7 +637,7 @@ export default {
 
           let verificationState = userStateCache.get(chatId);
           if (!verificationState) {
-            verificationState = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
+            verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
               .bind(chatId)
               .first();
             setCacheWithExpiry(userStateCache, chatId, verificationState);
@@ -654,9 +659,22 @@ export default {
             verificationState.code_expiry = null;
             verificationState.last_verification_message_id = null;
             verificationState.is_first_verification = false;
+            verificationState.is_verifying = false;
             setCacheWithExpiry(userStateCache, chatId, verificationState);
-            await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ? WHERE chat_id = ?')
-              .bind(true, verifiedExpiry, false, chatId)
+
+            // 数据库写入完成后再发送欢迎消息
+            await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
+              .bind(true, verifiedExpiry, false, false, chatId)
+              .run();
+
+            // 重置 message_count
+            let rateData = messageRateCache.get(chatId);
+            if (rateData) {
+              rateData.message_count = 0;
+              setCacheWithExpiry(messageRateCache, chatId, rateData);
+            }
+            await env.D1.prepare('UPDATE message_rates SET message_count = 0 WHERE chat_id = ?')
+              .bind(chatId)
               .run();
 
             const successMessage = await getVerificationSuccessMessage();
@@ -755,9 +773,18 @@ export default {
 
     async function handleVerification(chatId, messageId) {
       let userState = userStateCache.get(chatId) || {};
+      if (userState.is_verifying) {
+        await sendMessageToUser(chatId, "您正在验证中，请完成当前验证。");
+        return;
+      }
+
       userState.verification_code = null;
       userState.code_expiry = null;
+      userState.is_verifying = true;
       setCacheWithExpiry(userStateCache, chatId, userState);
+      await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = ? WHERE chat_id = ?')
+        .bind(true, chatId)
+        .run();
 
       const lastVerification = userState.last_verification_message_id || (await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
         .bind(chatId)
@@ -812,6 +839,7 @@ export default {
       userState.verification_code = correctResult.toString();
       userState.code_expiry = codeExpiry;
       userState.last_verification_message_id = null;
+      userState.is_verifying = true;
       setCacheWithExpiry(userStateCache, chatId, userState);
 
       try {
@@ -828,8 +856,8 @@ export default {
         if (data.ok) {
           userState.last_verification_message_id = data.result.message_id.toString();
           setCacheWithExpiry(userStateCache, chatId, userState);
-          await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ? WHERE chat_id = ?')
-            .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), chatId)
+          await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
+            .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
             .run();
         }
       } catch (error) {
