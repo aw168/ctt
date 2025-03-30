@@ -95,7 +95,7 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
-      // Handle group message
+      // Handle group messages
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
@@ -122,7 +122,7 @@ export default {
         return;
       }
 
-      // Get user state (prioritize from memory)
+      // Get user state (priority from memory)
       const userStateKey = `${chatId}:state`;
       let userState = userStateCache.get(userStateKey);
       if (!userState) {
@@ -229,9 +229,9 @@ export default {
 
       const isRateLimited = messageCount > MAX_MESSAGES_PER_MINUTE;
 
-      // Reissue verification code trigger logic: trigger verification if not verified or rate limited
+      // Verification trigger logic: trigger verification when not verified or rate limited
       if (verificationEnabled && (!isVerified || isRateLimited)) {
-        // If there is an existing code and it's not expired, prompt for verification
+        // If there is an existing verification code and it's not expired, prompt for verification
         if (userState.verification_code && userState.code_expiry && nowSeconds < userState.code_expiry) {
           await sendMessageToUser(chatId, "请验证上方验证码后再发送信息。");
           await sendMessageToUser(chatId, `请验证通过后重新发送“${text}”`);
@@ -294,33 +294,32 @@ export default {
         console.error(`Error handling message from chatId ${chatId}:`, error);
         if (error.message.includes('400')) {
           // Handle 400 error by checking and potentially creating a new topic
-          const userInfo = await getUserInfo(chatId);
-          const userName = userInfo.username || `User_${chatId}`;
-          const nickname = userInfo.nickname || userName;
-          const topicName = nickname;
+          const privateChatId = chatId;
+          let topicId = await getTopicId(privateChatId);
+          
+          if (!topicId) {
+            // If no topic exists, create a new one
+            const userInfo = await getUserInfo(privateChatId);
+            const userName = userInfo.username || `User_${privateChatId}`;
+            const nickname = userInfo.nickname || userName;
+            const topicName = nickname;
 
-          let newTopicId = await getTopicId(chatId);
-          if (!newTopicId) {
-            // Create a new forum topic if it doesn't exist
-            newTopicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-            topicIdCache.set(chatId, newTopicId);
+            topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || privateChatId);
+            topicIdCache.set(privateChatId, topicId);
             await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-              .bind(chatId, newTopicId)
+              .bind(privateChatId, topicId)
               .run();
-          }
 
-          if (newTopicId) {
-            // Retry sending the message to the new or found topic
+            // Retry sending the message
             const formattedMessage = text ? `${nickname}:\n${text}` : null;
-            await (formattedMessage ? sendMessageToTopic(newTopicId, formattedMessage) : copyMessageToTopic(newTopicId, message));
-            const retryTime = Date.now() - messageStart;
-            const retryTiming = `重试耗时: ${retryTime}ms`;
-            await sendMessageToTopic(newTopicId, retryTiming);
+            await (formattedMessage ? sendMessageToTopic(topicId, formattedMessage) : copyMessageToTopic(topicId, message));
 
-            await sendMessageToUser(chatId, `消息“${text}”转发失败后已自动创建/查找新话题并重试成功。`);
+            const retryTime = Date.now() - messageStart;
+            const retryTimingMessage = `重新创建话题后耗时: ${retryTime}ms`;
+            await sendMessageToTopic(topicId, retryTimingMessage);
           } else {
-            await sendMessageToUser(chatId, `消息“${text}”转发失败：无法创建或查找话题，请稍后再试或联系管理员。`);
-            await sendMessageToTopic(null, `无法为用户 ${chatId} 创建或查找话题：${error.message}`);
+            await sendMessageToUser(chatId, `消息“${text}”转发失败：话题无效，请联系管理员。`);
+            await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：话题无效`);
           }
         } else if (error.message.includes('429')) {
           await sendMessageToUser(chatId, `消息“${text}”转发失败：消息发送过于频繁，请稍后再试。`);
@@ -461,7 +460,7 @@ export default {
         .run();
       if (key === 'verification_enabled') {
         settingsCache.verification_enabled = value === 'true';
-        // If verification is turned off, reset all users' verification status
+        // If verification is disabled, reset all users' verification status
         if (value === 'false') {
           await env.D1.prepare('UPDATE users SET is_verified = ?, verified_expiry = NULL').bind(false).run();
           userStateCache.forEach((userState, userStateKey) => {
@@ -963,7 +962,7 @@ export default {
           if (!response.ok) {
             if (response.status === 429) {
               // Telegram API rate limit, wait longer
-              await new Promise(resolve => setTimeout(resolve, 5000 * (i + 1))); // 5 seconds base, exponential backoff
+              await new Promise(resolve => setTimeout(resolve, 5000 * (i + 1))); // 5 seconds initial, exponential backoff
               if (i === maxRetries) {
                 throw new Error('Request failed with status 429');
               }
@@ -975,7 +974,7 @@ export default {
         } catch (error) {
           lastError = error;
           if (i === maxRetries) break;
-          await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // General error, 1 second base, exponential backoff
+          await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // General error, 1 second initial, exponential backoff
         }
       }
       throw lastError;
