@@ -406,41 +406,41 @@ export default {
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
-        let topicId = topicIdCache.get(chatId);
-        if (topicId === undefined) {
-          topicId = await getExistingTopicId(chatId); // 先检查数据库中是否存在
-          if (!topicId) {
-            // 如果数据库中没有，再创建新话题
-            topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-            await saveTopicId(chatId, topicId);
-          }
-          topicIdCache.set(chatId, topicId); // 确保缓存更新
-        }
+let topicId = topicIdCache.get(chatId);
+if (topicId === undefined) {
+  topicId = await getExistingTopicId(chatId); // 先检查数据库中是否存在
+  if (!topicId) {
+    // 如果数据库中没有，再创建新话题
+    topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+    await saveTopicId(chatId, topicId);
+  }
+  topicIdCache.set(chatId, topicId); // 确保缓存更新
+}
 
-        try {
-          if (text) {
-            const formattedMessage = `${nickname}:\n${text}`;
-            await sendMessageToTopic(topicId, formattedMessage);
-          } else {
-            await copyMessageToTopic(topicId, message);
-          }
-        } catch (error) {
-          if (error.message.includes('Request failed with status 400')) {
-            // 如果话题无效，重新创建
-            topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-            topicIdCache.set(chatId, topicId);
-            await saveTopicId(chatId, topicId);
+try {
+  if (text) {
+    const formattedMessage = `${nickname}:\n${text}`;
+    await sendMessageToTopic(topicId, formattedMessage);
+  } else {
+    await copyMessageToTopic(topicId, message);
+  }
+} catch (error) {
+  if (error.message.includes('Request failed with status 400')) {
+    // 如果话题无效，重新创建
+    topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+    topicIdCache.set(chatId, topicId);
+    await saveTopicId(chatId, topicId);
 
-            if (text) {
-              const formattedMessage = `${nickname}:\n${text}`;
-              await sendMessageToTopic(topicId, formattedMessage);
-            } else {
-              await copyMessageToTopic(topicId, message);
-            }
-          } else {
-            throw error;
-          }
-        }
+    if (text) {
+      const formattedMessage = `${nickname}:\n${text}`;
+      await sendMessageToTopic(topicId, formattedMessage);
+    } else {
+      await copyMessageToTopic(topicId, message);
+    }
+  } else {
+    throw error;
+  }
+}
       } catch (error) {
         console.error(`Error handling message from chatId ${chatId}:`, error);
         await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
