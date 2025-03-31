@@ -408,9 +408,13 @@ export default {
 
         let topicId = topicIdCache.get(chatId);
         if (topicId === undefined) {
-          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-          topicIdCache.set(chatId, topicId);
-          await saveTopicId(chatId, topicId);
+          topicId = await getExistingTopicId(chatId); // 先检查数据库中是否存在
+          if (!topicId) {
+            // 如果数据库中没有，再创建新话题
+            topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+            await saveTopicId(chatId, topicId);
+          }
+          topicIdCache.set(chatId, topicId); // 确保缓存更新
         }
 
         try {
@@ -422,6 +426,7 @@ export default {
           }
         } catch (error) {
           if (error.message.includes('Request failed with status 400')) {
+            // 如果话题无效，重新创建
             topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
             topicIdCache.set(chatId, topicId);
             await saveTopicId(chatId, topicId);
