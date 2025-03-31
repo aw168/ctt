@@ -336,19 +336,17 @@ export default {
         return;
       }
 
-      let userState = userStateCache.get(chatId);
-      if (userState === undefined) {
-        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        if (!userState) {
-          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
-            .bind(chatId, false, true, false, false)
-            .run();
-          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
-        }
-        userStateCache.set(chatId, userState);
+      // 强制从数据库加载最新状态，避免缓存延迟
+      let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      if (!userState) {
+        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
+          .bind(chatId, false, true, false, false)
+          .run();
+        userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
       }
+      userStateCache.set(chatId, userState);
 
       const isBlocked = userState.is_blocked || false;
       if (isBlocked) {
@@ -381,6 +379,8 @@ export default {
       const isFirstVerification = userState.is_first_verification;
       const isRateLimited = await checkMessageRate(chatId);
 
+      console.log(`onMessage - chatId: ${chatId}, isVerified: ${isVerified}, isRateLimited: ${isRateLimited}, isVerifying: ${userState.is_verifying}`); // 调试日志
+
       // 从数据库重新获取最新状态，确保一致性
       const latestState = await env.D1.prepare('SELECT is_verifying FROM user_states WHERE chat_id = ?')
         .bind(chatId)
@@ -394,7 +394,7 @@ export default {
         }
         await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
         await handleVerification(chatId, messageId);
-        return;
+        return; // 阻止未验证或限频用户的消息转发
       }
 
       try {
@@ -615,7 +615,13 @@ export default {
       if (data === undefined) {
         data = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
           .bind(chatId)
-          .first() || { message_count: 0, window_start: now };
+          .first();
+        if (!data) {
+          data = { message_count: 0, window_start: now };
+          await env.D1.prepare('INSERT INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
+            .bind(chatId, data.message_count, data.window_start)
+            .run();
+        }
         messageRateCache.set(chatId, data);
       }
 
@@ -627,9 +633,10 @@ export default {
       }
 
       messageRateCache.set(chatId, data);
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
-        .bind(chatId, data.message_count, data.window_start)
+      await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
+        .bind(data.message_count, data.window_start, chatId)
         .run();
+      console.log(`Message rate check for chatId ${chatId}: count=${data.message_count}, window=${data.window_start}, limited=${data.message_count > MAX_MESSAGES_PER_MINUTE}`);
 
       return data.message_count > MAX_MESSAGES_PER_MINUTE;
     }
