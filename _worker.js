@@ -40,32 +40,6 @@ const topicIdCache = new LRUCache(1000);
 const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
 
-// 简单的 Markdown 到 HTML 转换函数
-function markdownToHtml(markdown) {
-  let html = markdown;
-
-  // 标题 (# -> <h1>, ## -> <h2>, etc.)
-  html = html.replace(/^# (.*)$/gm, '<b>$1</b>'); // Telegram 不支持 <h1>，用 <b> 替代
-  html = html.replace(/^## (.*)$/gm, '<b>$1</b>');
-  html = html.replace(/^### (.*)$/gm, '<b>$1</b>');
-
-  // 粗体 (**text** 或 __text__ -> <b>text</b>)
-  html = html.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
-  html = html.replace(/__(.*?)__/g, '<b>$1</b>');
-
-  // 斜体 (*text* 或 _text_ -> <i>text</i>)
-  html = html.replace(/\*(.*?)\*/g, '<i>$1</i>');
-  html = html.replace(/_(.*?)_/g, '<i>$1</i>');
-
-  // 链接 ([text](url) -> <a href="url">text</a>)
-  html = html.replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>');
-
-  // 换行（保留 \n，因为 Telegram 会自动处理）
-  html = html.replace(/\n/g, '\n');
-
-  return html.trim();
-}
-
 export default {
   async fetch(request, env) {
     BOT_TOKEN = env.BOT_TOKEN_ENV || null;
@@ -407,7 +381,7 @@ export default {
           await handleVerification(chatId, messageId);
         } else {
           const successMessage = await getVerificationSuccessMessage();
-          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`, 'HTML');
+          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
         }
         return;
       }
@@ -574,9 +548,8 @@ export default {
       try {
         const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/start.md');
         if (!response.ok) throw new Error(`Failed to fetch start.md: ${response.statusText}`);
-        const markdown = await response.text();
-        const html = markdownToHtml(markdown);
-        return html || '验证成功！您现在可以与客服聊天。';
+        const message = await response.text();
+        return message.trim() || '验证成功！您现在可以与客服聊天。';
       } catch (error) {
         console.error("Error fetching verification success message:", error);
         return '验证成功！您现在可以与客服聊天。';
@@ -587,9 +560,8 @@ export default {
       try {
         const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
         if (!response.ok) throw new Error(`Failed to fetch notification.md: ${response.statusText}`);
-        const markdown = await response.text();
-        const html = markdownToHtml(markdown);
-        return html || '';
+        const content = await response.text();
+        return content.trim() || '';
       } catch (error) {
         console.error("Error fetching notification content:", error);
         return '';
@@ -793,7 +765,7 @@ export default {
               .run();
 
             const successMessage = await getVerificationSuccessMessage();
-            await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`, 'HTML');
+            await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
           } else {
             await sendMessageToUser(chatId, '验证失败，请重新尝试。');
             await handleVerification(chatId, messageId);
@@ -1087,7 +1059,7 @@ export default {
         const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
         const notificationContent = await getNotificationContent();
         const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
-        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage, 'HTML');
+        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
         const messageId = messageResponse.result.message_id;
         await pinMessage(topicId, messageId);
 
@@ -1123,7 +1095,7 @@ export default {
       }
     }
 
-    async function sendMessageToTopic(topicId, text, parseMode = null) {
+    async function sendMessageToTopic(topicId, text) {
       if (!text.trim()) {
         throw new Error('Message text is empty');
       }
@@ -1134,9 +1106,6 @@ export default {
           text: text,
           message_thread_id: topicId
         };
-        if (parseMode) {
-          requestBody.parse_mode = parseMode;
-        }
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1222,12 +1191,9 @@ export default {
       }
     }
 
-    async function sendMessageToUser(chatId, text, parseMode = null) {
+    async function sendMessageToUser(chatId, text) {
       try {
         const requestBody = { chat_id: chatId, text: text };
-        if (parseMode) {
-          requestBody.parse_mode = parseMode;
-        }
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
