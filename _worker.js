@@ -400,16 +400,17 @@ export default {
       try {
         const [userInfo] = await Promise.all([
           getUserInfo(chatId),
-          ensureTopicExists(chatId) // 确保话题存在，不重复创建
+          getExistingTopicId(chatId).then(topicId => topicId ? topicIdCache.set(chatId, topicId) : null)
         ]);
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
         let topicId = topicIdCache.get(chatId);
-        if (!topicId) {
-          console.error(`No topicId found for chatId ${chatId}, this should not happen after ensureTopicExists`);
-          throw new Error(`Topic not found for chatId ${chatId}`);
+        if (topicId === undefined) {
+          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+          topicIdCache.set(chatId, topicId);
+          await saveTopicId(chatId, topicId);
         }
 
         try {
@@ -421,7 +422,6 @@ export default {
           }
         } catch (error) {
           if (error.message.includes('Request failed with status 400')) {
-            // 极少数情况下话题可能失效，重试创建
             topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
             topicIdCache.set(chatId, topicId);
             await saveTopicId(chatId, topicId);
@@ -550,45 +550,30 @@ export default {
 
     async function checkStartCommandRate(chatId) {
       const now = Date.now();
-      const window = 5 * 60 * 1000; // 5 分钟窗口
+      const window = 5 * 60 * 1000;
       const maxStartsPerWindow = 1;
 
       let data = messageRateCache.get(chatId);
-      console.log(`Checking start rate for chatId ${chatId}, cached data:`, data); // 调试日志
       if (data === undefined) {
-        // 从数据库加载初始数据
         data = await env.D1.prepare('SELECT start_count, start_window_start FROM message_rates WHERE chat_id = ?')
           .bind(chatId)
-          .first();
-        if (!data) {
-          data = { start_count: 0, start_window_start: now };
-          await env.D1.prepare('INSERT INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
-            .bind(chatId, data.start_count, data.start_window_start)
-            .run();
-        }
+          .first() || { start_count: 0, start_window_start: now };
         messageRateCache.set(chatId, data);
-        console.log(`Initialized start rate data for chatId ${chatId}:`, data);
       }
 
       if (now - data.start_window_start > window) {
         data.start_count = 1;
         data.start_window_start = now;
-        await env.D1.prepare('UPDATE message_rates SET start_count = ?, start_window_start = ? WHERE chat_id = ?')
-          .bind(data.start_count, data.start_window_start, chatId)
-          .run();
-        console.log(`Reset start count for chatId ${chatId} due to new window:`, data);
       } else {
         data.start_count += 1;
-        await env.D1.prepare('UPDATE message_rates SET start_count = ? WHERE chat_id = ?')
-          .bind(data.start_count, chatId)
-          .run();
-        console.log(`Incremented start count for chatId ${chatId}:`, data);
       }
 
       messageRateCache.set(chatId, data);
-      const isRateLimited = data.start_count > maxStartsPerWindow;
-      console.log(`Start rate limit check for chatId ${chatId}: count=${data.start_count}, limited=${isRateLimited}`);
-      return isRateLimited;
+      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
+        .bind(chatId, data.start_count, data.start_window_start)
+        .run();
+
+      return data.start_count > maxStartsPerWindow;
     }
 
     async function checkMessageRate(chatId) {
@@ -1034,20 +1019,6 @@ export default {
           .bind(chatId)
           .first())?.topic_id || null;
         if (topicId) topicIdCache.set(chatId, topicId);
-      }
-      return topicId;
-    }
-
-    async function ensureTopicExists(chatId) {
-      let topicId = await getExistingTopicId(chatId);
-      if (!topicId) {
-        const userInfo = await getUserInfo(chatId);
-        const userName = userInfo.username || `User_${chatId}`;
-        const nickname = userInfo.nickname || userName;
-        const topicName = nickname;
-
-        topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-        await saveTopicId(chatId, topicId);
       }
       return topicId;
     }
