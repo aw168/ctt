@@ -372,7 +372,7 @@ export default {
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
         }
-        return; // 确保 /start 命令处理完成后直接返回
+        return;
       }
 
       const verificationEnabled = settingsCache.get('verification_enabled');
@@ -400,21 +400,16 @@ export default {
       try {
         const [userInfo] = await Promise.all([
           getUserInfo(chatId),
-          getExistingTopicId(chatId).then(topicId => topicId ? topicIdCache.set(chatId, topicId) : null)
+          ensureTopicExists(chatId) // 确保话题存在，不重复创建
         ]);
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
         let topicId = topicIdCache.get(chatId);
-        if (topicId === undefined) {
-          topicId = await getExistingTopicId(chatId); // 先检查数据库中是否存在
-          if (!topicId) {
-            // 如果数据库中没有，再创建新话题
-            topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-            await saveTopicId(chatId, topicId);
-          }
-          topicIdCache.set(chatId, topicId); // 确保缓存更新
+        if (!topicId) {
+          console.error(`No topicId found for chatId ${chatId}, this should not happen after ensureTopicExists`);
+          throw new Error(`Topic not found for chatId ${chatId}`);
         }
 
         try {
@@ -426,7 +421,7 @@ export default {
           }
         } catch (error) {
           if (error.message.includes('Request failed with status 400')) {
-            // 如果话题无效，重新创建
+            // 极少数情况下话题可能失效，重试创建
             topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
             topicIdCache.set(chatId, topicId);
             await saveTopicId(chatId, topicId);
@@ -1024,6 +1019,20 @@ export default {
           .bind(chatId)
           .first())?.topic_id || null;
         if (topicId) topicIdCache.set(chatId, topicId);
+      }
+      return topicId;
+    }
+
+    async function ensureTopicExists(chatId) {
+      let topicId = await getExistingTopicId(chatId);
+      if (!topicId) {
+        const userInfo = await getUserInfo(chatId);
+        const userName = userInfo.username || `User_${chatId}`;
+        const nickname = userInfo.nickname || userName;
+        const topicName = nickname;
+
+        topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+        await saveTopicId(chatId, topicId);
       }
       return topicId;
     }
