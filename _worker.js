@@ -550,30 +550,45 @@ export default {
 
     async function checkStartCommandRate(chatId) {
       const now = Date.now();
-      const window = 5 * 60 * 1000;
+      const window = 5 * 60 * 1000; // 5 分钟窗口
       const maxStartsPerWindow = 1;
 
       let data = messageRateCache.get(chatId);
+      console.log(`Checking start rate for chatId ${chatId}, cached data:`, data); // 调试日志
       if (data === undefined) {
+        // 从数据库加载初始数据
         data = await env.D1.prepare('SELECT start_count, start_window_start FROM message_rates WHERE chat_id = ?')
           .bind(chatId)
-          .first() || { start_count: 0, start_window_start: now };
+          .first();
+        if (!data) {
+          data = { start_count: 0, start_window_start: now };
+          await env.D1.prepare('INSERT INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
+            .bind(chatId, data.start_count, data.start_window_start)
+            .run();
+        }
         messageRateCache.set(chatId, data);
+        console.log(`Initialized start rate data for chatId ${chatId}:`, data);
       }
 
       if (now - data.start_window_start > window) {
         data.start_count = 1;
         data.start_window_start = now;
+        await env.D1.prepare('UPDATE message_rates SET start_count = ?, start_window_start = ? WHERE chat_id = ?')
+          .bind(data.start_count, data.start_window_start, chatId)
+          .run();
+        console.log(`Reset start count for chatId ${chatId} due to new window:`, data);
       } else {
         data.start_count += 1;
+        await env.D1.prepare('UPDATE message_rates SET start_count = ? WHERE chat_id = ?')
+          .bind(data.start_count, chatId)
+          .run();
+        console.log(`Incremented start count for chatId ${chatId}:`, data);
       }
 
       messageRateCache.set(chatId, data);
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
-        .bind(chatId, data.start_count, data.start_window_start)
-        .run();
-
-      return data.start_count > maxStartsPerWindow;
+      const isRateLimited = data.start_count > maxStartsPerWindow;
+      console.log(`Start rate limit check for chatId ${chatId}: count=${data.start_count}, limited=${isRateLimited}`);
+      return isRateLimited;
     }
 
     async function checkMessageRate(chatId) {
