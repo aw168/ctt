@@ -6,6 +6,7 @@ let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
 let isInitialized = false;
 const processedMessages = new Set();
+const processedCallbacks = new Set(); // 新增：记录已处理的回调
 
 const settingsCache = new Map([
   ['verification_enabled', null],
@@ -635,6 +636,13 @@ export default {
       const topicId = callbackQuery.message.message_thread_id;
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
+      const callbackKey = `${chatId}:${callbackQuery.id}`; // 唯一标识回调
+
+      // 检查是否已处理过此回调
+      if (processedCallbacks.has(callbackKey)) {
+        return;
+      }
+      processedCallbacks.add(callbackKey);
 
       const parts = data.split('_');
       let action;
@@ -686,19 +694,23 @@ export default {
 
           if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
             await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
-            // 清理过期状态并触发新验证码
+            // 清理过期状态
             await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
               .bind(chatId)
               .run();
             userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
-            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: chatId,
-                message_id: messageId
-              })
-            });
+            try {
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  message_id: messageId
+                })
+              });
+            } catch (deleteError) {
+              console.error(`Error deleting expired verification message: ${deleteError.message}`);
+            }
             return;
           }
 
@@ -738,14 +750,18 @@ export default {
             await handleVerification(chatId, messageId);
           }
 
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: chatId,
-              message_id: messageId
-            })
-          });
+          try {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId
+              })
+            });
+          } catch (deleteError) {
+            console.error(`Error deleting verification message: ${deleteError.message}`);
+          }
         } else {
           const senderId = callbackQuery.from.id.toString();
           const isAdmin = await checkIfAdmin(senderId);
