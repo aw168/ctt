@@ -317,8 +317,6 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
-      console.log(`Received message from chatId: ${chatId}, text: ${text}`);
-
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
@@ -359,22 +357,13 @@ export default {
       }
 
       if (text === '/start') {
-        console.log(`Processing /start for chatId: ${chatId}, userState:`, userState);
         if (await checkStartCommandRate(chatId)) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
           return;
         }
 
-        // 确保 settingsCache 有值
-        let verificationEnabled = settingsCache.get('verification_enabled');
-        if (verificationEnabled === null) {
-          verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-          settingsCache.set('verification_enabled', verificationEnabled);
-        }
-
+        const verificationEnabled = settingsCache.get('verification_enabled');
         const isFirstVerification = userState.is_first_verification;
-
-        console.log(`verificationEnabled: ${verificationEnabled}, isFirstVerification: ${isFirstVerification}`);
 
         if (verificationEnabled && isFirstVerification) {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
@@ -383,14 +372,10 @@ export default {
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
         }
-        return;
+        return; // 确保 /start 命令处理完成后直接返回
       }
 
       const verificationEnabled = settingsCache.get('verification_enabled');
-      if (verificationEnabled === null) {
-        settingsCache.set('verification_enabled', (await getSetting('verification_enabled', env.D1)) === 'true');
-      }
-
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
       const isFirstVerification = userState.is_first_verification;
@@ -570,8 +555,8 @@ export default {
 
     async function checkStartCommandRate(chatId) {
       const now = Date.now();
-      const window = 5 * 60 * 1000; // 5 分钟窗口
-      const maxStartsPerWindow = 5; // 增加允许的频率
+      const window = 5 * 60 * 1000;
+      const maxStartsPerWindow = 1;
 
       let data = messageRateCache.get(chatId);
       if (data === undefined) {
@@ -593,7 +578,6 @@ export default {
         .bind(chatId, data.start_count, data.start_window_start)
         .run();
 
-      console.log(`checkStartCommandRate for ${chatId}: count=${data.start_count}, max=${maxStartsPerWindow}`);
       return data.start_count > maxStartsPerWindow;
     }
 
