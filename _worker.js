@@ -336,17 +336,19 @@ export default {
         return;
       }
 
-      // 强制从数据库加载最新状态，避免缓存延迟
-      let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      if (!userState) {
-        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
-          .bind(chatId, false, true, false, false)
-          .run();
-        userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+      let userState = userStateCache.get(chatId);
+      if (userState === undefined) {
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        if (!userState) {
+          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
+            .bind(chatId, false, true, false, false)
+            .run();
+          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+        }
+        userStateCache.set(chatId, userState);
       }
-      userStateCache.set(chatId, userState);
 
       const isBlocked = userState.is_blocked || false;
       if (isBlocked) {
@@ -379,8 +381,6 @@ export default {
       const isFirstVerification = userState.is_first_verification;
       const isRateLimited = await checkMessageRate(chatId);
 
-      console.log(`onMessage - chatId: ${chatId}, isVerified: ${isVerified}, isRateLimited: ${isRateLimited}, isVerifying: ${userState.is_verifying}`); // 调试日志
-
       // 从数据库重新获取最新状态，确保一致性
       const latestState = await env.D1.prepare('SELECT is_verifying FROM user_states WHERE chat_id = ?')
         .bind(chatId)
@@ -400,16 +400,17 @@ export default {
       try {
         const [userInfo] = await Promise.all([
           getUserInfo(chatId),
-          ensureTopicExists(chatId) // 确保话题存在，不重复创建
+          getExistingTopicId(chatId).then(topicId => topicId ? topicIdCache.set(chatId, topicId) : null)
         ]);
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
         let topicId = topicIdCache.get(chatId);
-        if (!topicId) {
-          console.error(`No topicId found for chatId ${chatId}, this should not happen after ensureTopicExists`);
-          throw new Error(`Topic not found for chatId ${chatId}`);
+        if (topicId === undefined) {
+          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+          topicIdCache.set(chatId, topicId);
+          await saveTopicId(chatId, topicId);
         }
 
         try {
@@ -421,7 +422,6 @@ export default {
           }
         } catch (error) {
           if (error.message.includes('Request failed with status 400')) {
-            // 极少数情况下话题可能失效，重试创建
             topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
             topicIdCache.set(chatId, topicId);
             await saveTopicId(chatId, topicId);
@@ -474,8 +474,9 @@ export default {
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       try {
-        const verificationEnabled = settingsCache.get('verification_enabled');
-        const userRawEnabled = settingsCache.get('user_raw_enabled');
+        // 强制从数据库加载最新设置
+        const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+        const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
 
         const buttons = [
           [
@@ -640,6 +641,7 @@ export default {
         } else if (key === 'user_raw_enabled') {
           settingsCache.set('user_raw_enabled', value === 'true');
         }
+        console.log(`Setting ${key} updated to ${value}, cache updated to ${value === 'true'}`);
       } catch (error) {
         console.error(`Error setting ${key} to ${value}:`, error);
         throw error;
@@ -696,20 +698,16 @@ export default {
             return;
           }
 
-          // 强制从数据库加载最新状态
-          let verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          if (!verificationState) {
-            verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
+          let verificationState = userStateCache.get(chatId);
+          if (verificationState === undefined) {
+            verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+              .bind(chatId)
+              .first();
+            userStateCache.set(chatId, verificationState);
           }
-          userStateCache.set(chatId, verificationState);
-          console.log(`Verify - chatId: ${chatId}, verificationState:`, verificationState); // 调试日志
-
-          const storedCode = verificationState.verification_code;
-          const codeExpiry = verificationState.code_expiry;
+          const storedCode = verificationState?.verification_code;
+          const codeExpiry = verificationState?.code_expiry;
           const nowSeconds = Math.floor(Date.now() / 1000);
-          console.log(`Verify - storedCode: ${storedCode}, codeExpiry: ${codeExpiry}, nowSeconds: ${nowSeconds}`); // 调试日志
 
           if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
             await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
@@ -740,7 +738,7 @@ export default {
               .bind(true, verifiedExpiry, false, false, chatId)
               .run();
 
-            // 立即刷新缓存状态
+            // 更新缓存状态
             verificationState = {
               ...verificationState,
               is_verified: true,
@@ -753,13 +751,13 @@ export default {
             };
             userStateCache.set(chatId, verificationState);
 
-            // 立即重置限频状态
-            let rateData = messageRateCache.get(chatId) || { message_count: 0, window_start: nowSeconds * 1000 };
-            rateData.message_count = 0;
-            rateData.window_start = nowSeconds * 1000;
-            messageRateCache.set(chatId, rateData);
-            await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
-              .bind(0, nowSeconds * 1000, chatId)
+            let rateData = messageRateCache.get(chatId);
+            if (rateData) {
+              rateData.message_count = 0;
+              messageRateCache.set(chatId, rateData);
+            }
+            await env.D1.prepare('UPDATE message_rates SET message_count = 0 WHERE chat_id = ?')
+              .bind(chatId)
               .run();
 
             const successMessage = await getVerificationSuccessMessage();
@@ -816,9 +814,8 @@ export default {
               .run();
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
           } else if (action === 'toggle_verification') {
-            const currentState = settingsCache.get('verification_enabled');
+            const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
             const newState = !currentState;
-            settingsCache.set('verification_enabled', newState);
             await setSetting('verification_enabled', newState.toString());
             await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'check_blocklist') {
@@ -830,9 +827,8 @@ export default {
               : '当前没有被拉黑的用户。';
             await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`);
           } else if (action === 'toggle_user_raw') {
-            const currentState = settingsCache.get('user_raw_enabled');
+            const currentState = (await getSetting('user_raw_enabled', env.D1)) === 'true';
             const newState = !currentState;
-            settingsCache.set('user_raw_enabled', newState);
             await setSetting('user_raw_enabled', newState.toString());
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
@@ -1038,20 +1034,6 @@ export default {
           .bind(chatId)
           .first())?.topic_id || null;
         if (topicId) topicIdCache.set(chatId, topicId);
-      }
-      return topicId;
-    }
-
-    async function ensureTopicExists(chatId) {
-      let topicId = await getExistingTopicId(chatId);
-      if (!topicId) {
-        const userInfo = await getUserInfo(chatId);
-        const userName = userInfo.username || `User_${chatId}`;
-        const nickname = userInfo.nickname || userName;
-        const topicName = nickname;
-
-        topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-        await saveTopicId(chatId, topicId);
       }
       return topicId;
     }
