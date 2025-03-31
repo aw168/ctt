@@ -696,16 +696,20 @@ export default {
             return;
           }
 
-          let verificationState = userStateCache.get(chatId);
-          if (verificationState === undefined) {
-            verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-              .bind(chatId)
-              .first();
-            userStateCache.set(chatId, verificationState);
+          // 强制从数据库加载最新状态
+          let verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+            .bind(chatId)
+            .first();
+          if (!verificationState) {
+            verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
           }
-          const storedCode = verificationState?.verification_code;
-          const codeExpiry = verificationState?.code_expiry;
+          userStateCache.set(chatId, verificationState);
+          console.log(`Verify - chatId: ${chatId}, verificationState:`, verificationState); // 调试日志
+
+          const storedCode = verificationState.verification_code;
+          const codeExpiry = verificationState.code_expiry;
           const nowSeconds = Math.floor(Date.now() / 1000);
+          console.log(`Verify - storedCode: ${storedCode}, codeExpiry: ${codeExpiry}, nowSeconds: ${nowSeconds}`); // 调试日志
 
           if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
             await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
