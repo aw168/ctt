@@ -400,17 +400,32 @@ export default {
       try {
         const [userInfo] = await Promise.all([
           getUserInfo(chatId),
-          getExistingTopicId(chatId).then(topicId => topicId ? topicIdCache.set(chatId, topicId) : null)
+          getExistingTopicId(chatId).then(topicId => {
+            if (!topicId) {
+              console.log(`No topic found for chatId ${chatId}, creating new topic`);
+              return createForumTopic(
+                userInfo.nickname || `User_${chatId}`,
+                userInfo.username || `User_${chatId}`,
+                userInfo.nickname || `User_${chatId}`,
+                userInfo.id || chatId
+              ).then(newTopicId => {
+                topicIdCache.set(chatId, newTopicId);
+                saveTopicId(chatId, newTopicId);
+                return newTopicId;
+              });
+            }
+            topicIdCache.set(chatId, topicId);
+            return topicId;
+          })
         ]);
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
         let topicId = topicIdCache.get(chatId);
-        if (topicId === undefined) {
-          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-          topicIdCache.set(chatId, topicId);
-          await saveTopicId(chatId, topicId);
+        if (!topicId) {
+          console.error(`TopicId still null for chatId ${chatId} after creation attempt, this should not happen`);
+          throw new Error(`Topic not found or created for chatId ${chatId}`);
         }
 
         try {
