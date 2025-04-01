@@ -356,13 +356,30 @@ export default {
         return;
       }
 
+      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+      console.log(`Verification enabled: ${verificationEnabled} for chatId ${chatId}`);
+
+      // 如果验证码功能关闭，自动将用户标记为已验证
+      if (!verificationEnabled && !userState.is_verified) {
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const verifiedExpiry = nowSeconds + 3600 * 24; // 设置 24 小时有效期
+        await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
+          .bind(true, verifiedExpiry, false, false, chatId)
+          .run();
+        userState.is_verified = true;
+        userState.verified_expiry = verifiedExpiry;
+        userState.is_first_verification = false;
+        userState.is_verifying = false;
+        userStateCache.set(chatId, userState);
+        console.log(`Automatically verified user ${chatId} since verification is disabled`);
+      }
+
       if (text === '/start') {
         if (await checkStartCommandRate(chatId)) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
           return;
         }
 
-        const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
         const isFirstVerification = userState.is_first_verification;
 
         if (verificationEnabled && isFirstVerification) {
@@ -377,7 +394,6 @@ export default {
         return;
       }
 
-      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
       const isFirstVerification = userState.is_first_verification;
@@ -388,14 +404,19 @@ export default {
         .first();
       const isVerifying = latestState?.is_verifying || false;
 
-      if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
-        if (isVerifying) {
+      console.log(`User ${chatId} verification status: isVerified=${isVerified}, isFirstVerification=${isFirstVerification}, isRateLimited=${isRateLimited}, isVerifying=${isVerifying}`);
+
+      // 只有在验证码功能开启时才检查验证状态
+      if (verificationEnabled) {
+        if (!isVerified || (isRateLimited && !isFirstVerification)) {
+          if (isVerifying) {
+            await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
+            return;
+          }
           await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
+          await handleVerification(chatId, messageId);
           return;
         }
-        await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
-        await handleVerification(chatId, messageId);
-        return;
       }
 
       try {
@@ -427,8 +448,10 @@ export default {
           if (text) {
             const formattedMessage = `${nickname}:\n${text}`;
             await sendMessageToTopic(topicId, formattedMessage);
+            console.log(`Message forwarded to topic ${topicId} for chatId ${chatId}: ${formattedMessage}`);
           } else {
             await copyMessageToTopic(topicId, message);
+            console.log(`Non-text message forwarded to topic ${topicId} for chatId ${chatId}`);
           }
         } catch (error) {
           console.error(`Error sending message to topic ${topicId}:`, error);
@@ -707,6 +730,15 @@ export default {
           .run();
         if (key === 'verification_enabled') {
           settingsCache.set('verification_enabled', value === 'true');
+          // 当验证码功能关闭时，自动将所有用户的 is_verified 设置为 true
+          if (value === 'false') {
+            const nowSeconds = Math.floor(Date.now() / 1000);
+            const verifiedExpiry = nowSeconds + 3600 * 24;
+            await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_verifying = ?, verification_code = NULL, code_expiry = NULL WHERE is_verified = ?')
+              .bind(true, verifiedExpiry, false, false)
+              .run();
+            console.log('Verification disabled, set all users to verified');
+          }
         } else if (key === 'user_raw_enabled') {
           settingsCache.set('user_raw_enabled', value === 'true');
         }
