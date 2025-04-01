@@ -379,10 +379,11 @@ export default {
       settingsCache.set('verification_enabled', verificationEnabled);
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+      const isRateLimited = await checkMessageRate(chatId);
 
-      console.log(`Debug - Message: chatId=${chatId}, verificationEnabled=${verificationEnabled}, isVerified=${isVerified}, verified_expiry=${userState.verified_expiry}`);
+      console.log(`Debug - Message: chatId=${chatId}, verificationEnabled=${verificationEnabled}, isVerified=${isVerified}, isRateLimited=${isRateLimited}, verified_expiry=${userState.verified_expiry}`);
 
-      if (verificationEnabled && !isVerified) {
+      if (verificationEnabled && (!isVerified || isRateLimited)) {
         userState = await env.D1.prepare('SELECT is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
@@ -399,12 +400,11 @@ export default {
           await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
           return;
         }
-        await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
+        await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”${isRateLimited ? '（您发送消息过于频繁）' : ''}。`);
         await handleVerification(chatId, messageId);
         return;
       }
 
-      const isRateLimited = await checkMessageRate(chatId);
       if (isRateLimited) {
         await sendMessageToUser(chatId, "您发送消息过于频繁，请稍后再试！");
         return;
