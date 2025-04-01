@@ -8,7 +8,6 @@ let isInitialized = false;
 const processedMessages = new Set();
 const processedCallbacks = new Set();
 
-// 用于实现锁机制的 Map
 const topicCreationLocks = new Map();
 
 const settingsCache = new Map([
@@ -36,10 +35,8 @@ class LRUCache {
     }
     this.cache.set(key, value);
   }
-  // 确保 clear 方法存在，用于清空缓存
   clear() {
     this.cache.clear();
-    console.log('LRUCache cleared');
   }
 }
 
@@ -55,7 +52,6 @@ export default {
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
     if (!env.D1) {
-      console.error('D1 database is not bound');
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
     }
 
@@ -66,7 +62,6 @@ export default {
 
     async function handleRequest(request) {
       if (!BOT_TOKEN || !GROUP_ID) {
-        console.error('Missing required environment variables');
         return new Response('Server configuration error: Missing required environment variables', { status: 500 });
       }
 
@@ -77,7 +72,6 @@ export default {
           await handleUpdate(update);
           return new Response('OK');
         } catch (error) {
-          console.error('Error parsing request or handling update:', error);
           return new Response('Bad Request', { status: 400 });
         }
       } else if (url.pathname === '/registerWebhook') {
@@ -108,12 +102,7 @@ export default {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: webhookUrl }),
         }).then(r => r.json());
-        if (!response.ok) {
-          console.error('Webhook auto-registration failed:', JSON.stringify(response, null, 2));
-        }
-      } catch (error) {
-        console.error('Error during webhook auto-registration:', error);
-      }
+      } catch (error) {}
     }
 
     async function checkBotPermissions() {
@@ -144,15 +133,8 @@ export default {
         const canSendMessages = memberData.result.can_send_messages !== false;
         const canPostMessages = memberData.result.can_post_messages !== false;
         const canManageTopics = memberData.result.can_manage_topics !== false;
-        if (!canSendMessages || !canPostMessages || !canManageTopics) {
-          console.error('Bot lacks necessary permissions in the group:', {
-            canSendMessages,
-            canPostMessages,
-            canManageTopics
-          });
-        }
+        if (!canSendMessages || !canPostMessages || !canManageTopics) {}
       } catch (error) {
-        console.error('Error checking bot permissions:', error);
         throw error;
       }
     }
@@ -243,7 +225,6 @@ export default {
               await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
             }
           } catch (error) {
-            console.error(`Error checking ${tableName}:`, error);
             await d1.exec(`DROP TABLE IF EXISTS ${tableName}`);
             await createTable(d1, tableName, structure);
           }
@@ -259,7 +240,6 @@ export default {
         settingsCache.set('verification_enabled', (await getSetting('verification_enabled', d1)) === 'true');
         settingsCache.set('user_raw_enabled', (await getSetting('user_raw_enabled', d1)) === 'true');
       } catch (error) {
-        console.error('Error in checkAndRepairTables:', error);
         throw error;
       }
     }
@@ -294,9 +274,7 @@ export default {
           );
         }
         lastCleanupTime = now;
-      } catch (error) {
-        console.error('Error cleaning expired verification codes:', error);
-      }
+      } catch (error) {}
     }
 
     async function handleUpdate(update) {
@@ -325,8 +303,6 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
-      console.log(`Processing message from chatId ${chatId}: ${text}`);
-
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
@@ -346,7 +322,6 @@ export default {
         return;
       }
 
-      // 强制从数据库读取最新的用户状态
       let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -357,21 +332,16 @@ export default {
         userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
       }
       userStateCache.set(chatId, userState);
-      console.log(`User state for chatId ${chatId}: ${JSON.stringify(userState)}`);
 
       const isBlocked = userState.is_blocked || false;
       if (isBlocked) {
         await sendMessageToUser(chatId, "您已被拉黑，无法发送消息。请联系管理员解除拉黑。");
-        console.log(`User ${chatId} is blocked, message not forwarded`);
         return;
       }
 
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-      console.log(`Verification enabled: ${verificationEnabled} for chatId ${chatId}`);
 
-      // 如果验证码功能关闭，跳过所有验证逻辑
       if (!verificationEnabled) {
-        console.log(`Verification is disabled, skipping verification checks for chatId ${chatId}`);
       } else {
         const nowSeconds = Math.floor(Date.now() / 1000);
         const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
@@ -379,17 +349,13 @@ export default {
         const isRateLimited = await checkMessageRate(chatId);
         const isVerifying = userState.is_verifying || false;
 
-        console.log(`User ${chatId} verification status: isVerified=${isVerified}, isFirstVerification=${isFirstVerification}, isRateLimited=${isRateLimited}, isVerifying=${isVerifying}`);
-
         if (!isVerified || (isRateLimited && !isFirstVerification)) {
           if (isVerifying) {
             await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
-            console.log(`User ${chatId} is verifying, message not forwarded`);
             return;
           }
           await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
           await handleVerification(chatId, messageId);
-          console.log(`User ${chatId} needs verification, message not forwarded`);
           return;
         }
       }
@@ -397,7 +363,6 @@ export default {
       if (text === '/start') {
         if (await checkStartCommandRate(chatId)) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
-          console.log(`User ${chatId} sent /start too frequently`);
           return;
         }
 
@@ -405,7 +370,6 @@ export default {
         await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
         const userInfo = await getUserInfo(chatId);
         await ensureUserTopic(chatId, userInfo);
-        console.log(`User ${chatId} sent /start, welcome message sent`);
         return;
       }
 
@@ -414,7 +378,6 @@ export default {
         if (!userInfo) {
           throw new Error(`Failed to fetch user info for chatId ${chatId}`);
         }
-        console.log(`User info for chatId ${chatId}: ${JSON.stringify(userInfo)}`);
 
         let topicId = await ensureUserTopic(chatId, userInfo);
         if (!topicId) {
@@ -423,7 +386,6 @@ export default {
 
         const isTopicValid = await validateTopic(topicId);
         if (!isTopicValid) {
-          console.log(`Topic ${topicId} is invalid for chatId ${chatId}, recreating topic...`);
           await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
           topicIdCache.set(chatId, undefined);
           topicId = await ensureUserTopic(chatId, userInfo);
@@ -439,17 +401,13 @@ export default {
           if (text) {
             const formattedMessage = `${nickname}:\n${text}`;
             await sendMessageToTopic(topicId, formattedMessage);
-            console.log(`Message forwarded to topic ${topicId} for chatId ${chatId}: ${formattedMessage}`);
           } else {
             await copyMessageToTopic(topicId, message);
-            console.log(`Non-text message forwarded to topic ${topicId} for chatId ${chatId}`);
           }
         } catch (error) {
-          console.error(`Error sending message to topic ${topicId}:`, error);
           throw error;
         }
       } catch (error) {
-        console.error(`Error handling message from chatId ${chatId}:`, error);
         await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
         await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
       }
@@ -477,14 +435,11 @@ export default {
               message_id: data.result.message_id
             })
           });
-          console.log(`Topic ${topicId} is valid`);
           return true;
         } else {
-          console.log(`Topic ${topicId} is invalid: ${data.description}`);
           return false;
         }
       } catch (error) {
-        console.error(`Error validating topic ${topicId}:`, error);
         return false;
       }
     }
@@ -499,26 +454,22 @@ export default {
       try {
         await lock;
 
-        let topicId = await getExistingTopicId(chatId, 3, 1000); // 重试 3 次，每次间隔 1 秒
+        let topicId = await getExistingTopicId(chatId, 3, 1000);
         if (topicId) {
-          console.log(`Topic ${topicId} already exists for chatId ${chatId}, using existing topic.`);
           return topicId;
         }
 
         const newLock = (async () => {
-          console.log(`Creating new topic for chatId ${chatId}...`);
           const userName = userInfo.username || `User_${chatId}`;
           const nickname = userInfo.nickname || userName;
           topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
           await saveTopicId(chatId, topicId);
-          console.log(`Created topic ${topicId} for chatId ${chatId}`);
           return topicId;
         })();
 
         topicCreationLocks.set(chatId, newLock);
         return await newLock;
       } catch (error) {
-        console.error(`Error ensuring topic for chatId ${chatId}:`, error);
         throw error;
       } finally {
         if (topicCreationLocks.get(chatId) === lock) {
@@ -553,7 +504,6 @@ export default {
         topicIdCache.set(targetChatId, undefined);
         await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
       } catch (error) {
-        console.error(`Error resetting user ${targetChatId}:`, error);
         await sendMessageToTopic(topicId, `重置用户 ${targetChatId} 失败：${error.message}`);
       }
     }
@@ -573,9 +523,7 @@ export default {
             { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
           ],
           [
-            { text: userRawEnabled ? '关闭用户Raw' : '开启
-
-用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
+            { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
             { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
           ],
           [
@@ -602,11 +550,9 @@ export default {
               chat_id: chatId,
               message_id: messageId
             })
-          }).catch(error => console.error(`Error deleting message ${messageId}:`, error))
+          }).catch(error => {})
         ]);
-      } catch (error) {
-        console.error(`Error sending admin panel to chatId ${chatId}, topicId ${topicId}:`, error);
-      }
+      } catch (error) {}
     }
 
     async function getVerificationSuccessMessage() {
@@ -619,7 +565,6 @@ export default {
         const message = await response.text();
         return message.trim() || '验证成功！您现在可以与客服聊天。';
       } catch (error) {
-        console.error("Error fetching verification success message:", error);
         return '验证成功！您现在可以与客服聊天。';
       }
     }
@@ -631,7 +576,6 @@ export default {
         const content = await response.text();
         return content.trim() || '';
       } catch (error) {
-        console.error("Error fetching notification content:", error);
         return '';
       }
     }
@@ -711,7 +655,6 @@ export default {
           .first();
         return result?.value || null;
       } catch (error) {
-        console.error(`Error getting setting ${key}:`, error);
         throw error;
       }
     }
@@ -730,20 +673,13 @@ export default {
               .bind(true, verifiedExpiry, false, false)
               .run();
             try {
-              userStateCache.clear(); // 调用 clear 方法
-            } catch (error) {
-              console.error('Error clearing userStateCache:', error);
-              // 如果 clear 失败，仍然继续执行后续逻辑
-            }
-            console.log('Verification disabled, set all users to verified and attempted to clear userStateCache');
-          } else {
-            console.log('Verification enabled, user states unchanged');
-          }
+              userStateCache.clear();
+            } catch (error) {}
+          } else {}
         } else if (key === 'user_raw_enabled') {
           settingsCache.set('user_raw_enabled', value === 'true');
         }
       } catch (error) {
-        console.error(`Error setting ${key} to ${value}:`, error);
         throw error;
       }
     }
@@ -797,7 +733,7 @@ export default {
             return;
           }
 
-          let verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+          let verificationState = await env.D1.prepare('SELECT verification_code, code-Expiry, is_verifying FROM user_states WHERE chat_id = ?')
             .bind(chatId)
             .first();
           if (!verificationState) {
@@ -824,9 +760,7 @@ export default {
                   message_id: messageId
                 })
               });
-            } catch (deleteError) {
-              console.error(`Error deleting expired verification message: ${deleteError.message}`);
-            }
+            } catch (deleteError) {}
             return;
           }
 
@@ -868,9 +802,7 @@ export default {
                 message_id: messageId
               })
             });
-          } catch (deleteError) {
-            console.error(`Error deleting verification message: ${deleteError.message}`);
-          }
+          } catch (deleteError) {}
         } else {
           const senderId = callbackQuery.from.id.toString();
           const isAdmin = await checkIfAdmin(senderId);
@@ -933,7 +865,6 @@ export default {
               ]);
               await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
             } catch (error) {
-              console.error(`Error deleting user ${privateChatId}:`, error);
               await sendMessageToTopic(topicId, `删除用户 ${privateChatId} 失败：${error.message}`);
             }
           } else {
@@ -951,7 +882,6 @@ export default {
           })
         });
       } catch (error) {
-        console.error(`Error processing callback query ${data}:`, error);
         await sendMessageToTopic(topicId, `处理操作 ${action} 失败：${error.message}`);
       }
     }
@@ -990,9 +920,7 @@ export default {
               message_id: lastVerification
             })
           });
-        } catch (error) {
-          console.error("Error deleting old verification message:", error);
-        }
+        } catch (error) {}
         userState.last_verification_message_id = null;
         userStateCache.set(chatId, userState);
         await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
@@ -1054,9 +982,7 @@ export default {
             .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
             .run();
         }
-      } catch (error) {
-        console.error("Error sending verification message:", error);
-      }
+      } catch (error) {}
     }
 
     async function checkIfAdmin(userId) {
@@ -1072,7 +998,6 @@ export default {
         const data = await response.json();
         return data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
       } catch (error) {
-        console.error(`Error checking admin status for user ${userId}:`, error);
         return false;
       }
     }
@@ -1108,7 +1033,6 @@ export default {
           };
         }
       } catch (error) {
-        console.error(`Error fetching user info for chatId ${chatId}:`, error);
         userInfo = {
           id: chatId,
           username: `User_${chatId}`,
@@ -1123,7 +1047,6 @@ export default {
     async function getExistingTopicId(chatId, retries = 3, delay = 1000) {
       let topicId = topicIdCache.get(chatId);
       if (topicId !== undefined) {
-        console.log(`Found topicId ${topicId} in cache for chatId ${chatId}`);
         return topicId;
       }
 
@@ -1134,23 +1057,16 @@ export default {
             .first();
           topicId = result?.topic_id || null;
           if (topicId) {
-            console.log(`Found topicId ${topicId} in database for chatId ${chatId} on attempt ${i + 1}`);
             topicIdCache.set(chatId, topicId);
             return topicId;
-          } else {
-            console.log(`No topicId found in database for chatId ${chatId} on attempt ${i + 1}`);
           }
-        } catch (error) {
-          console.error(`Error fetching topicId for chatId ${chatId} from database on attempt ${i + 1}:`, error);
-        }
+        } catch (error) {}
 
         if (i < retries - 1) {
-          console.log(`Retrying to fetch topicId for chatId ${chatId} after ${delay}ms...`);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
 
-      console.log(`Failed to fetch topicId for chatId ${chatId} after ${retries} attempts`);
       return null;
     }
 
@@ -1175,7 +1091,6 @@ export default {
 
         return topicId;
       } catch (error) {
-        console.error(`Error creating forum topic for user ${userId}:`, error);
         throw error;
       }
     }
@@ -1186,9 +1101,7 @@ export default {
           .bind(chatId, topicId)
           .run();
         topicIdCache.set(chatId, topicId);
-        console.log(`Saved topicId ${topicId} for chatId ${chatId} to database and cache`);
       } catch (error) {
-        console.error(`Error saving topicId ${topicId} for chatId ${chatId}:`, error);
         throw error;
       }
     }
@@ -1201,7 +1114,6 @@ export default {
           .first();
         return mapping?.chat_id || null;
       } catch (error) {
-        console.error(`Error fetching private chat ID for topicId ${topicId}:`, error);
         throw error;
       }
     }
@@ -1217,7 +1129,7 @@ export default {
           text: text,
           message_thread_id: topicId
         };
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        const response = await fetchWithRetry(`https.//api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody)
@@ -1228,7 +1140,6 @@ export default {
         }
         return data;
       } catch (error) {
-        console.error(`Error sending message to topic ${topicId}:`, error);
         throw error;
       }
     }
@@ -1252,7 +1163,6 @@ export default {
           throw new Error(`Failed to copy message to topic ${topicId}: ${data.description}`);
         }
       } catch (error) {
-        console.error(`Error copying message to topic ${topicId}:`, error);
         throw error;
       }
     }
@@ -1274,7 +1184,6 @@ export default {
           throw new Error(`Failed to pin message: ${data.description}`);
         }
       } catch (error) {
-        console.error(`Error pinning message ${messageId} in topic ${topicId}:`, error);
         throw error;
       }
     }
@@ -1297,7 +1206,6 @@ export default {
           throw new Error(`Failed to forward message to private chat: ${data.description}`);
         }
       } catch (error) {
-        console.error(`Error forwarding message to private chat ${privateChatId}:`, error);
         throw error;
       }
     }
@@ -1315,7 +1223,6 @@ export default {
           throw new Error(`Failed to send message to user: ${data.description}`);
         }
       } catch (error) {
-        console.error(`Error sending message to user ${chatId}:`, error);
         throw error;
       }
     }
@@ -1368,7 +1275,6 @@ export default {
     try {
       return await handleRequest(request);
     } catch (error) {
-      console.error('Unhandled error in fetch handler:', error);
       return new Response('Internal Server Error', { status: 500 });
     }
   }
