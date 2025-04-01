@@ -320,6 +320,8 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
+      console.log(`Processing message from chatId ${chatId}: ${text}`);
+
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
@@ -339,6 +341,7 @@ export default {
         return;
       }
 
+      // 强制从数据库读取最新的用户状态
       let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -349,74 +352,56 @@ export default {
         userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
       }
       userStateCache.set(chatId, userState);
+      console.log(`User state for chatId ${chatId}: ${JSON.stringify(userState)}`);
 
       const isBlocked = userState.is_blocked || false;
       if (isBlocked) {
         await sendMessageToUser(chatId, "您已被拉黑，无法发送消息。请联系管理员解除拉黑。");
+        console.log(`User ${chatId} is blocked, message not forwarded`);
         return;
       }
 
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
       console.log(`Verification enabled: ${verificationEnabled} for chatId ${chatId}`);
 
-      // 如果验证码功能关闭，自动将用户标记为已验证
-      if (!verificationEnabled && !userState.is_verified) {
+      // 如果验证码功能关闭，跳过所有验证逻辑
+      if (!verificationEnabled) {
+        console.log(`Verification is disabled, skipping verification checks for chatId ${chatId}`);
+      } else {
         const nowSeconds = Math.floor(Date.now() / 1000);
-        const verifiedExpiry = nowSeconds + 3600 * 24; // 设置 24 小时有效期
-        await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
-          .bind(true, verifiedExpiry, false, false, chatId)
-          .run();
-        userState.is_verified = true;
-        userState.verified_expiry = verifiedExpiry;
-        userState.is_first_verification = false;
-        userState.is_verifying = false;
-        userStateCache.set(chatId, userState);
-        console.log(`Automatically verified user ${chatId} since verification is disabled`);
+        const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+        const isFirstVerification = userState.is_first_verification;
+        const isRateLimited = await checkMessageRate(chatId);
+        const isVerifying = userState.is_verifying || false;
+
+        console.log(`User ${chatId} verification status: isVerified=${isVerified}, isFirstVerification=${isFirstVerification}, isRateLimited=${isRateLimited}, isVerifying=${isVerifying}`);
+
+        if (!isVerified || (isRateLimited && !isFirstVerification)) {
+          if (isVerifying) {
+            await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
+            console.log(`User ${chatId} is verifying, message not forwarded`);
+            return;
+          }
+          await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
+          await handleVerification(chatId, messageId);
+          console.log(`User ${chatId} needs verification, message not forwarded`);
+          return;
+        }
       }
 
       if (text === '/start') {
         if (await checkStartCommandRate(chatId)) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
+          console.log(`User ${chatId} sent /start too frequently`);
           return;
         }
 
-        const isFirstVerification = userState.is_first_verification;
-
-        if (verificationEnabled && isFirstVerification) {
-          await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
-          await handleVerification(chatId, messageId);
-        } else {
-          const successMessage = await getVerificationSuccessMessage();
-          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
-          const userInfo = await getUserInfo(chatId);
-          await ensureUserTopic(chatId, userInfo);
-        }
+        const successMessage = await getVerificationSuccessMessage();
+        await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
+        const userInfo = await getUserInfo(chatId);
+        await ensureUserTopic(chatId, userInfo);
+        console.log(`User ${chatId} sent /start, welcome message sent`);
         return;
-      }
-
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
-      const isFirstVerification = userState.is_first_verification;
-      const isRateLimited = await checkMessageRate(chatId);
-
-      const latestState = await env.D1.prepare('SELECT is_verifying FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      const isVerifying = latestState?.is_verifying || false;
-
-      console.log(`User ${chatId} verification status: isVerified=${isVerified}, isFirstVerification=${isFirstVerification}, isRateLimited=${isRateLimited}, isVerifying=${isVerifying}`);
-
-      // 只有在验证码功能开启时才检查验证状态
-      if (verificationEnabled) {
-        if (!isVerified || (isRateLimited && !isFirstVerification)) {
-          if (isVerifying) {
-            await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
-            return;
-          }
-          await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
-          await handleVerification(chatId, messageId);
-          return;
-        }
       }
 
       try {
@@ -424,6 +409,7 @@ export default {
         if (!userInfo) {
           throw new Error(`Failed to fetch user info for chatId ${chatId}`);
         }
+        console.log(`User info for chatId ${chatId}: ${JSON.stringify(userInfo)}`);
 
         let topicId = await ensureUserTopic(chatId, userInfo);
         if (!topicId) {
@@ -730,14 +716,16 @@ export default {
           .run();
         if (key === 'verification_enabled') {
           settingsCache.set('verification_enabled', value === 'true');
-          // 当验证码功能关闭时，自动将所有用户的 is_verified 设置为 true
           if (value === 'false') {
             const nowSeconds = Math.floor(Date.now() / 1000);
             const verifiedExpiry = nowSeconds + 3600 * 24;
-            await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_verifying = ?, verification_code = NULL, code_expiry = NULL WHERE is_verified = ?')
+            await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_verifying = ?, verification_code = NULL, code_expiry = NULL, is_first_verification = ?')
               .bind(true, verifiedExpiry, false, false)
               .run();
-            console.log('Verification disabled, set all users to verified');
+            userStateCache.clear(); // 清除缓存，确保后续读取最新状态
+            console.log('Verification disabled, set all users to verified and cleared userStateCache');
+          } else {
+            console.log('Verification enabled, user states unchanged');
           }
         } else if (key === 'user_raw_enabled') {
           settingsCache.set('user_raw_enabled', value === 'true');
@@ -962,7 +950,9 @@ export default {
         userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
-        if (!userState) {
+       
+
+ if (!userState) {
           userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
         }
         userStateCache.set(chatId, userState);
