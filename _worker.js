@@ -35,10 +35,14 @@ class LRUCache {
     }
     this.cache.set(key, value);
   }
+  clear() {
+    this.cache.clear();
+  }
 }
 
 const userInfoCache = new LRUCache(1000);
 const topicIdCache = new LRUCache(1000);
+const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
 
 export default {
@@ -296,14 +300,18 @@ export default {
         return;
       }
 
-      const userState = await env.D1.prepare('SELECT is_blocked, is_verified, verified_expiry FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first() || { is_blocked: false, is_verified: false, verified_expiry: null };
-
-      if (!userState.is_blocked) {
-        await env.D1.prepare('INSERT OR IGNORE INTO user_states (chat_id, is_blocked, is_verified) VALUES (?, ?, ?)')
-          .bind(chatId, false, false)
-          .run();
+      let userState = userStateCache.get(chatId);
+      if (userState === undefined) {
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        if (!userState) {
+          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
+            .bind(chatId, false, true, false, false)
+            .run();
+        }
+        userStateCache.set(chatId, userState);
       }
 
       if (userState.is_blocked) {
@@ -312,10 +320,21 @@ export default {
       }
 
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-      if (verificationEnabled) {
+
+      if (!verificationEnabled) {
+        // 验证码关闭时，所有用户都可以直接发送消息
+      } else {
         const nowSeconds = Math.floor(Date.now() / 1000);
         const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
-        if (!isVerified) {
+        const isFirstVerification = userState.is_first_verification;
+        const isRateLimited = await checkMessageRate(chatId);
+        const isVerifying = userState.is_verifying || false;
+
+        if (!isVerified || (isRateLimited && !isFirstVerification)) {
+          if (isVerifying) {
+            await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
+            return;
+          }
           await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
           await handleVerification(chatId, messageId);
           return;
@@ -347,6 +366,17 @@ export default {
         return;
       }
 
+      const isTopicValid = await validateTopic(topicId);
+      if (!isTopicValid) {
+        await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
+        topicIdCache.set(chatId, undefined);
+        topicId = await ensureUserTopic(chatId, userInfo);
+        if (!topicId) {
+          await sendMessageToUser(chatId, "无法重新创建话题，请稍后再试或联系管理员。");
+          return;
+        }
+      }
+
       const userName = userInfo.username || `User_${chatId}`;
       const nickname = userInfo.nickname || userName;
 
@@ -355,6 +385,36 @@ export default {
         await sendMessageToTopic(topicId, formattedMessage);
       } else {
         await copyMessageToTopic(topicId, message);
+      }
+    }
+
+    async function validateTopic(topicId) {
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            message_thread_id: topicId,
+            text: "测试消息，用于验证话题有效性",
+            disable_notification: true
+          })
+        });
+        const data = await response.json();
+        if (data.ok) {
+          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: GROUP_ID,
+              message_id: data.result.message_id
+            })
+          });
+          return true;
+        }
+        return false;
+      } catch (error) {
+        return false;
       }
     }
 
@@ -410,6 +470,8 @@ export default {
         env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId),
         env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(targetChatId)
       ]);
+      userStateCache.set(targetChatId, undefined);
+      messageRateCache.set(targetChatId, undefined);
       topicIdCache.set(targetChatId, undefined);
       await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
     }
@@ -485,22 +547,63 @@ export default {
       if (data === undefined) {
         data = await env.D1.prepare('SELECT start_count, start_window_start FROM message_rates WHERE chat_id = ?')
           .bind(chatId)
-          .first() || { start_count: 0, start_window_start: now };
+          .first();
+        if (!data) {
+          data = { start_count: 0, start_window_start: now };
+          await env.D1.prepare('INSERT INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
+            .bind(chatId, data.start_count, data.start_window_start)
+            .run();
+        }
         messageRateCache.set(chatId, data);
       }
 
       if (now - data.start_window_start > window) {
         data.start_count = 1;
         data.start_window_start = now;
+        await env.D1.prepare('UPDATE message_rates SET start_count = ?, start_window_start = ? WHERE chat_id = ?')
+          .bind(data.start_count, data.start_window_start, chatId)
+          .run();
       } else {
         data.start_count += 1;
+        await env.D1.prepare('UPDATE message_rates SET start_count = ? WHERE chat_id = ?')
+          .bind(data.start_count, chatId)
+          .run();
       }
 
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
-        .bind(chatId, data.start_count, data.start_window_start)
-        .run();
       messageRateCache.set(chatId, data);
       return data.start_count > maxStartsPerWindow;
+    }
+
+    async function checkMessageRate(chatId) {
+      const now = Date.now();
+      const window = 60 * 1000;
+
+      let data = messageRateCache.get(chatId);
+      if (data === undefined) {
+        data = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        if (!data) {
+          data = { message_count: 0, window_start: now };
+          await env.D1.prepare('INSERT INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
+            .bind(chatId, data.message_count, data.window_start)
+            .run();
+        }
+        messageRateCache.set(chatId, data);
+      }
+
+      if (now - data.window_start > window) {
+        data.message_count = 1;
+        data.window_start = now;
+      } else {
+        data.message_count += 1;
+      }
+
+      messageRateCache.set(chatId, data);
+      await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
+        .bind(data.message_count, data.window_start, chatId)
+        .run();
+      return data.message_count > MAX_MESSAGES_PER_MINUTE;
     }
 
     async function getSetting(key, d1) {
@@ -519,9 +622,10 @@ export default {
         if (value === 'false') {
           const nowSeconds = Math.floor(Date.now() / 1000);
           const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL WHERE chat_id NOT IN (SELECT chat_id FROM user_states WHERE is_blocked = TRUE)')
-            .bind(true, verifiedExpiry)
+          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_verifying = ?, verification_code = NULL, code_expiry = NULL, is_first_verification = ? WHERE chat_id NOT IN (SELECT chat_id FROM user_states WHERE is_blocked = TRUE)')
+            .bind(true, verifiedExpiry, false, false)
             .run();
+          userStateCache.clear();
         }
       } else if (key === 'user_raw_enabled') {
         settingsCache.set('user_raw_enabled', value === 'true');
@@ -576,9 +680,16 @@ export default {
           return;
         }
 
-        const verificationState = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first() || { verification_code: null, code_expiry: null };
+        let verificationState = userStateCache.get(chatId);
+        if (verificationState === undefined) {
+          verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+            .bind(chatId)
+            .first();
+          if (!verificationState) {
+            verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
+          }
+          userStateCache.set(chatId, verificationState);
+        }
 
         const storedCode = verificationState.verification_code;
         const codeExpiry = verificationState.code_expiry;
@@ -586,9 +697,10 @@ export default {
 
         if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
           await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
-          await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL WHERE chat_id = ?')
+          await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
             .bind(chatId)
             .run();
+          userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
           await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -602,8 +714,22 @@ export default {
 
         if (result === 'correct') {
           const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL WHERE chat_id = ?')
-            .bind(true, verifiedExpiry, chatId)
+          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
+            .bind(true, verifiedExpiry, false, false, chatId)
+            .run();
+          verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_first_verification, is_verifying FROM user_states WHERE chat_id = ?')
+            .bind(chatId)
+            .first();
+          userStateCache.set(chatId, verificationState);
+
+          let rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
+            .bind(chatId)
+            .first() || { message_count: 0, window_start: nowSeconds * 1000 };
+          rateData.message_count = 0;
+          rateData.window_start = nowSeconds * 1000;
+          messageRateCache.set(chatId, rateData);
+          await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
+            .bind(0, nowSeconds * 1000, chatId)
             .run();
 
           const successMessage = await getVerificationSuccessMessage();
@@ -633,13 +759,30 @@ export default {
         }
 
         if (action === 'block') {
+          let state = userStateCache.get(privateChatId);
+          if (state === undefined) {
+            state = await env.D1.prepare('SELECT is_blocked FROM user_states WHERE chat_id = ?')
+              .bind(privateChatId)
+              .first() || { is_blocked: false };
+          }
+          state.is_blocked = true;
+          userStateCache.set(privateChatId, state);
           await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
             .bind(privateChatId, true)
             .run();
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
         } else if (action === 'unblock') {
-          await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)')
-            .bind(privateChatId, false)
+          let state = userStateCache.get(privateChatId);
+          if (state === undefined) {
+            state = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
+              .bind(privateChatId)
+              .first() || { is_blocked: false, is_first_verification: true };
+          }
+          state.is_blocked = false;
+          state.is_first_verification = true;
+          userStateCache.set(privateChatId, state);
+          await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
+            .bind(privateChatId, false, true)
             .run();
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
         } else if (action === 'toggle_verification') {
@@ -661,12 +804,14 @@ export default {
           await setSetting('user_raw_enabled', newState.toString());
           await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
         } else if (action === 'delete_user') {
+          userStateCache.set(privateChatId, undefined);
+          messageRateCache.set(privateChatId, undefined);
+          topicIdCache.set(privateChatId, undefined);
           await env.D1.batch([
             env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
             env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId),
             env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId)
           ]);
-          topicIdCache.set(privateChatId, undefined);
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
         } else {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
@@ -685,7 +830,26 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
-      const lastVerification = (await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
+      let userState = userStateCache.get(chatId);
+      if (userState === undefined) {
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        if (!userState) {
+          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+        }
+        userStateCache.set(chatId, userState);
+      }
+
+      userState.verification_code = null;
+      userState.code_expiry = null;
+      userState.is_verifying = true;
+      userStateCache.set(chatId, userState);
+      await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = ? WHERE chat_id = ?')
+        .bind(true, chatId)
+        .run();
+
+      const lastVerification = userState.last_verification_message_id || (await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first())?.last_verification_message_id;
 
@@ -698,6 +862,8 @@ export default {
             message_id: lastVerification
           })
         });
+        userState.last_verification_message_id = null;
+        userStateCache.set(chatId, userState);
         await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
           .bind(chatId)
           .run();
@@ -728,6 +894,17 @@ export default {
       const nowSeconds = Math.floor(Date.now() / 1000);
       const codeExpiry = nowSeconds + 300;
 
+      let userState = userStateCache.get(chatId);
+      if (userState === undefined) {
+        userState = { verification_code: correctResult.toString(), code_expiry: codeExpiry, last_verification_message_id: null, is_verifying: true };
+      } else {
+        userState.verification_code = correctResult.toString();
+        userState.code_expiry = codeExpiry;
+        userState.last_verification_message_id = null;
+        userState.is_verifying = true;
+      }
+      userStateCache.set(chatId, userState);
+
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -739,8 +916,10 @@ export default {
       });
       const data = await response.json();
       if (data.ok) {
-        await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ? WHERE chat_id = ?')
-          .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), chatId)
+        userState.last_verification_message_id = data.result.message_id.toString();
+        userStateCache.set(chatId, userState);
+        await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
+          .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
           .run();
       }
     }
