@@ -720,16 +720,20 @@ export default {
             return;
           }
 
-          let verificationState = userStateCache.get(chatId);
-          if (verificationState === undefined) {
-            verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-              .bind(chatId)
-              .first();
-            userStateCache.set(chatId, verificationState);
+          // 强制从数据库加载最新状态
+          let verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+            .bind(chatId)
+            .first();
+          if (!verificationState) {
+            verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
           }
-          const storedCode = verificationState?.verification_code;
-          const codeExpiry = verificationState?.code_expiry;
+          userStateCache.set(chatId, verificationState);
+          console.log(`Verify - chatId: ${chatId}, verificationState:`, verificationState); // 调试日志
+
+          const storedCode = verificationState.verification_code;
+          const codeExpiry = verificationState.code_expiry;
           const nowSeconds = Math.floor(Date.now() / 1000);
+          console.log(`Verify - storedCode: ${storedCode}, codeExpiry: ${codeExpiry}, nowSeconds: ${nowSeconds}`); // 调试日志
 
           if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
             await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
@@ -760,7 +764,7 @@ export default {
               .bind(true, verifiedExpiry, false, false, chatId)
               .run();
 
-            // 更新缓存状态
+            // 立即刷新缓存状态
             verificationState = {
               ...verificationState,
               is_verified: true,
@@ -773,13 +777,12 @@ export default {
             };
             userStateCache.set(chatId, verificationState);
 
-            let rateData = messageRateCache.get(chatId);
-            if (rateData) {
-              rateData.message_count = 0;
-              messageRateCache.set(chatId, rateData);
-            }
-            await env.D1.prepare('UPDATE message_rates SET message_count = 0 WHERE chat_id = ?')
-              .bind(chatId)
+            let rateData = messageRateCache.get(chatId) || { message_count: 0, window_start: nowSeconds * 1000 };
+            rateData.message_count = 0;
+            rateData.window_start = nowSeconds * 1000;
+            messageRateCache.set(chatId, rateData);
+            await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
+              .bind(0, nowSeconds * 1000, chatId)
               .run();
 
             const successMessage = await getVerificationSuccessMessage();
@@ -984,6 +987,7 @@ export default {
           await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
             .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
             .run();
+          console.log(`Verification sent for chatId ${chatId}, code: ${correctResult}, expiry: ${codeExpiry}`); // 调试日志
         }
       } catch (error) {
         console.error("Error sending verification message:", error);
