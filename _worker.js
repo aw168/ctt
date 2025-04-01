@@ -6,7 +6,7 @@ let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
 let isInitialized = false;
 const processedMessages = new Set();
-const processedCallbacks = new Set(); // 新增：记录已处理的回调
+const processedCallbacks = new Set();
 
 const settingsCache = new Map([
   ['verification_enabled', null],
@@ -35,7 +35,7 @@ class LRUCache {
   }
 }
 
-const userInfoCache = new LRUCache(1000); // 最大 1000 条
+const userInfoCache = new LRUCache(1000);
 const topicIdCache = new LRUCache(1000);
 const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
@@ -336,7 +336,6 @@ export default {
         return;
       }
 
-      // 强制从数据库获取最新状态，确保验证状态是最新的
       let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -346,7 +345,7 @@ export default {
           .run();
         userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false, verification_code: null, code_expiry: null };
       }
-      userStateCache.set(chatId, userState); // 更新缓存
+      userStateCache.set(chatId, userState);
 
       const isBlocked = userState.is_blocked || false;
       if (isBlocked) {
@@ -360,7 +359,9 @@ export default {
           return;
         }
 
-        const verificationEnabled = settingsCache.get('verification_enabled');
+        // 从数据库获取最新的 verification_enabled 状态
+        const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+        settingsCache.set('verification_enabled', verificationEnabled); // 同步缓存
         const isFirstVerification = userState.is_first_verification;
 
         if (verificationEnabled && isFirstVerification) {
@@ -373,13 +374,14 @@ export default {
         return;
       }
 
-      const verificationEnabled = settingsCache.get('verification_enabled');
+      // 从数据库获取最新的 verification_enabled 状态
+      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+      settingsCache.set('verification_enabled', verificationEnabled); // 同步缓存
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
       const isFirstVerification = userState.is_first_verification;
       const isRateLimited = await checkMessageRate(chatId);
 
-      // 从数据库重新获取最新状态，确保一致性
       userState = await env.D1.prepare('SELECT is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -479,7 +481,8 @@ export default {
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       try {
-        const verificationEnabled = settingsCache.get('verification_enabled');
+        const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+        settingsCache.set('verification_enabled', verificationEnabled); // 同步缓存
         const userRawEnabled = settingsCache.get('user_raw_enabled');
 
         const buttons = [
@@ -641,9 +644,8 @@ export default {
       const topicId = callbackQuery.message.message_thread_id;
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
-      const callbackKey = `${chatId}:${callbackQuery.id}`; // 唯一标识回调
+      const callbackKey = `${chatId}:${callbackQuery.id}`;
 
-      // 检查是否已处理过此回调
       if (processedCallbacks.has(callbackKey)) {
         return;
       }
@@ -686,14 +688,13 @@ export default {
             return;
           }
 
-          // 从数据库获取最新状态
           let verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
             .bind(chatId)
             .first();
           if (!verificationState) {
             verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
           }
-          userStateCache.set(chatId, verificationState); // 更新缓存
+          userStateCache.set(chatId, verificationState);
 
           const storedCode = verificationState.verification_code;
           const codeExpiry = verificationState.code_expiry;
@@ -720,7 +721,7 @@ export default {
           }
 
           if (result === 'correct' && selectedAnswer === storedCode) {
-            const verifiedExpiry = nowSeconds + 3600 * 24; // 24 小时有效
+            const verifiedExpiry = nowSeconds + 3600 * 24;
             await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
               .bind(true, verifiedExpiry, false, false, chatId)
               .run();
@@ -800,10 +801,11 @@ export default {
               .run();
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
           } else if (action === 'toggle_verification') {
-            const currentState = settingsCache.get('verification_enabled');
+            const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
             const newState = !currentState;
-            settingsCache.set('verification_enabled', newState);
             await setSetting('verification_enabled', newState.toString());
+            settingsCache.set('verification_enabled', newState); // 确保缓存同步
+            console.log(`Debug - Toggle Verification: newState=${newState}`);
             await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'check_blocklist') {
             const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
@@ -816,8 +818,8 @@ export default {
           } else if (action === 'toggle_user_raw') {
             const currentState = settingsCache.get('user_raw_enabled');
             const newState = !currentState;
-            settingsCache.set('user_raw_enabled', newState);
             await setSetting('user_raw_enabled', newState.toString());
+            settingsCache.set('user_raw_enabled', newState);
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
             try {
@@ -864,7 +866,6 @@ export default {
         userStateCache.set(chatId, userState);
       }
 
-      // 清理旧状态并设置为验证中
       userState.verification_code = null;
       userState.code_expiry = null;
       userState.is_verifying = true;
@@ -920,7 +921,7 @@ export default {
 
       const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const codeExpiry = nowSeconds + 300; // 5 分钟有效
+      const codeExpiry = nowSeconds + 300;
 
       let userState = userStateCache.get(chatId);
       if (userState === undefined) {
