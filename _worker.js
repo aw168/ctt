@@ -6,7 +6,7 @@ let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
 let isInitialized = false;
 const processedMessages = new Set();
-const processedCallbacks = new Set();
+const processedCallbacks = new Set(); // 新增：记录已处理的回调
 
 const settingsCache = new Map([
   ['verification_enabled', null],
@@ -35,7 +35,7 @@ class LRUCache {
   }
 }
 
-const userInfoCache = new LRUCache(1000);
+const userInfoCache = new LRUCache(1000); // 最大 1000 条
 const topicIdCache = new LRUCache(1000);
 const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
@@ -336,14 +336,15 @@ export default {
         return;
       }
 
-      let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
+      // 强制从数据库加载最新状态，避免缓存延迟
+      let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
       if (!userState) {
-        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying, verification_code, code_expiry) VALUES (?, ?, ?, ?, ?, ?, ?)')
-          .bind(chatId, false, true, false, false, null, null)
+        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
+          .bind(chatId, false, true, false, false)
           .run();
-        userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false, verification_code: null, code_expiry: null };
+        userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
       }
       userStateCache.set(chatId, userState);
 
@@ -359,11 +360,8 @@ export default {
           return;
         }
 
-        const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-        settingsCache.set('verification_enabled', verificationEnabled);
+        const verificationEnabled = settingsCache.get('verification_enabled');
         const isFirstVerification = userState.is_first_verification;
-
-        console.log(`Debug - /start: chatId=${chatId}, verificationEnabled=${verificationEnabled}, isFirstVerification=${isFirstVerification}`);
 
         if (verificationEnabled && isFirstVerification) {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
@@ -375,55 +373,59 @@ export default {
         return;
       }
 
-      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-      settingsCache.set('verification_enabled', verificationEnabled);
+      const verificationEnabled = settingsCache.get('verification_enabled');
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+      const isFirstVerification = userState.is_first_verification;
       const isRateLimited = await checkMessageRate(chatId);
 
-      console.log(`Debug - Message: chatId=${chatId}, verificationEnabled=${verificationEnabled}, isVerified=${isVerified}, isRateLimited=${isRateLimited}, verified_expiry=${userState.verified_expiry}`);
+      console.log(`onMessage - chatId: ${chatId}, isVerified: ${isVerified}, isRateLimited: ${isRateLimited}, isVerifying: ${userState.is_verifying}`); // 调试日志
 
-      if (verificationEnabled && (!isVerified || isRateLimited)) {
-        userState = await env.D1.prepare('SELECT is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        const isVerifying = userState?.is_verifying || false;
-        const storedCode = userState?.verification_code;
-        const codeExpiry = userState?.code_expiry;
+      // 从数据库重新获取最新状态，确保一致性
+      const latestState = await env.D1.prepare('SELECT is_verifying FROM user_states WHERE chat_id = ?')
+        .bind(chatId)
+        .first();
+      const isVerifying = latestState?.is_verifying || false;
 
+      if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
         if (isVerifying) {
-          if (storedCode && codeExpiry && nowSeconds > codeExpiry) {
-            await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
-            await handleVerification(chatId, messageId);
-            return;
-          }
           await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
           return;
         }
-        await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”${isRateLimited ? '（您发送消息过于频繁）' : ''}。`);
+        await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
         await handleVerification(chatId, messageId);
-        return;
-      }
-
-      if (isRateLimited) {
-        await sendMessageToUser(chatId, "您发送消息过于频繁，请稍后再试！");
-        return;
+        return; // 阻止未验证或限频用户的消息转发
       }
 
       try {
         const [userInfo] = await Promise.all([
           getUserInfo(chatId),
-          getExistingTopicId(chatId).then(topicId => topicId ? topicIdCache.set(chatId, topicId) : null)
+          getExistingTopicId(chatId).then(topicId => {
+            if (!topicId) {
+              console.log(`No topic found for chatId ${chatId}, creating new topic`);
+              return createForumTopic(
+                userInfo.nickname || `User_${chatId}`,
+                userInfo.username || `User_${chatId}`,
+                userInfo.nickname || `User_${chatId}`,
+                userInfo.id || chatId
+              ).then(newTopicId => {
+                topicIdCache.set(chatId, newTopicId);
+                saveTopicId(chatId, newTopicId);
+                return newTopicId;
+              });
+            }
+            topicIdCache.set(chatId, topicId);
+            return topicId;
+          })
         ]);
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
         let topicId = topicIdCache.get(chatId);
-        if (topicId === undefined) {
-          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
-          topicIdCache.set(chatId, topicId);
-          await saveTopicId(chatId, topicId);
+        if (!topicId) {
+          console.error(`TopicId still null for chatId ${chatId} after creation attempt, this should not happen`);
+          throw new Error(`Topic not found or created for chatId ${chatId}`);
         }
 
         try {
@@ -487,9 +489,9 @@ export default {
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       try {
+        // 强制从数据库加载最新设置
         const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-        settingsCache.set('verification_enabled', verificationEnabled);
-        const userRawEnabled = settingsCache.get('user_raw_enabled');
+        const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
 
         const buttons = [
           [
@@ -564,30 +566,45 @@ export default {
 
     async function checkStartCommandRate(chatId) {
       const now = Date.now();
-      const window = 5 * 60 * 1000;
+      const window = 5 * 60 * 1000; // 5 分钟窗口
       const maxStartsPerWindow = 1;
 
       let data = messageRateCache.get(chatId);
+      console.log(`Checking start rate for chatId ${chatId}, cached data:`, data); // 调试日志
       if (data === undefined) {
+        // 从数据库加载初始数据
         data = await env.D1.prepare('SELECT start_count, start_window_start FROM message_rates WHERE chat_id = ?')
           .bind(chatId)
-          .first() || { start_count: 0, start_window_start: now };
+          .first();
+        if (!data) {
+          data = { start_count: 0, start_window_start: now };
+          await env.D1.prepare('INSERT INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
+            .bind(chatId, data.start_count, data.start_window_start)
+            .run();
+        }
         messageRateCache.set(chatId, data);
+        console.log(`Initialized start rate data for chatId ${chatId}:`, data);
       }
 
       if (now - data.start_window_start > window) {
         data.start_count = 1;
         data.start_window_start = now;
+        await env.D1.prepare('UPDATE message_rates SET start_count = ?, start_window_start = ? WHERE chat_id = ?')
+          .bind(data.start_count, data.start_window_start, chatId)
+          .run();
+        console.log(`Reset start count for chatId ${chatId} due to new window:`, data);
       } else {
         data.start_count += 1;
+        await env.D1.prepare('UPDATE message_rates SET start_count = ? WHERE chat_id = ?')
+          .bind(data.start_count, chatId)
+          .run();
+        console.log(`Incremented start count for chatId ${chatId}:`, data);
       }
 
       messageRateCache.set(chatId, data);
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
-        .bind(chatId, data.start_count, data.start_window_start)
-        .run();
-
-      return data.start_count > maxStartsPerWindow;
+      const isRateLimited = data.start_count > maxStartsPerWindow;
+      console.log(`Start rate limit check for chatId ${chatId}: count=${data.start_count}, limited=${isRateLimited}`);
+      return isRateLimited;
     }
 
     async function checkMessageRate(chatId) {
@@ -598,7 +615,13 @@ export default {
       if (data === undefined) {
         data = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
           .bind(chatId)
-          .first() || { message_count: 0, window_start: now };
+          .first();
+        if (!data) {
+          data = { message_count: 0, window_start: now };
+          await env.D1.prepare('INSERT INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
+            .bind(chatId, data.message_count, data.window_start)
+            .run();
+        }
         messageRateCache.set(chatId, data);
       }
 
@@ -610,9 +633,10 @@ export default {
       }
 
       messageRateCache.set(chatId, data);
-      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
-        .bind(chatId, data.message_count, data.window_start)
+      await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
+        .bind(data.message_count, data.window_start, chatId)
         .run();
+      console.log(`Message rate check for chatId ${chatId}: count=${data.message_count}, window=${data.window_start}, limited=${data.message_count > MAX_MESSAGES_PER_MINUTE}`);
 
       return data.message_count > MAX_MESSAGES_PER_MINUTE;
     }
@@ -639,6 +663,7 @@ export default {
         } else if (key === 'user_raw_enabled') {
           settingsCache.set('user_raw_enabled', value === 'true');
         }
+        console.log(`Setting ${key} updated to ${value}, cache updated to ${value === 'true'}`);
       } catch (error) {
         console.error(`Error setting ${key} to ${value}:`, error);
         throw error;
@@ -650,8 +675,9 @@ export default {
       const topicId = callbackQuery.message.message_thread_id;
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
-      const callbackKey = `${chatId}:${callbackQuery.id}`;
+      const callbackKey = `${chatId}:${callbackQuery.id}`; // 唯一标识回调
 
+      // 检查是否已处理过此回调
       if (processedCallbacks.has(callbackKey)) {
         return;
       }
@@ -694,23 +720,24 @@ export default {
             return;
           }
 
-          let verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying, is_blocked FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          if (!verificationState) {
-            verificationState = { verification_code: null, code_expiry: null, is_verifying: false, is_blocked: false };
+          let verificationState = userStateCache.get(chatId);
+          if (verificationState === undefined) {
+            verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+              .bind(chatId)
+              .first();
+            userStateCache.set(chatId, verificationState);
           }
-          userStateCache.set(chatId, verificationState);
-
-          const storedCode = verificationState.verification_code;
-          const codeExpiry = verificationState.code_expiry;
+          const storedCode = verificationState?.verification_code;
+          const codeExpiry = verificationState?.code_expiry;
           const nowSeconds = Math.floor(Date.now() / 1000);
 
-          console.log(`Debug - Verification Check: chatId=${chatId}, storedCode=${storedCode}, codeExpiry=${codeExpiry}, nowSeconds=${nowSeconds}`);
-
-          if (!storedCode || !codeExpiry || nowSeconds > codeExpiry) {
+          if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
             await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
-            await handleVerification(chatId, messageId);
+            // 清理过期状态
+            await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
+              .bind(chatId)
+              .run();
+            userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
             try {
               await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
                 method: 'POST',
@@ -726,21 +753,23 @@ export default {
             return;
           }
 
-          if (result === 'correct' && selectedAnswer === storedCode) {
+          if (result === 'correct') {
             const verifiedExpiry = nowSeconds + 3600 * 24;
+            // 更新数据库状态
             await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
               .bind(true, verifiedExpiry, false, false, chatId)
               .run();
 
+            // 更新缓存状态
             verificationState = {
+              ...verificationState,
               is_verified: true,
               verified_expiry: verifiedExpiry,
               verification_code: null,
               code_expiry: null,
               last_verification_message_id: null,
               is_first_verification: false,
-              is_verifying: false,
-              is_blocked: verificationState.is_blocked || false
+              is_verifying: false
             };
             userStateCache.set(chatId, verificationState);
 
@@ -810,8 +839,6 @@ export default {
             const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
             const newState = !currentState;
             await setSetting('verification_enabled', newState.toString());
-            settingsCache.set('verification_enabled', newState);
-            console.log(`Debug - Toggle Verification: newState=${newState}`);
             await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'check_blocklist') {
             const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
@@ -822,10 +849,9 @@ export default {
               : '当前没有被拉黑的用户。';
             await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`);
           } else if (action === 'toggle_user_raw') {
-            const currentState = settingsCache.get('user_raw_enabled');
+            const currentState = (await getSetting('user_raw_enabled', env.D1)) === 'true';
             const newState = !currentState;
             await setSetting('user_raw_enabled', newState.toString());
-            settingsCache.set('user_raw_enabled', newState);
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
             try {
@@ -863,15 +889,16 @@ export default {
     async function handleVerification(chatId, messageId) {
       let userState = userStateCache.get(chatId);
       if (userState === undefined) {
-        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
         if (!userState) {
-          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false, verification_code: null, code_expiry: null };
+          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
         }
         userStateCache.set(chatId, userState);
       }
 
+      // 清理旧状态并设置为验证中
       userState.verification_code = null;
       userState.code_expiry = null;
       userState.is_verifying = true;
