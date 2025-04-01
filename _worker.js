@@ -414,7 +414,8 @@ export default {
                 return newTopicId;
               });
             }
-            topicIdCache.set(chatId, topicId);
+            console.log(`Reusing existing topic ${topicId} for chatId ${chatId}`);
+            topicIdCache.set(chatId, topicId); // 确保缓存同步
             return topicId;
           })
         ]);
@@ -424,8 +425,10 @@ export default {
 
         let topicId = topicIdCache.get(chatId);
         if (!topicId) {
-          console.error(`TopicId still null for chatId ${chatId} after creation attempt, this should not happen`);
-          throw new Error(`Topic not found or created for chatId ${chatId}`);
+          console.error(`TopicId still null for chatId ${chatId} after creation attempt, forcing recreation`);
+          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+          topicIdCache.set(chatId, topicId);
+          await saveTopicId(chatId, topicId);
         }
 
         try {
@@ -437,6 +440,7 @@ export default {
           }
         } catch (error) {
           if (error.message.includes('Request failed with status 400')) {
+            console.log(`Topic ${topicId} failed, recreating for chatId ${chatId}`);
             topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
             topicIdCache.set(chatId, topicId);
             await saveTopicId(chatId, topicId);
