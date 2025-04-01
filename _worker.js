@@ -8,6 +8,9 @@ let isInitialized = false;
 const processedMessages = new Set();
 const processedCallbacks = new Set();
 
+// 用于实现锁机制的 Map
+const topicCreationLocks = new Map();
+
 const settingsCache = new Map([
   ['verification_enabled', null],
   ['user_raw_enabled', null]
@@ -406,11 +409,9 @@ export default {
           throw new Error(`Failed to ensure topic for chatId ${chatId}`);
         }
 
-        // 验证 topicId 是否有效
         const isTopicValid = await validateTopic(topicId);
         if (!isTopicValid) {
           console.log(`Topic ${topicId} is invalid for chatId ${chatId}, recreating topic...`);
-          // 如果话题无效，删除旧记录并重新创建
           await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
           topicIdCache.set(chatId, undefined);
           topicId = await ensureUserTopic(chatId, userInfo);
@@ -440,7 +441,6 @@ export default {
       }
     }
 
-    // 新增函数：验证话题是否有效
     async function validateTopic(topicId) {
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -455,7 +455,6 @@ export default {
         });
         const data = await response.json();
         if (data.ok) {
-          // 如果消息发送成功，删除测试消息
           await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -474,14 +473,46 @@ export default {
     }
 
     async function ensureUserTopic(chatId, userInfo) {
-      let topicId = await getExistingTopicId(chatId);
-      if (!topicId) {
-        const userName = userInfo.username || `User_${chatId}`;
-        const nickname = userInfo.nickname || userName;
-        topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
-        await saveTopicId(chatId, topicId);
+      // 为 chatId 创建锁
+      let lock = topicCreationLocks.get(chatId);
+      if (!lock) {
+        lock = Promise.resolve();
+        topicCreationLocks.set(chatId, lock);
       }
-      return topicId;
+
+      try {
+        // 等待锁释放
+        await lock;
+
+        // 再次检查 topicId，确保没有其他并发请求已经创建了话题
+        let topicId = await getExistingTopicId(chatId);
+        if (topicId) {
+          console.log(`Topic ${topicId} already exists for chatId ${chatId}, using existing topic.`);
+          return topicId;
+        }
+
+        // 创建新锁，防止其他并发请求进入
+        const newLock = (async () => {
+          console.log(`Creating new topic for chatId ${chatId}...`);
+          const userName = userInfo.username || `User_${chatId}`;
+          const nickname = userInfo.nickname || userName;
+          topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
+          await saveTopicId(chatId, topicId);
+          console.log(`Created topic ${topicId} for chatId ${chatId}`);
+          return topicId;
+        })();
+
+        topicCreationLocks.set(chatId, newLock);
+        return await newLock;
+      } catch (error) {
+        console.error(`Error ensuring topic for chatId ${chatId}:`, error);
+        throw error;
+      } finally {
+        // 清理锁
+        if (topicCreationLocks.get(chatId) === lock) {
+          topicCreationLocks.delete(chatId);
+        }
+      }
     }
 
     async function handleResetUser(chatId, topicId, text) {
@@ -502,10 +533,12 @@ export default {
       try {
         await env.D1.batch([
           env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId),
-          env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId)
+          env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId),
+          env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(targetChatId)
         ]);
         userStateCache.set(targetChatId, undefined);
         messageRateCache.set(targetChatId, undefined);
+        topicIdCache.set(targetChatId, undefined);
         await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
       } catch (error) {
         console.error(`Error resetting user ${targetChatId}:`, error);
@@ -1059,13 +1092,27 @@ export default {
 
     async function getExistingTopicId(chatId) {
       let topicId = topicIdCache.get(chatId);
-      if (topicId === undefined) {
-        topicId = (await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-          .bind(chatId)
-          .first())?.topic_id || null;
-        if (topicId) topicIdCache.set(chatId, topicId);
+      if (topicId !== undefined) {
+        console.log(`Found topicId ${topicId} in cache for chatId ${chatId}`);
+        return topicId;
       }
-      return topicId;
+
+      try {
+        const result = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        topicId = result?.topic_id || null;
+        if (topicId) {
+          console.log(`Found topicId ${topicId} in database for chatId ${chatId}`);
+          topicIdCache.set(chatId, topicId);
+        } else {
+          console.log(`No topicId found in database for chatId ${chatId}`);
+        }
+        return topicId;
+      } catch (error) {
+        console.error(`Error fetching topicId for chatId ${chatId} from database:`, error);
+        return null;
+      }
     }
 
     async function createForumTopic(topicName, userName, nickname, userId) {
@@ -1095,13 +1142,14 @@ export default {
     }
 
     async function saveTopicId(chatId, topicId) {
-      topicIdCache.set(chatId, topicId);
       try {
         await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
           .bind(chatId, topicId)
           .run();
+        topicIdCache.set(chatId, topicId);
+        console.log(`Saved topicId ${topicId} for chatId ${chatId} to database and cache`);
       } catch (error) {
-        console.error(`Error saving topic ID ${topicId} for chatId ${chatId}:`, error);
+        console.error(`Error saving topicId ${topicId} for chatId ${chatId}:`, error);
         throw error;
       }
     }
