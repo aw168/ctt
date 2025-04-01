@@ -337,14 +337,14 @@ export default {
       }
 
       // 强制从数据库获取最新状态，确保验证状态是最新的
-      let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+      let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
       if (!userState) {
-        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
-          .bind(chatId, false, true, false, false)
+        await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying, verification_code, code_expiry) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .bind(chatId, false, true, false, false, null, null)
           .run();
-        userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+        userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false, verification_code: null, code_expiry: null };
       }
       userStateCache.set(chatId, userState); // 更新缓存
 
@@ -380,13 +380,20 @@ export default {
       const isRateLimited = await checkMessageRate(chatId);
 
       // 从数据库重新获取最新状态，确保一致性
-      userState = await env.D1.prepare('SELECT is_verifying FROM user_states WHERE chat_id = ?')
+      userState = await env.D1.prepare('SELECT is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
       const isVerifying = userState?.is_verifying || false;
+      const storedCode = userState?.verification_code;
+      const codeExpiry = userState?.code_expiry;
 
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
         if (isVerifying) {
+          if (storedCode && codeExpiry && nowSeconds > codeExpiry) {
+            await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
+            await handleVerification(chatId, messageId);
+            return;
+          }
           await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
           return;
         }
@@ -679,24 +686,24 @@ export default {
             return;
           }
 
-          let verificationState = userStateCache.get(chatId);
-          if (verificationState === undefined) {
-            verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-              .bind(chatId)
-              .first();
-            userStateCache.set(chatId, verificationState);
+          // 从数据库获取最新状态
+          let verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+            .bind(chatId)
+            .first();
+          if (!verificationState) {
+            verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
           }
-          const storedCode = verificationState?.verification_code;
-          const codeExpiry = verificationState?.code_expiry;
+          userStateCache.set(chatId, verificationState); // 更新缓存
+
+          const storedCode = verificationState.verification_code;
+          const codeExpiry = verificationState.code_expiry;
           const nowSeconds = Math.floor(Date.now() / 1000);
 
-          if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
+          console.log(`Debug - Verification Check: chatId=${chatId}, storedCode=${storedCode}, codeExpiry=${codeExpiry}, nowSeconds=${nowSeconds}`);
+
+          if (!storedCode || !codeExpiry || nowSeconds > codeExpiry) {
             await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
-            // 清理过期状态
-            await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
-              .bind(chatId)
-              .run();
-            userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
+            await handleVerification(chatId, messageId);
             try {
               await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
                 method: 'POST',
@@ -712,14 +719,12 @@ export default {
             return;
           }
 
-          if (result === 'correct') {
-            const verifiedExpiry = nowSeconds + 3600 * 24;
-            // 更新数据库状态
+          if (result === 'correct' && selectedAnswer === storedCode) {
+            const verifiedExpiry = nowSeconds + 3600 * 24; // 24 小时有效
             await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
               .bind(true, verifiedExpiry, false, false, chatId)
               .run();
 
-            // 立即更新缓存状态
             verificationState = {
               is_verified: true,
               verified_expiry: verifiedExpiry,
@@ -850,11 +855,11 @@ export default {
     async function handleVerification(chatId, messageId) {
       let userState = userStateCache.get(chatId);
       if (userState === undefined) {
-        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
         if (!userState) {
-          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false, verification_code: null, code_expiry: null };
         }
         userStateCache.set(chatId, userState);
       }
@@ -915,7 +920,7 @@ export default {
 
       const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const codeExpiry = nowSeconds + 300;
+      const codeExpiry = nowSeconds + 300; // 5 分钟有效
 
       let userState = userStateCache.get(chatId);
       if (userState === undefined) {
