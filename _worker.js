@@ -368,7 +368,8 @@ export default {
         } else {
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
-          await ensureUserTopic(chatId);
+          const userInfo = await getUserInfo(chatId);
+          await ensureUserTopic(chatId, userInfo);
         }
         return;
       }
@@ -395,16 +396,27 @@ export default {
       }
 
       try {
-        // 先获取用户信息
         const userInfo = await getUserInfo(chatId);
         if (!userInfo) {
           throw new Error(`Failed to fetch user info for chatId ${chatId}`);
         }
 
-        // 确保话题存在
-        const topicId = await ensureUserTopic(chatId, userInfo);
+        let topicId = await ensureUserTopic(chatId, userInfo);
         if (!topicId) {
           throw new Error(`Failed to ensure topic for chatId ${chatId}`);
+        }
+
+        // 验证 topicId 是否有效
+        const isTopicValid = await validateTopic(topicId);
+        if (!isTopicValid) {
+          console.log(`Topic ${topicId} is invalid for chatId ${chatId}, recreating topic...`);
+          // 如果话题无效，删除旧记录并重新创建
+          await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
+          topicIdCache.set(chatId, undefined);
+          topicId = await ensureUserTopic(chatId, userInfo);
+          if (!topicId) {
+            throw new Error(`Failed to recreate topic for chatId ${chatId}`);
+          }
         }
 
         const userName = userInfo.username || `User_${chatId}`;
@@ -425,6 +437,39 @@ export default {
         console.error(`Error handling message from chatId ${chatId}:`, error);
         await sendMessageToTopic(null, `无法转发用户 ${chatId} 的消息：${error.message}`);
         await sendMessageToUser(chatId, "消息转发失败，请稍后再试或联系管理员。");
+      }
+    }
+
+    // 新增函数：验证话题是否有效
+    async function validateTopic(topicId) {
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            message_thread_id: topicId,
+            text: "测试消息，用于验证话题有效性",
+            disable_notification: true
+          })
+        });
+        const data = await response.json();
+        if (data.ok) {
+          // 如果消息发送成功，删除测试消息
+          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: GROUP_ID,
+              message_id: data.result.message_id
+            })
+          });
+          return true;
+        }
+        return false;
+      } catch (error) {
+        console.error(`Error validating topic ${topicId}:`, error);
+        return false;
       }
     }
 
@@ -1092,7 +1137,7 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          throw new Error(`Failed to send message to topic: ${data.description}`);
+          throw new Error(`Failed to send message to topic ${topicId}: ${data.description}`);
         }
         return data;
       } catch (error) {
@@ -1117,7 +1162,7 @@ export default {
         });
         const data = await response.json();
         if (!data.ok) {
-          throw new Error(`Failed to copy message to topic: ${data.description}`);
+          throw new Error(`Failed to copy message to topic ${topicId}: ${data.description}`);
         }
       } catch (error) {
         console.error(`Error copying message to topic ${topicId}:`, error);
@@ -1205,7 +1250,7 @@ export default {
             await new Promise(resolve => setTimeout(resolve, delay));
             continue;
           }
-          throw new Error(`Request failed with status ${response.status}`);
+          throw new Error(`Request failed with status ${response.status}: ${await response.text()}`);
         } catch (error) {
           if (i === retries - 1) throw error;
           await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
