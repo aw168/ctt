@@ -336,7 +336,7 @@ export default {
         return;
       }
 
-      // 强制从数据库加载最新状态，避免缓存延迟
+      // 强制从数据库获取最新状态，确保验证状态是最新的
       let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -346,7 +346,7 @@ export default {
           .run();
         userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
       }
-      userStateCache.set(chatId, userState);
+      userStateCache.set(chatId, userState); // 更新缓存
 
       const isBlocked = userState.is_blocked || false;
       if (isBlocked) {
@@ -379,13 +379,11 @@ export default {
       const isFirstVerification = userState.is_first_verification;
       const isRateLimited = await checkMessageRate(chatId);
 
-      console.log(`onMessage - chatId: ${chatId}, isVerified: ${isVerified}, isRateLimited: ${isRateLimited}, isVerifying: ${userState.is_verifying}`); // 调试日志
-
       // 从数据库重新获取最新状态，确保一致性
-      const latestState = await env.D1.prepare('SELECT is_verifying FROM user_states WHERE chat_id = ?')
+      userState = await env.D1.prepare('SELECT is_verifying FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
-      const isVerifying = latestState?.is_verifying || false;
+      const isVerifying = userState?.is_verifying || false;
 
       if (verificationEnabled && (!isVerified || (isRateLimited && !isFirstVerification))) {
         if (isVerifying) {
@@ -394,38 +392,23 @@ export default {
         }
         await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
         await handleVerification(chatId, messageId);
-        return; // 阻止未验证或限频用户的消息转发
+        return;
       }
 
       try {
         const [userInfo] = await Promise.all([
           getUserInfo(chatId),
-          getExistingTopicId(chatId).then(topicId => {
-            if (!topicId) {
-              console.log(`No topic found for chatId ${chatId}, creating new topic`);
-              return createForumTopic(
-                userInfo.nickname || `User_${chatId}`,
-                userInfo.username || `User_${chatId}`,
-                userInfo.nickname || `User_${chatId}`,
-                userInfo.id || chatId
-              ).then(newTopicId => {
-                topicIdCache.set(chatId, newTopicId);
-                saveTopicId(chatId, newTopicId);
-                return newTopicId;
-              });
-            }
-            topicIdCache.set(chatId, topicId);
-            return topicId;
-          })
+          getExistingTopicId(chatId).then(topicId => topicId ? topicIdCache.set(chatId, topicId) : null)
         ]);
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
         const topicName = nickname;
 
         let topicId = topicIdCache.get(chatId);
-        if (!topicId) {
-          console.error(`TopicId still null for chatId ${chatId} after creation attempt, this should not happen`);
-          throw new Error(`Topic not found or created for chatId ${chatId}`);
+        if (topicId === undefined) {
+          topicId = await createForumTopic(topicName, userName, nickname, userInfo.id || chatId);
+          topicIdCache.set(chatId, topicId);
+          await saveTopicId(chatId, topicId);
         }
 
         try {
@@ -489,9 +472,8 @@ export default {
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       try {
-        // 强制从数据库加载最新设置
-        const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-        const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
+        const verificationEnabled = settingsCache.get('verification_enabled');
+        const userRawEnabled = settingsCache.get('user_raw_enabled');
 
         const buttons = [
           [
@@ -566,45 +548,30 @@ export default {
 
     async function checkStartCommandRate(chatId) {
       const now = Date.now();
-      const window = 5 * 60 * 1000; // 5 分钟窗口
+      const window = 5 * 60 * 1000;
       const maxStartsPerWindow = 1;
 
       let data = messageRateCache.get(chatId);
-      console.log(`Checking start rate for chatId ${chatId}, cached data:`, data); // 调试日志
       if (data === undefined) {
-        // 从数据库加载初始数据
         data = await env.D1.prepare('SELECT start_count, start_window_start FROM message_rates WHERE chat_id = ?')
           .bind(chatId)
-          .first();
-        if (!data) {
-          data = { start_count: 0, start_window_start: now };
-          await env.D1.prepare('INSERT INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
-            .bind(chatId, data.start_count, data.start_window_start)
-            .run();
-        }
+          .first() || { start_count: 0, start_window_start: now };
         messageRateCache.set(chatId, data);
-        console.log(`Initialized start rate data for chatId ${chatId}:`, data);
       }
 
       if (now - data.start_window_start > window) {
         data.start_count = 1;
         data.start_window_start = now;
-        await env.D1.prepare('UPDATE message_rates SET start_count = ?, start_window_start = ? WHERE chat_id = ?')
-          .bind(data.start_count, data.start_window_start, chatId)
-          .run();
-        console.log(`Reset start count for chatId ${chatId} due to new window:`, data);
       } else {
         data.start_count += 1;
-        await env.D1.prepare('UPDATE message_rates SET start_count = ? WHERE chat_id = ?')
-          .bind(data.start_count, chatId)
-          .run();
-        console.log(`Incremented start count for chatId ${chatId}:`, data);
       }
 
       messageRateCache.set(chatId, data);
-      const isRateLimited = data.start_count > maxStartsPerWindow;
-      console.log(`Start rate limit check for chatId ${chatId}: count=${data.start_count}, limited=${isRateLimited}`);
-      return isRateLimited;
+      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, start_count, start_window_start) VALUES (?, ?, ?)')
+        .bind(chatId, data.start_count, data.start_window_start)
+        .run();
+
+      return data.start_count > maxStartsPerWindow;
     }
 
     async function checkMessageRate(chatId) {
@@ -615,13 +582,7 @@ export default {
       if (data === undefined) {
         data = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
           .bind(chatId)
-          .first();
-        if (!data) {
-          data = { message_count: 0, window_start: now };
-          await env.D1.prepare('INSERT INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
-            .bind(chatId, data.message_count, data.window_start)
-            .run();
-        }
+          .first() || { message_count: 0, window_start: now };
         messageRateCache.set(chatId, data);
       }
 
@@ -633,10 +594,9 @@ export default {
       }
 
       messageRateCache.set(chatId, data);
-      await env.D1.prepare('UPDATE message_rates SET message_count = ?, window_start = ? WHERE chat_id = ?')
-        .bind(data.message_count, data.window_start, chatId)
+      await env.D1.prepare('INSERT OR REPLACE INTO message_rates (chat_id, message_count, window_start) VALUES (?, ?, ?)')
+        .bind(chatId, data.message_count, data.window_start)
         .run();
-      console.log(`Message rate check for chatId ${chatId}: count=${data.message_count}, window=${data.window_start}, limited=${data.message_count > MAX_MESSAGES_PER_MINUTE}`);
 
       return data.message_count > MAX_MESSAGES_PER_MINUTE;
     }
@@ -663,7 +623,6 @@ export default {
         } else if (key === 'user_raw_enabled') {
           settingsCache.set('user_raw_enabled', value === 'true');
         }
-        console.log(`Setting ${key} updated to ${value}, cache updated to ${value === 'true'}`);
       } catch (error) {
         console.error(`Error setting ${key} to ${value}:`, error);
         throw error;
@@ -760,16 +719,16 @@ export default {
               .bind(true, verifiedExpiry, false, false, chatId)
               .run();
 
-            // 更新缓存状态
+            // 立即更新缓存状态
             verificationState = {
-              ...verificationState,
               is_verified: true,
               verified_expiry: verifiedExpiry,
               verification_code: null,
               code_expiry: null,
               last_verification_message_id: null,
               is_first_verification: false,
-              is_verifying: false
+              is_verifying: false,
+              is_blocked: verificationState?.is_blocked || false
             };
             userStateCache.set(chatId, verificationState);
 
@@ -836,8 +795,9 @@ export default {
               .run();
             await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
           } else if (action === 'toggle_verification') {
-            const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
+            const currentState = settingsCache.get('verification_enabled');
             const newState = !currentState;
+            settingsCache.set('verification_enabled', newState);
             await setSetting('verification_enabled', newState.toString());
             await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'check_blocklist') {
@@ -849,8 +809,9 @@ export default {
               : '当前没有被拉黑的用户。';
             await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`);
           } else if (action === 'toggle_user_raw') {
-            const currentState = (await getSetting('user_raw_enabled', env.D1)) === 'true';
+            const currentState = settingsCache.get('user_raw_enabled');
             const newState = !currentState;
+            settingsCache.set('user_raw_enabled', newState);
             await setSetting('user_raw_enabled', newState.toString());
             await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
           } else if (action === 'delete_user') {
