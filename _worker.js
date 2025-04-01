@@ -36,6 +36,11 @@ class LRUCache {
     }
     this.cache.set(key, value);
   }
+  // 确保 clear 方法存在，用于清空缓存
+  clear() {
+    this.cache.clear();
+    console.log('LRUCache cleared');
+  }
 }
 
 const userInfoCache = new LRUCache(1000);
@@ -568,7 +573,9 @@ export default {
             { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
           ],
           [
-            { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
+            { text: userRawEnabled ? '关闭用户Raw' : '开启
+
+用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
             { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
           ],
           [
@@ -722,8 +729,13 @@ export default {
             await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_verifying = ?, verification_code = NULL, code_expiry = NULL, is_first_verification = ?')
               .bind(true, verifiedExpiry, false, false)
               .run();
-            userStateCache.clear(); // 清除缓存，确保后续读取最新状态
-            console.log('Verification disabled, set all users to verified and cleared userStateCache');
+            try {
+              userStateCache.clear(); // 调用 clear 方法
+            } catch (error) {
+              console.error('Error clearing userStateCache:', error);
+              // 如果 clear 失败，仍然继续执行后续逻辑
+            }
+            console.log('Verification disabled, set all users to verified and attempted to clear userStateCache');
           } else {
             console.log('Verification enabled, user states unchanged');
           }
@@ -950,9 +962,7 @@ export default {
         userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
-       
-
- if (!userState) {
+        if (!userState) {
           userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
         }
         userStateCache.set(chatId, userState);
