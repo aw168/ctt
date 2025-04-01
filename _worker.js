@@ -463,9 +463,12 @@ export default {
               message_id: data.result.message_id
             })
           });
+          console.log(`Topic ${topicId} is valid`);
           return true;
+        } else {
+          console.log(`Topic ${topicId} is invalid: ${data.description}`);
+          return false;
         }
-        return false;
       } catch (error) {
         console.error(`Error validating topic ${topicId}:`, error);
         return false;
@@ -473,7 +476,6 @@ export default {
     }
 
     async function ensureUserTopic(chatId, userInfo) {
-      // 为 chatId 创建锁
       let lock = topicCreationLocks.get(chatId);
       if (!lock) {
         lock = Promise.resolve();
@@ -481,17 +483,14 @@ export default {
       }
 
       try {
-        // 等待锁释放
         await lock;
 
-        // 再次检查 topicId，确保没有其他并发请求已经创建了话题
-        let topicId = await getExistingTopicId(chatId);
+        let topicId = await getExistingTopicId(chatId, 3, 1000); // 重试 3 次，每次间隔 1 秒
         if (topicId) {
           console.log(`Topic ${topicId} already exists for chatId ${chatId}, using existing topic.`);
           return topicId;
         }
 
-        // 创建新锁，防止其他并发请求进入
         const newLock = (async () => {
           console.log(`Creating new topic for chatId ${chatId}...`);
           const userName = userInfo.username || `User_${chatId}`;
@@ -508,7 +507,6 @@ export default {
         console.error(`Error ensuring topic for chatId ${chatId}:`, error);
         throw error;
       } finally {
-        // 清理锁
         if (topicCreationLocks.get(chatId) === lock) {
           topicCreationLocks.delete(chatId);
         }
@@ -1090,29 +1088,38 @@ export default {
       return userInfo;
     }
 
-    async function getExistingTopicId(chatId) {
+    async function getExistingTopicId(chatId, retries = 3, delay = 1000) {
       let topicId = topicIdCache.get(chatId);
       if (topicId !== undefined) {
         console.log(`Found topicId ${topicId} in cache for chatId ${chatId}`);
         return topicId;
       }
 
-      try {
-        const result = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        topicId = result?.topic_id || null;
-        if (topicId) {
-          console.log(`Found topicId ${topicId} in database for chatId ${chatId}`);
-          topicIdCache.set(chatId, topicId);
-        } else {
-          console.log(`No topicId found in database for chatId ${chatId}`);
+      for (let i = 0; i < retries; i++) {
+        try {
+          const result = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
+            .bind(chatId)
+            .first();
+          topicId = result?.topic_id || null;
+          if (topicId) {
+            console.log(`Found topicId ${topicId} in database for chatId ${chatId} on attempt ${i + 1}`);
+            topicIdCache.set(chatId, topicId);
+            return topicId;
+          } else {
+            console.log(`No topicId found in database for chatId ${chatId} on attempt ${i + 1}`);
+          }
+        } catch (error) {
+          console.error(`Error fetching topicId for chatId ${chatId} from database on attempt ${i + 1}:`, error);
         }
-        return topicId;
-      } catch (error) {
-        console.error(`Error fetching topicId for chatId ${chatId} from database:`, error);
-        return null;
+
+        if (i < retries - 1) {
+          console.log(`Retrying to fetch topicId for chatId ${chatId} after ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
+
+      console.log(`Failed to fetch topicId for chatId ${chatId} after ${retries} attempts`);
+      return null;
     }
 
     async function createForumTopic(topicName, userName, nickname, userId) {
@@ -1120,7 +1127,7 @@ export default {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: GROUP_ID, name: topicName })
+          body: JSON.stringify({ chat_id: GROUP_ID, name: `CTTBOT: ${nickname}` })
         });
         const data = await response.json();
         if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
