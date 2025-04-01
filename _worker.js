@@ -336,7 +336,6 @@ export default {
         return;
       }
 
-      // 从数据库获取最新状态
       let userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
         .bind(chatId)
         .first();
@@ -364,6 +363,8 @@ export default {
         settingsCache.set('verification_enabled', verificationEnabled);
         const isFirstVerification = userState.is_first_verification;
 
+        console.log(`Debug - /start: chatId=${chatId}, verificationEnabled=${verificationEnabled}, isFirstVerification=${isFirstVerification}`);
+
         if (verificationEnabled && isFirstVerification) {
           await sendMessageToUser(chatId, "你好，欢迎使用私聊机器人，请完成验证以开始使用！");
           await handleVerification(chatId, messageId);
@@ -379,7 +380,8 @@ export default {
       const nowSeconds = Math.floor(Date.now() / 1000);
       const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
 
-      // 只在用户未验证且验证码启用时要求验证
+      console.log(`Debug - Message: chatId=${chatId}, verificationEnabled=${verificationEnabled}, isVerified=${isVerified}, verified_expiry=${userState.verified_expiry}`);
+
       if (verificationEnabled && !isVerified) {
         userState = await env.D1.prepare('SELECT is_verifying, verification_code, code_expiry FROM user_states WHERE chat_id = ?')
           .bind(chatId)
@@ -402,7 +404,6 @@ export default {
         return;
       }
 
-      // 检查消息速率限制，但不触发验证
       const isRateLimited = await checkMessageRate(chatId);
       if (isRateLimited) {
         await sendMessageToUser(chatId, "您发送消息过于频繁，请稍后再试！");
@@ -726,12 +727,11 @@ export default {
           }
 
           if (result === 'correct' && selectedAnswer === storedCode) {
-            const verifiedExpiry = nowSeconds + 3600 * 24; // 24小时有效期
+            const verifiedExpiry = nowSeconds + 3600 * 24;
             await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
               .bind(true, verifiedExpiry, false, false, chatId)
               .run();
 
-            // 更新缓存，确保状态一致
             verificationState = {
               is_verified: true,
               verified_expiry: verifiedExpiry,
