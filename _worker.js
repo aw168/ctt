@@ -332,10 +332,41 @@ export default {
 
         if (!isVerified || (isRateLimited && !isFirstVerification)) {
           if (isVerifying) {
-            await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
+            // 检查验证码是否已过期
+            const storedCode = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
+              .bind(chatId)
+              .first();
+            
+            const nowSeconds = Math.floor(Date.now() / 1000);
+            const isCodeExpired = !storedCode?.verification_code || !storedCode?.code_expiry || nowSeconds > storedCode.code_expiry;
+            
+            if (isCodeExpired) {
+              // 如果验证码已过期，重新发送验证码
+              await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
+              await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
+                .bind(chatId)
+                .run();
+              userStateCache.set(chatId, { ...userState, verification_code: null, code_expiry: null, is_verifying: false });
+              
+              // 删除旧的验证消息
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  message_id: messageId
+                })
+              });
+              
+              // 立即发送新的验证码
+              await handleVerification(chatId, 0);
+              return;
+            } else {
+              await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
+            }
             return;
           }
-          await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
+          await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
           await handleVerification(chatId, messageId);
           return;
         }
@@ -696,11 +727,13 @@ export default {
         const nowSeconds = Math.floor(Date.now() / 1000);
 
         if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
-          await sendMessageToUser(chatId, '验证码已过期，请重新发送消息以获取新验证码。');
+          await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
           await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
             .bind(chatId)
             .run();
           userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
+          
+          // 删除旧的验证消息
           await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -709,6 +742,9 @@ export default {
               message_id: messageId
             })
           });
+          
+          // 立即发送新的验证码
+          await handleVerification(chatId, 0);
           return;
         }
 
@@ -991,7 +1027,7 @@ export default {
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: GROUP_ID, name: `CTTBOT: ${nickname}` })
+        body: JSON.stringify({ chat_id: GROUP_ID, name: `${nickname}` })
       });
       const data = await response.json();
       if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
