@@ -302,11 +302,11 @@ export default {
 
       let userState = userStateCache.get(chatId);
       if (userState === undefined) {
-        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, verification_code, code_expiry, last_verification_message_id FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
         if (!userState) {
-          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false, verification_code: null, code_expiry: null, last_verification_message_id: null };
           await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
             .bind(chatId, false, true, false, false)
             .run();
@@ -321,22 +321,75 @@ export default {
 
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
 
-      if (!verificationEnabled) {
-        // 验证码关闭时，所有用户都可以直接发送消息
-      } else {
+      if (verificationEnabled) {
         const nowSeconds = Math.floor(Date.now() / 1000);
+
+        if (userState.is_verifying === undefined || userState.code_expiry === undefined || userState.verification_code === undefined) {
+             const dbUserState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, verification_code, code_expiry, last_verification_message_id FROM user_states WHERE chat_id = ?')
+               .bind(chatId)
+               .first();
+             if (dbUserState) {
+                userState = { ...userState, ...dbUserState };
+                userStateCache.set(chatId, userState);
+             }
+        }
+
         const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
         const isFirstVerification = userState.is_first_verification;
         const isRateLimited = await checkMessageRate(chatId);
         const isVerifying = userState.is_verifying || false;
+        const verificationExpired = isVerifying && userState.code_expiry && nowSeconds > userState.code_expiry;
 
-        if (!isVerified || (isRateLimited && !isFirstVerification)) {
-          if (isVerifying) {
-            await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
-            return;
+        const needsVerification = !isVerified || (isRateLimited && !isFirstVerification);
+
+        if (needsVerification) {
+          if (isVerifying && !verificationExpired) {
+            let reminderMessage = `请先完成当前的验证。`;
+            if(userState.last_verification_message_id){
+              try {
+                 const checkMsgResponse = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                          chat_id: chatId,
+                          from_chat_id: chatId,
+                          message_id: userState.last_verification_message_id,
+                          disable_notification: true
+                      })
+                 });
+                 const checkMsgData = await checkMsgResponse.json();
+                 if (checkMsgData.ok) {
+                     await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+                         method: 'POST',
+                         headers: { 'Content-Type': 'application/json' },
+                         body: JSON.stringify({
+                             chat_id: chatId,
+                             message_id: checkMsgData.result.message_id
+                         })
+                     });
+                 } else if (checkMsgData.error_code === 400 && checkMsgData.description.includes("message to forward not found")) {
+                      reminderMessage = `之前的验证消息似乎已丢失，正在为您发送新的验证...`;
+                      await sendMessageToUser(chatId, reminderMessage);
+                      await handleVerification(chatId, messageId);
+                      return;
+                 }
+              } catch(e) {
+                 console.error("Error checking verification message existence:", e);
+                 reminderMessage = `检查验证状态时出错，正在为您发送新的验证...`;
+                 await sendMessageToUser(chatId, reminderMessage);
+                 await handleVerification(chatId, messageId);
+                 return;
+              }
+            }
+            await sendMessageToUser(chatId, reminderMessage + `请点击之前的验证消息中的按钮完成操作。`);
+
+          } else {
+            const messageToSend = verificationExpired
+              ? `您的上一个验证码已过期，请完成新的验证后发送消息“${text || '您的具体信息'}”。`
+              : `请完成验证后发送消息“${text || '您的具体信息'}”。`;
+            await sendMessageToUser(chatId, messageToSend);
+            await handleVerification(chatId, messageId);
           }
-          await sendMessageToUser(chatId, `请完成验证后发送消息“${text || '您的具体信息'}”。`);
-          await handleVerification(chatId, messageId);
           return;
         }
       }
@@ -396,7 +449,7 @@ export default {
           body: JSON.stringify({
             chat_id: GROUP_ID,
             message_thread_id: topicId,
-            text: "测试消息，用于验证话题有效性",
+            text: "您有新消息！",
             disable_notification: true
           })
         });
@@ -523,12 +576,12 @@ export default {
 
     async function getVerificationSuccessMessage() {
       const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-      if (!userRawEnabled) return '验证成功！您现在可以与客服聊天。';
+      if (!userRawEnabled) return '验证成功！您现在可以与我聊天。';
 
       const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/start.md');
-      if (!response.ok) return '验证成功！您现在可以与客服聊天。';
+      if (!response.ok) return '验证成功！您现在可以与我聊天。';
       const message = await response.text();
-      return message.trim() || '验证成功！您现在可以与客服聊天。';
+      return message.trim() || '验证成功！您现在可以与我聊天。';
     }
 
     async function getNotificationContent() {
