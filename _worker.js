@@ -344,45 +344,7 @@ export default {
 
         if (needsVerification) {
           if (isVerifying && !verificationExpired) {
-            let reminderMessage = `请先完成当前的验证。`;
-            if(userState.last_verification_message_id){
-              try {
-                 const checkMsgResponse = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/forwardMessage`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                          chat_id: chatId,
-                          from_chat_id: chatId,
-                          message_id: userState.last_verification_message_id,
-                          disable_notification: true
-                      })
-                 });
-                 const checkMsgData = await checkMsgResponse.json();
-                 if (checkMsgData.ok) {
-                     await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-                         method: 'POST',
-                         headers: { 'Content-Type': 'application/json' },
-                         body: JSON.stringify({
-                             chat_id: chatId,
-                             message_id: checkMsgData.result.message_id
-                         })
-                     });
-                 } else if (checkMsgData.error_code === 400 && checkMsgData.description.includes("message to forward not found")) {
-                      reminderMessage = `之前的验证消息似乎已丢失，正在为您发送新的验证...`;
-                      await sendMessageToUser(chatId, reminderMessage);
-                      await handleVerification(chatId, messageId);
-                      return;
-                 }
-              } catch(e) {
-                 console.error("Error checking verification message existence:", e);
-                 reminderMessage = `检查验证状态时出错，正在为您发送新的验证...`;
-                 await sendMessageToUser(chatId, reminderMessage);
-                 await handleVerification(chatId, messageId);
-                 return;
-              }
-            }
-            await sendMessageToUser(chatId, reminderMessage + `请点击之前的验证消息中的按钮完成操作。`);
-
+            await sendMessageToUser(chatId, `您有一个待处理的验证请求。请点击收到的验证消息中的按钮完成操作。`);
           } else {
             const messageToSend = verificationExpired
               ? `您的上一个验证码已过期，请完成新的验证后发送消息“${text || '您的具体信息'}”。`
@@ -1044,7 +1006,7 @@ export default {
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: GROUP_ID, name: `CTTBOT: ${nickname}` })
+        body: JSON.stringify({ chat_id: GROUP_ID, name: `${nickname}` })
       });
       const data = await response.json();
       if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
