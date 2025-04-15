@@ -1110,7 +1110,7 @@ export default {
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: GROUP_ID, name: `CTTBOT: ${nickname}` })
+        body: JSON.stringify({ chat_id: GROUP_ID, name: `${nickname}` })
       });
       const data = await response.json();
       if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
