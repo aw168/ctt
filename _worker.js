@@ -7,7 +7,6 @@ const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
 let isInitialized = false;
 const processedMessages = new Set();
 const processedCallbacks = new Set();
-const verificationAttempts = new Map(); // 存储验证尝试次数
 
 const topicCreationLocks = new Map();
 
