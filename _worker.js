@@ -348,18 +348,51 @@ export default {
                 .run();
               userStateCache.set(chatId, { ...userState, verification_code: null, code_expiry: null, is_verifying: false });
               
-              // 删除旧的验证消息
-              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  chat_id: chatId,
-                  message_id: messageId
-                })
-              });
+              // 删除旧的验证消息（如果存在）
+              try {
+                const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
+                  .bind(chatId)
+                  .first();
+                
+                if (lastVerification?.last_verification_message_id) {
+                  try {
+                    await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        chat_id: chatId,
+                        message_id: lastVerification.last_verification_message_id
+                      })
+                    });
+                  } catch (deleteError) {
+                    console.log(`删除旧验证消息失败: ${deleteError.message}`);
+                    // 删除失败仍继续处理
+                  }
+                  
+                  await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
+                    .bind(chatId)
+                    .run();
+                }
+              } catch (error) {
+                console.log(`查询旧验证消息失败: ${error.message}`);
+                // 即使出错也继续处理
+              }
               
               // 立即发送新的验证码
-              await handleVerification(chatId, 0);
+              try {
+                await handleVerification(chatId, 0);
+              } catch (verificationError) {
+                console.error(`发送新验证码失败: ${verificationError.message}`);
+                // 如果发送验证码失败，则再次尝试
+                setTimeout(async () => {
+                  try {
+                    await handleVerification(chatId, 0);
+                  } catch (retryError) {
+                    console.error(`重试发送验证码仍失败: ${retryError.message}`);
+                    await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
+                  }
+                }, 1000);
+              }
               return;
             } else {
               await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
@@ -734,17 +767,35 @@ export default {
           userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
           
           // 删除旧的验证消息
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: chatId,
-              message_id: messageId
-            })
-          });
+          try {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId
+              })
+            });
+          } catch (error) {
+            console.log(`删除过期验证按钮失败: ${error.message}`);
+            // 即使删除失败也继续处理
+          }
           
           // 立即发送新的验证码
-          await handleVerification(chatId, 0);
+          try {
+            await handleVerification(chatId, 0);
+          } catch (verificationError) {
+            console.error(`发送新验证码失败: ${verificationError.message}`);
+            // 如果发送验证码失败，则再次尝试
+            setTimeout(async () => {
+              try {
+                await handleVerification(chatId, 0);
+              } catch (retryError) {
+                console.error(`重试发送验证码仍失败: ${retryError.message}`);
+                await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
+              }
+            }, 1000);
+          }
           return;
         }
 
@@ -866,97 +917,129 @@ export default {
     }
 
     async function handleVerification(chatId, messageId) {
-      let userState = userStateCache.get(chatId);
-      if (userState === undefined) {
-        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+      try {
+        let userState = userStateCache.get(chatId);
+        if (userState === undefined) {
+          userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+            .bind(chatId)
+            .first();
+          if (!userState) {
+            userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+          }
+          userStateCache.set(chatId, userState);
+        }
+
+        userState.verification_code = null;
+        userState.code_expiry = null;
+        userState.is_verifying = true;
+        userStateCache.set(chatId, userState);
+        await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = ? WHERE chat_id = ?')
+          .bind(true, chatId)
+          .run();
+
+        const lastVerification = userState.last_verification_message_id || (await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
           .bind(chatId)
-          .first();
-        if (!userState) {
-          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+          .first())?.last_verification_message_id;
+
+        if (lastVerification) {
+          try {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: lastVerification
+              })
+            });
+          } catch (deleteError) {
+            console.log(`删除上一条验证消息失败: ${deleteError.message}`);
+            // 继续处理，即使删除失败
+          }
+          
+          userState.last_verification_message_id = null;
+          userStateCache.set(chatId, userState);
+          await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
+            .bind(chatId)
+            .run();
+        }
+
+        // 确保发送验证码
+        await sendVerification(chatId);
+      } catch (error) {
+        console.error(`处理验证过程失败: ${error.message}`);
+        // 重置用户状态以防卡住
+        try {
+          await env.D1.prepare('UPDATE user_states SET is_verifying = FALSE WHERE chat_id = ?')
+            .bind(chatId)
+            .run();
+          let currentState = userStateCache.get(chatId);
+          if (currentState) {
+            currentState.is_verifying = false;
+            userStateCache.set(chatId, currentState);
+          }
+        } catch (resetError) {
+          console.error(`重置用户验证状态失败: ${resetError.message}`);
+        }
+        throw error; // 向上传递错误以便调用方处理
+      }
+    }
+
+    async function sendVerification(chatId) {
+      try {
+        const num1 = Math.floor(Math.random() * 10);
+        const num2 = Math.floor(Math.random() * 10);
+        const operation = Math.random() > 0.5 ? '+' : '-';
+        const correctResult = operation === '+' ? num1 + num2 : num1 - num2;
+
+        const options = new Set([correctResult]);
+        while (options.size < 4) {
+          const wrongResult = correctResult + Math.floor(Math.random() * 5) - 2;
+          if (wrongResult !== correctResult) options.add(wrongResult);
+        }
+        const optionArray = Array.from(options).sort(() => Math.random() - 0.5);
+
+        const buttons = optionArray.map(option => ({
+          text: `(${option})`,
+          callback_data: `verify_${chatId}_${option}_${option === correctResult ? 'correct' : 'wrong'}`
+        }));
+
+        const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const codeExpiry = nowSeconds + 300;
+
+        let userState = userStateCache.get(chatId);
+        if (userState === undefined) {
+          userState = { verification_code: correctResult.toString(), code_expiry: codeExpiry, last_verification_message_id: null, is_verifying: true };
+        } else {
+          userState.verification_code = correctResult.toString();
+          userState.code_expiry = codeExpiry;
+          userState.last_verification_message_id = null;
+          userState.is_verifying = true;
         }
         userStateCache.set(chatId, userState);
-      }
 
-      userState.verification_code = null;
-      userState.code_expiry = null;
-      userState.is_verifying = true;
-      userStateCache.set(chatId, userState);
-      await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = ? WHERE chat_id = ?')
-        .bind(true, chatId)
-        .run();
-
-      const lastVerification = userState.last_verification_message_id || (await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-        .bind(chatId)
-        .first())?.last_verification_message_id;
-
-      if (lastVerification) {
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: chatId,
-            message_id: lastVerification
+            text: question,
+            reply_markup: { inline_keyboard: [buttons] }
           })
         });
-        userState.last_verification_message_id = null;
-        userStateCache.set(chatId, userState);
-        await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
-          .bind(chatId)
-          .run();
-      }
-
-      await sendVerification(chatId);
-    }
-
-    async function sendVerification(chatId) {
-      const num1 = Math.floor(Math.random() * 10);
-      const num2 = Math.floor(Math.random() * 10);
-      const operation = Math.random() > 0.5 ? '+' : '-';
-      const correctResult = operation === '+' ? num1 + num2 : num1 - num2;
-
-      const options = new Set([correctResult]);
-      while (options.size < 4) {
-        const wrongResult = correctResult + Math.floor(Math.random() * 5) - 2;
-        if (wrongResult !== correctResult) options.add(wrongResult);
-      }
-      const optionArray = Array.from(options).sort(() => Math.random() - 0.5);
-
-      const buttons = optionArray.map(option => ({
-        text: `(${option})`,
-        callback_data: `verify_${chatId}_${option}_${option === correctResult ? 'correct' : 'wrong'}`
-      }));
-
-      const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      const codeExpiry = nowSeconds + 300;
-
-      let userState = userStateCache.get(chatId);
-      if (userState === undefined) {
-        userState = { verification_code: correctResult.toString(), code_expiry: codeExpiry, last_verification_message_id: null, is_verifying: true };
-      } else {
-        userState.verification_code = correctResult.toString();
-        userState.code_expiry = codeExpiry;
-        userState.last_verification_message_id = null;
-        userState.is_verifying = true;
-      }
-      userStateCache.set(chatId, userState);
-
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: question,
-          reply_markup: { inline_keyboard: [buttons] }
-        })
-      });
-      const data = await response.json();
-      if (data.ok) {
-        userState.last_verification_message_id = data.result.message_id.toString();
-        userStateCache.set(chatId, userState);
-        await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
-          .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
-          .run();
+        const data = await response.json();
+        if (data.ok) {
+          userState.last_verification_message_id = data.result.message_id.toString();
+          userStateCache.set(chatId, userState);
+          await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
+            .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
+            .run();
+        } else {
+          throw new Error(`Telegram API 返回错误: ${data.description || '未知错误'}`);
+        }
+      } catch (error) {
+        console.error(`发送验证码失败: ${error.message}`);
+        throw error; // 向上传递错误以便调用方处理
       }
     }
 
@@ -1027,7 +1110,7 @@ export default {
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: GROUP_ID, name: `${nickname}` })
+        body: JSON.stringify({ chat_id: GROUP_ID, name: `CTTBOT: ${nickname}` })
       });
       const data = await response.json();
       if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
