@@ -381,6 +381,60 @@ export default {
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
+          // 新增：检查消息是否由管理员（非机器人）发送
+          if (message.from && message.from.id.toString() !== (await getBotId()).toString()) {
+            const isAdmin = await checkIfAdmin(message.from.id.toString());
+            if (isAdmin) {
+              console.log(`检测到管理员 ${message.from.id} 在群组 ${GROUP_ID} 话题 ${topicId} 中发送了消息 ${messageId}`);
+              
+              // 为管理员消息添加编辑/删除按钮
+              try {
+                await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    chat_id: GROUP_ID,
+                    message_id: messageId,
+                    reply_markup: {
+                      inline_keyboard: [
+                        [
+                          { text: "编辑消息", callback_data: `admin_edit_${messageId}` },
+                          { text: "删除消息", callback_data: `admin_delete_${messageId}` }
+                        ]
+                      ]
+                    }
+                  })
+                });
+                console.log(`成功为管理员直接发送的消息 ${messageId} 添加编辑/删除按钮`);
+                
+                // 查找对应的私聊
+                const privateChatId = await getPrivateChatId(topicId);
+                if (privateChatId) {
+                  // 转发到私聊
+                  const privateMsg = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      chat_id: privateChatId,
+                      from_chat_id: GROUP_ID,
+                      message_id: messageId
+                    })
+                  }).then(res => res.json());
+                  
+                  // 保存消息映射
+                  if (privateMsg.ok) {
+                    await env.D1.prepare(
+                      'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
+                    ).bind(privateChatId, privateMsg.result.message_id.toString(), messageId.toString()).run();
+                    console.log(`为管理员直接发送的消息创建映射: 私聊ID=${privateChatId}, 私聊消息ID=${privateMsg.result.message_id}, 群组消息ID=${messageId}`);
+                  }
+                }
+              } catch (error) {
+                console.error(`为管理员直接发送的消息 ${messageId} 添加按钮失败: ${error.message}`);
+              }
+            }
+          }
+          
           const privateChatId = await getPrivateChatId(topicId);
           if (privateChatId && text === '/admin') {
             await sendAdminPanel(chatId, topicId, privateChatId, messageId);
