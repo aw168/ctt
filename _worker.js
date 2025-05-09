@@ -435,7 +435,7 @@ export default {
       if (text === '/start') {
         try {
           if (await checkStartCommandRate(chatId)) {
-            await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！如果您已经在聊天中，无需重复发送 /start 命令。");
+            await sendMessageToUser(chatId, "➡️您发送 /start 命令过于频繁，请稍后再试！如果您已经在聊天中，无需重复发送 /start 命令。");
             return;
           }
 
@@ -443,7 +443,7 @@ export default {
           const existingTopicId = await getExistingTopicId(chatId);
           if (existingTopicId) {
             const successMessage = await getVerificationSuccessMessage();
-            await sendMessageToUser(chatId, `${successMessage}\n您已经在聊天中，无需重复发送 /start 命令。`);
+            await sendMessageToUser(chatId, `${successMessage}\n➡️您已经在聊天中，无需重复发送 /start 命令。`);
             return;
           }
 
@@ -1135,7 +1135,7 @@ export default {
           callback_data: `verify_${chatId}_${option}_${option === correctResult ? 'correct' : 'wrong'}`
         }));
 
-        const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证）`;
+        const question = `请计算：${num1} ${operation} ${num2} = ?（点击下方按钮完成验证，勿重复点击！）`;
         const nowSeconds = Math.floor(Date.now() / 1000);
         const codeExpiry = nowSeconds + 300;
 
