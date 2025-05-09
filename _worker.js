@@ -397,10 +397,10 @@ export default {
             
             // 查询是否有待编辑的管理员消息
             const editState = await env.D1.prepare(
-              'SELECT original_message_id FROM admin_edit_state WHERE topic_id = ? AND instruction_message_id = ?'
+              'SELECT original_message_id, admin_id FROM admin_edit_state WHERE topic_id = ? AND instruction_message_id = ?'
             ).bind(topicId, replyToMsgId).first();
             
-            if (editState && editState.original_message_id) {
+            if (editState && editState.original_message_id && editState.admin_id === message.from.id.toString()) {
               const originalMsgId = editState.original_message_id;
               
               try {
@@ -411,7 +411,7 @@ export default {
                   body: JSON.stringify({
                     chat_id: GROUP_ID,
                     message_id: originalMsgId,
-                    text: text,
+                    text: text, // 使用管理员回复的新内容
                     reply_markup: {
                       inline_keyboard: [
                         [
@@ -437,7 +437,7 @@ export default {
                       body: JSON.stringify({
                         chat_id: result.user_id,
                         message_id: result.user_message_id,
-                        text: text
+                        text: text // 使用管理员回复的新内容
                       })
                     });
                   } catch (error) {
@@ -445,6 +445,9 @@ export default {
                     // 忽略错误，私聊消息可能已过期
                   }
                 }
+                
+                // 发送编辑成功提示
+                await sendMessageToTopic(topicId, "✅ 好的，已将对应消息编辑。");
                 
                 // 删除编辑状态和编辑指导消息
                 await env.D1.prepare('DELETE FROM admin_edit_state WHERE topic_id = ? AND instruction_message_id = ?')
@@ -463,7 +466,7 @@ export default {
                   console.log(`删除编辑指导消息失败: ${error.message}`);
                 }
                 
-                // 删除用户回复消息
+                // 删除管理员的回复消息
                 try {
                   await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
                     method: 'POST',
@@ -474,12 +477,13 @@ export default {
                     })
                   });
                 } catch (error) {
-                  console.log(`删除用户回复消息失败: ${error.message}`);
+                  console.log(`删除管理员回复消息失败: ${error.message}`);
                 }
                 
                 return;
               } catch (error) {
                 console.error(`编辑管理员消息失败: ${error.message}`);
+                await sendMessageToTopic(topicId, "编辑消息失败，请重试。");
               }
             }
           }
@@ -759,7 +763,7 @@ export default {
                   message_id: replyToMsgId
                 })
               });
-            } catch (error) {
+          } catch (error) {
               console.log(`删除编辑指导消息失败: ${error.message}`);
             }
             
@@ -829,9 +833,9 @@ export default {
           
           // 再次检查是否已有话题（可能在等待期间已被创建）
       let topicId = await getExistingTopicId(chatId);
-      if (topicId) {
-        return topicId;
-      }
+          if (topicId) {
+            return topicId;
+          }
 
           // 添加数据库级别的锁定机制
           // 使用事务和唯一约束来确保不会重复创建
@@ -1241,7 +1245,7 @@ export default {
         });
       } else if (action === 'admin_edit') {
         // 管理员编辑自己的消息
-        const messageId = data.split('_')[2];
+        const originalMessageId = data.split('_')[2]; // 确保这里获取的是原始消息的ID
         const senderId = callbackQuery.from.id.toString();
         const isAdmin = await checkIfAdmin(senderId);
         
@@ -1259,29 +1263,14 @@ export default {
         }
         
         try {
-          // 获取原始消息内容
-          const originalMessage = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: GROUP_ID,
-              message_id: messageId
-            })
-          }).then(res => res.json());
-          
-          let originalText = "";
-          if (originalMessage.ok && originalMessage.result.text) {
-            originalText = originalMessage.result.text;
-          }
-          
-          // 发送编辑指导消息
+          // 发送编辑指导消息到群组话题中
           const instructionMsg = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              chat_id: GROUP_ID,
-              message_thread_id: topicId,
-              text: "请回复此消息，发送新的内容来替换原消息。原消息内容如下：\n\n" + originalText,
+              chat_id: GROUP_ID, // 直接发送到群组
+              message_thread_id: topicId, // 确保在正确的话题中
+              text: "请在当前话题中发送您想要编辑成的新内容。您的下一条消息将用于编辑。",
               reply_markup: {
                 force_reply: true,
                 selective: true
@@ -1293,7 +1282,9 @@ export default {
             // 将回复标记为等待编辑状态
             await env.D1.prepare(
               'INSERT OR REPLACE INTO admin_edit_state (admin_id, topic_id, original_message_id, instruction_message_id) VALUES (?, ?, ?, ?)'
-            ).bind(senderId, topicId, messageId, instructionMsg.result.message_id.toString()).run();
+            ).bind(senderId, topicId, originalMessageId, instructionMsg.result.message_id.toString()).run();
+          } else {
+            throw new Error(`发送编辑指导消息失败: ${instructionMsg.description}`);
           }
           
           await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
@@ -1304,13 +1295,13 @@ export default {
             })
           });
         } catch (error) {
-          console.error(`发送管理员编辑指导消息失败: ${error.message}`);
+          console.error(`管理员编辑消息流程出错: ${error.message}`);
           await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               callback_query_id: callbackQuery.id,
-              text: "发送编辑指导消息失败，请重试",
+              text: "编辑消息流程出错，请重试",
               show_alert: true
             })
           });
