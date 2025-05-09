@@ -501,29 +501,27 @@ export default {
                 ).bind(topicId, replyToMsgId, senderId).first();
                 if (editState) {
                   isReplyToAdminEditInstruction = true;
-                  // 此处是对编辑指示的回复，逻辑在下面处理，这里直接返回避免重复处理或错误转发
-                  // ... (管理员编辑回复逻辑，已在下方处理) ...
-                  // 为了确保不继续执行下方的转发和按钮添加逻辑，可以在此安全返回
-                  // 但由于编辑回复逻辑已经包含return，这里不再添加，保持代码结构清晰
                 }
               }
 
-              // 只有当不是对编辑指示的回复时，才进行普通消息处理（转发并尝试加按钮）
+              // 只有当不是对编辑指示的回复时，才进行普通消息处理
               if (!isReplyToAdminEditInstruction) {
                 console.log(`管理员 ${senderId} 在话题 ${topicId} 中发送了普通消息 ${message.message_id}`);
-                const forwardedMessageData = await forwardMessageToPrivateChat(privateChatId, message);
-                console.log(`forwardMessageToPrivateChat 返回: ${JSON.stringify(forwardedMessageData)}`);
                 
-                if (forwardedMessageData && forwardedMessageData.ok_group_message_sent) {
-                  console.log(`准备为管理员消息 ${message.message_id} 添加按钮`);
+                // 获取原始消息文本
+                const messageText = message.text || "管理员发送了一条消息";
+                
+                // 如果是文本消息，直接发送带按钮的新消息，而不是先发送后编辑
+                if (message.text) {
                   try {
-                    // 为群组中管理员的原始消息添加编辑/删除按钮
-                    await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
+                    // 直接发送带编辑/删除按钮的消息
+                    const result = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({
                         chat_id: GROUP_ID,
-                        message_id: message.message_id, // 管理员在群组中发送的原始消息ID
+                        message_thread_id: topicId,
+                        text: messageText,
                         reply_markup: {
                           inline_keyboard: [
                             [
@@ -533,13 +531,92 @@ export default {
                           ]
                         }
                       })
-                    });
+                    }).then(res => res.json());
+                    
+                    if (result.ok) {
+                      // 转发到私聊
+                      const forwardResult = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: privateChatId,
+                          text: messageText
+                        })
+                      }).then(res => res.json());
+                      
+                      // 保存正确的消息映射关系
+                      if (forwardResult.ok) {
+                        await env.D1.prepare(
+                          'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
+                        ).bind(privateChatId, forwardResult.result.message_id.toString(), result.result.message_id.toString()).run();
+                      }
+                      
+                      // 删除原始消息
+                      try {
+                        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            chat_id: GROUP_ID,
+                            message_id: message.message_id
+                          })
+                        });
+                      } catch (deleteError) {
+                        console.log(`删除原始管理员消息失败: ${deleteError.message}`);
+                      }
+                    }
                   } catch (error) {
-                    console.error(`为管理员消息 ${message.message_id} 添加按钮失败: ${error.message}`);
-                    // 即使添加按钮失败，消息也已经转发，所以不应中断流程
+                    console.error(`管理员发送带按钮消息失败: ${error.message}`);
+                    // 如果新方法失败，回退到原方法
+                    await fallbackForwardMessage();
                   }
                 } else {
-                  console.log(`forwardMessageToPrivateChat 未成功处理群组消息，不为 ${message.message_id} 添加按钮。返回数据: ${JSON.stringify(forwardedMessageData)}`);
+                  // 非文本消息使用原方法
+                  await fallbackForwardMessage();
+                }
+                
+                // 回退方法：使用原来的转发+编辑按钮方式
+                async function fallbackForwardMessage() {
+                  try {
+                    // 转发消息到私聊
+                    const forwardResult = await forwardMessageToPrivateChat(privateChatId, message);
+                    console.log(`转发结果: ${JSON.stringify(forwardResult)}`);
+                    
+                    // 为原消息添加按钮
+                    try {
+                      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: GROUP_ID,
+                          message_id: message.message_id,
+                          reply_markup: {
+                            inline_keyboard: [
+                              [
+                                { text: "编辑消息", callback_data: `admin_edit_${message.message_id}` },
+                                { text: "删除消息", callback_data: `admin_delete_${message.message_id}` }
+                              ]
+                            ]
+                          }
+                        })
+                      });
+                      console.log(`成功为管理员消息 ${message.message_id} 添加编辑/删除按钮`);
+                    } catch (error) {
+                      console.error(`为管理员消息 ${message.message_id} 添加按钮失败: ${error.message}`);
+                    }
+                    
+                    // 如果转发成功，保存消息映射
+                    if (forwardResult && forwardResult.ok && forwardResult.result && forwardResult.result.message_id) {
+                      await env.D1.prepare(
+                        'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
+                      ).bind(privateChatId, forwardResult.result.message_id.toString(), message.message_id.toString()).run();
+                      console.log(`保存消息映射: 私聊消息ID=${forwardResult.result.message_id}, 群组消息ID=${message.message_id}`);
+                    } else {
+                      console.error(`未能获取转发消息的ID，无法保存映射关系`);
+                    }
+                  } catch (error) {
+                    console.error(`转发管理员消息失败: ${error.message}`);
+                  }
                 }
               } else {
                 console.log(`管理员 ${senderId} 的消息 ${message.message_id} 是对编辑指示的回复，不添加按钮。`);
