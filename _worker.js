@@ -91,7 +91,8 @@ export default {
         autoRegisterWebhook(request),
         checkBotPermissions(),
         cleanExpiredVerificationCodes(d1),
-        cleanupCreatingTopics(d1)
+        cleanupCreatingTopics(d1),
+        cleanupOldData(d1)
       ]);
     }
 
@@ -153,8 +154,7 @@ export default {
             last_verification_message_id: 'TEXT',
             is_first_verification: 'BOOLEAN DEFAULT TRUE',
             is_rate_limited: 'BOOLEAN DEFAULT FALSE',
-            is_verifying: 'BOOLEAN DEFAULT FALSE',
-            edit_message_id: 'TEXT'
+            is_verifying: 'BOOLEAN DEFAULT FALSE'
           }
         },
         message_rates: {
@@ -178,16 +178,23 @@ export default {
             value: 'TEXT'
           }
         },
-        sent_messages: {
+        message_mapping: {
           columns: {
-            message_id: 'TEXT NOT NULL',
-            chat_id: 'TEXT NOT NULL',
-            topic_id: 'TEXT NOT NULL',
-            from_private_chat_id: 'TEXT',
-            content: 'TEXT',
-            sent_at: 'INTEGER'
-          },
-          primaryKey: '(message_id, chat_id)'
+            id: 'INTEGER PRIMARY KEY AUTOINCREMENT',
+            user_id: 'TEXT NOT NULL',
+            user_message_id: 'TEXT NOT NULL',
+            group_message_id: 'TEXT NOT NULL',
+            created_at: 'INTEGER DEFAULT (strftime(\'%s\', \'now\'))'
+          }
+        },
+        edit_state: {
+          columns: {
+            id: 'INTEGER PRIMARY KEY AUTOINCREMENT',
+            user_id: 'TEXT NOT NULL',
+            original_message_id: 'TEXT NOT NULL',
+            instruction_message_id: 'TEXT NOT NULL',
+            created_at: 'INTEGER DEFAULT (strftime(\'%s\', \'now\'))'
+          }
         }
       };
 
@@ -224,6 +231,16 @@ export default {
         if (tableName === 'settings') {
           await d1.exec('CREATE INDEX IF NOT EXISTS idx_settings_key ON settings (key)');
         }
+        
+        if (tableName === 'message_mapping') {
+          await d1.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_message_mapping_user_msg ON message_mapping (user_id, user_message_id)');
+          await d1.exec('CREATE INDEX IF NOT EXISTS idx_message_mapping_group_msg ON message_mapping (group_message_id)');
+        }
+        
+        if (tableName === 'edit_state') {
+          await d1.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_edit_state_user_instruction ON edit_state (user_id, instruction_message_id)');
+          await d1.exec('CREATE INDEX IF NOT EXISTS idx_edit_state_original ON edit_state (user_id, original_message_id)');
+        }
       }
 
       await Promise.all([
@@ -241,14 +258,7 @@ export default {
       const columnsDef = Object.entries(structure.columns)
         .map(([name, def]) => `${name} ${def}`)
         .join(', ');
-      
-      // 添加主键定义
-      let createSQL = `CREATE TABLE ${tableName} (${columnsDef}`;
-      if (structure.primaryKey) {
-        createSQL += `, PRIMARY KEY${structure.primaryKey}`;
-      }
-      createSQL += `)`;
-      
+      const createSQL = `CREATE TABLE ${tableName} (${columnsDef})`;
       await d1.exec(createSQL);
     }
 
@@ -273,6 +283,26 @@ export default {
         );
       }
       lastCleanupTime = now;
+    }
+
+    async function cleanupOldData(d1) {
+      try {
+        // 清理30天前的消息映射
+        const thirtyDaysAgo = Math.floor(Date.now() / 1000) - (30 * 24 * 60 * 60);
+        await d1.prepare('DELETE FROM message_mapping WHERE created_at < ?')
+          .bind(thirtyDaysAgo)
+          .run();
+
+        // 清理1小时前的未完成编辑状态
+        const oneHourAgo = Math.floor(Date.now() / 1000) - (1 * 60 * 60);
+        await d1.prepare('DELETE FROM edit_state WHERE created_at < ?')
+          .bind(oneHourAgo)
+          .run();
+
+        console.log('旧数据清理完成');
+      } catch (error) {
+        console.error(`清理旧数据时出错: ${error.message}`);
+      }
     }
 
     async function cleanupCreatingTopics(d1) {
@@ -319,6 +349,9 @@ export default {
         await onMessage(update.message);
       } else if (update.callback_query) {
         await onCallbackQuery(update.callback_query);
+      } else if (update.edited_message) {
+        // 处理编辑消息事件
+        await onEditedMessage(update.edited_message);
       }
     }
 
@@ -348,13 +381,13 @@ export default {
 
       let userState = userStateCache.get(chatId);
       if (userState === undefined) {
-        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, edit_message_id FROM user_states WHERE chat_id = ?')
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
         if (!userState) {
-          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false, edit_message_id: null };
-          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying, edit_message_id) VALUES (?, ?, ?, ?, ?, ?)')
-            .bind(chatId, false, true, false, false, null)
+          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
+            .bind(chatId, false, true, false, false)
             .run();
         }
         userStateCache.set(chatId, userState);
@@ -451,92 +484,6 @@ export default {
         }
       }
 
-      // 检查用户是否正在编辑消息
-      if (userState.edit_message_id) {
-        // 如果用户发送 /cancel，取消编辑
-        if (text.toLowerCase() === '/cancel') {
-          await env.D1.prepare('UPDATE user_states SET edit_message_id = NULL WHERE chat_id = ?')
-            .bind(chatId)
-            .run();
-          userState.edit_message_id = null;
-          userStateCache.set(chatId, userState);
-          await sendMessageToUser(chatId, '已取消编辑。');
-          return;
-        }
-
-        // 处理编辑
-        try {
-          // 获取要编辑的消息记录
-          const messageToEdit = await env.D1.prepare(
-            'SELECT * FROM sent_messages WHERE message_id = ? AND chat_id = ?'
-          ).bind(userState.edit_message_id, GROUP_ID).first();
-
-          if (!messageToEdit) {
-            await sendMessageToUser(chatId, '找不到要编辑的消息，编辑已取消。');
-            await env.D1.prepare('UPDATE user_states SET edit_message_id = NULL WHERE chat_id = ?')
-              .bind(chatId)
-              .run();
-            userState.edit_message_id = null;
-            userStateCache.set(chatId, userState);
-            return;
-          }
-
-          // 从消息内容中提取用户名，保留原始的用户名部分
-          const userInfo = await getUserInfo(chatId);
-          const userName = userInfo.username || `User_${chatId}`;
-          const nickname = userInfo.nickname || userName;
-          
-          // 格式化新消息内容
-          const formattedMessage = `${nickname} (已编辑):\n${text}`;
-
-          // 编辑消息
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: GROUP_ID,
-              message_id: userState.edit_message_id,
-              text: formattedMessage,
-              reply_markup: {
-                inline_keyboard: [
-                  [
-                    { text: '✏️ 编辑', callback_data: `edit_${userState.edit_message_id}_${chatId}` },
-                    { text: '🗑️ 删除', callback_data: `delete_${userState.edit_message_id}_${chatId}` }
-                  ]
-                ]
-              }
-            })
-          });
-
-          // 更新数据库中的消息内容
-          await env.D1.prepare(
-            'UPDATE sent_messages SET content = ? WHERE message_id = ? AND chat_id = ?'
-          ).bind(formattedMessage, userState.edit_message_id, GROUP_ID).run();
-
-          // 清除编辑状态
-          await env.D1.prepare('UPDATE user_states SET edit_message_id = NULL WHERE chat_id = ?')
-            .bind(chatId)
-            .run();
-          userState.edit_message_id = null;
-          userStateCache.set(chatId, userState);
-
-          // 通知用户
-          await sendMessageToUser(chatId, '消息已更新。');
-          return;
-
-        } catch (error) {
-          console.error(`编辑消息失败: ${error.message}`);
-          await sendMessageToUser(chatId, '编辑消息失败，请稍后再试。');
-          // 清除编辑状态
-          await env.D1.prepare('UPDATE user_states SET edit_message_id = NULL WHERE chat_id = ?')
-            .bind(chatId)
-            .run();
-          userState.edit_message_id = null;
-          userStateCache.set(chatId, userState);
-          return;
-        }
-      }
-
       if (text === '/start') {
         try {
         if (await checkStartCommandRate(chatId)) {
@@ -623,12 +570,104 @@ export default {
 
       if (text) {
         const formattedMessage = `${nickname}:\n${text}`;
-        await sendMessageToTopic(topicId, formattedMessage, {
-          fromPrivateChatId: chatId,
-          addButtons: true
-        });
+        await sendMessageToTopic(topicId, formattedMessage, chatId, messageId);
       } else {
         await copyMessageToTopic(topicId, message);
+      }
+
+      // 检查是否是对编辑指导消息的回复
+      if (message.reply_to_message && text) {
+        const replyToMsgId = message.reply_to_message.message_id.toString();
+        
+        // 查询是否有待编辑的消息
+        const editState = await env.D1.prepare(
+          'SELECT original_message_id FROM edit_state WHERE user_id = ? AND instruction_message_id = ?'
+        ).bind(chatId, replyToMsgId).first();
+        
+        if (editState && editState.original_message_id) {
+          // 查询原消息在群组中的对应消息ID
+          const originalMsgId = editState.original_message_id;
+          const mapping = await env.D1.prepare(
+            'SELECT group_message_id FROM message_mapping WHERE user_id = ? AND user_message_id = ?'
+          ).bind(chatId, originalMsgId).first();
+          
+          if (mapping && mapping.group_message_id) {
+            // 更新群组中的消息
+            const userInfo = await getUserInfo(chatId);
+            const nickname = userInfo.nickname || userInfo.username || `User_${chatId}`;
+            const formattedMessage = `${nickname}:\n${text}\n\n(已编辑)`;
+            
+            try {
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: GROUP_ID,
+                  message_id: mapping.group_message_id,
+                  text: formattedMessage,
+                  reply_markup: {
+                    inline_keyboard: [
+                      [
+                        { text: "编辑消息", callback_data: `edit_${chatId}_${originalMsgId}` },
+                        { text: "删除消息", callback_data: `delete_${chatId}_${originalMsgId}` }
+                      ]
+                    ]
+                  }
+                })
+              });
+              
+              // 更新用户消息
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  message_id: originalMsgId,
+                  text: text
+                })
+              });
+              
+              // 发送编辑成功通知
+              await sendMessageToUser(chatId, "消息已成功编辑！");
+            } catch (error) {
+              console.error(`编辑消息失败: ${error.message}`);
+              await sendMessageToUser(chatId, "编辑消息失败，可能是消息已过期。");
+            }
+            
+            // 删除编辑状态和编辑指导消息
+            await env.D1.prepare('DELETE FROM edit_state WHERE user_id = ? AND instruction_message_id = ?')
+              .bind(chatId, replyToMsgId).run();
+            
+            try {
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  message_id: replyToMsgId
+                })
+              });
+            } catch (error) {
+              console.log(`删除编辑指导消息失败: ${error.message}`);
+            }
+            
+            // 删除用户回复消息
+            try {
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  message_id: messageId
+                })
+              });
+            } catch (error) {
+              console.log(`删除用户回复消息失败: ${error.message}`);
+            }
+            
+            return;
+          }
+        }
       }
     }
 
@@ -973,39 +1012,6 @@ export default {
       } else if (data.startsWith('delete_user_')) {
         action = 'delete_user';
         privateChatId = parts.slice(2).join('_');
-      } else if (data.startsWith('edit_')) {
-        action = 'edit';
-        const targetMessageId = parts[1];
-        privateChatId = parts[2];
-        await handleEditMessage(chatId, messageId, targetMessageId, privateChatId);
-        await answerCallbackQuery(callbackQuery.id);
-        return;
-      } else if (data.startsWith('delete_')) {
-        action = 'delete';
-        const targetMessageId = parts[1];
-        privateChatId = parts[2];
-        await handleDeleteMessage(chatId, messageId, targetMessageId, privateChatId);
-        await answerCallbackQuery(callbackQuery.id);
-        return;
-      } else if (data.startsWith('cancel_edit_')) {
-        action = 'cancel_edit';
-        privateChatId = parts[2];
-        await handleCancelEdit(chatId, messageId, privateChatId);
-        await answerCallbackQuery(callbackQuery.id);
-        return;
-      } else if (data.startsWith('confirm_delete_')) {
-        action = 'confirm_delete';
-        const targetMessageId = parts[2];
-        privateChatId = parts[3];
-        await handleConfirmDelete(chatId, messageId, targetMessageId, privateChatId);
-        await answerCallbackQuery(callbackQuery.id);
-        return;
-      } else if (data.startsWith('cancel_delete_')) {
-        action = 'cancel_delete';
-        privateChatId = parts[2];
-        await handleCancelDelete(chatId, messageId, privateChatId);
-        await answerCallbackQuery(callbackQuery.id);
-        return;
       } else {
         action = data;
         privateChatId = '';
@@ -1173,6 +1179,179 @@ export default {
             env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId)
           ]);
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
+        } else if (action.startsWith('edit')) {
+          // 编辑消息操作
+          const [, userId, messageId] = data.split('_');
+          
+          // 检查是否是管理员或消息的发送者
+          const senderId = callbackQuery.from.id.toString();
+          const isAdmin = await checkIfAdmin(senderId);
+          const isMessageSender = senderId === userId;
+          
+          if (!isAdmin && !isMessageSender) {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                callback_query_id: callbackQuery.id,
+                text: "您没有权限编辑此消息",
+                show_alert: true
+              })
+            });
+            return;
+          }
+          
+          // 向用户发送编辑提示
+          if (isMessageSender) {
+            try {
+              // 获取原始消息内容
+              const originalMessage = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: userId,
+                  message_id: messageId
+                })
+              }).then(res => res.json());
+              
+              let originalText = "";
+              if (originalMessage.ok && originalMessage.result.text) {
+                originalText = originalMessage.result.text;
+              }
+              
+              // 发送编辑指导消息
+              const instructionMsg = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: userId,
+                  text: "请发送新的消息内容来替换原消息。原消息内容如下：\n\n" + originalText,
+                  reply_markup: {
+                    force_reply: true,
+                    selective: true
+                  }
+                })
+              }).then(res => res.json());
+              
+              if (instructionMsg.ok) {
+                // 将回复标记为等待编辑状态
+                await env.D1.prepare(
+                  'INSERT OR REPLACE INTO edit_state (user_id, original_message_id, instruction_message_id) VALUES (?, ?, ?)'
+                ).bind(userId, messageId, instructionMsg.result.message_id.toString()).run();
+              }
+            } catch (error) {
+              console.error(`发送编辑指导消息失败: ${error.message}`);
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  callback_query_id: callbackQuery.id,
+                  text: "发送编辑指导消息失败，请重试",
+                  show_alert: true
+                })
+              });
+            }
+          } else {
+            // 管理员编辑用户消息
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                callback_query_id: callbackQuery.id,
+                text: "管理员无法直接编辑用户消息，请通过回复发送新消息",
+                show_alert: true
+              })
+            });
+          }
+        } else if (action.startsWith('delete')) {
+          // 删除消息操作
+          const [, userId, messageId] = data.split('_');
+          
+          // 检查是否是管理员或消息的发送者
+          const senderId = callbackQuery.from.id.toString();
+          const isAdmin = await checkIfAdmin(senderId);
+          const isMessageSender = senderId === userId;
+          
+          if (!isAdmin && !isMessageSender) {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                callback_query_id: callbackQuery.id,
+                text: "您没有权限删除此消息",
+                show_alert: true
+              })
+            });
+            return;
+          }
+          
+          // 查询群组中的消息ID
+          const result = await env.D1.prepare(
+            'SELECT group_message_id FROM message_mapping WHERE user_id = ? AND user_message_id = ?'
+          ).bind(userId, messageId).first();
+          
+          if (result && result.group_message_id) {
+            // 删除群组中的消息
+            try {
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: GROUP_ID,
+                  message_id: result.group_message_id
+                })
+              });
+              
+              // 删除私聊中的消息
+              try {
+                await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    chat_id: userId,
+                    message_id: messageId
+                  })
+                });
+              } catch (error) {
+                // 私聊消息可能已经过期无法删除，忽略错误
+                console.log(`无法删除私聊消息: ${error.message}`);
+              }
+              
+              // 从数据库中删除映射
+              await env.D1.prepare('DELETE FROM message_mapping WHERE user_id = ? AND user_message_id = ?')
+                .bind(userId, messageId).run();
+                
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  callback_query_id: callbackQuery.id,
+                  text: "消息已删除"
+                })
+              });
+            } catch (error) {
+              console.error(`删除消息失败: ${error.message}`);
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  callback_query_id: callbackQuery.id,
+                  text: "删除消息失败，可能是消息已过期",
+                  show_alert: true
+                })
+              });
+            }
+          } else {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                callback_query_id: callbackQuery.id,
+                text: "找不到对应的消息",
+                show_alert: true
+              })
+            });
+          }
         } else {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
         }
@@ -1180,7 +1359,13 @@ export default {
         await sendAdminPanel(chatId, topicId, privateChatId, messageId);
       }
 
-      await answerCallbackQuery(callbackQuery.id);
+      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          callback_query_id: callbackQuery.id
+        })
+      });
     }
 
     async function handleVerification(chatId, messageId) {
@@ -1438,88 +1623,47 @@ export default {
       return mapping?.chat_id || null;
     }
 
-    async function sendMessageToTopic(topicId, text, options = {}) {
+    async function sendMessageToTopic(topicId, text, userId = null, userMessageId = null) {
       if (!text.trim()) {
         throw new Error('Message text is empty');
       }
-      
-      // 默认参数
-      const {
-        fromPrivateChatId = null,  // 消息来自哪个私聊用户
-        addButtons = true,         // 是否添加编辑和删除按钮
-        replyToMessageId = null    // 回复的消息ID
-      } = options;
-      
-      // 如果是用户发送的消息且需要添加按钮，则添加编辑和删除按钮
-      let inline_keyboard = undefined;
-      if (fromPrivateChatId && addButtons) {
-        inline_keyboard = [
-          [
-            { text: '✏️ 编辑', callback_data: `edit_0_${fromPrivateChatId}` },
-            { text: '🗑️ 删除', callback_data: `delete_0_${fromPrivateChatId}` }
-          ]
-        ];
-      }
-      
-      const requestBody = {
+
+      let requestBody = {
         chat_id: GROUP_ID,
         text: text,
-        message_thread_id: topicId,
-        reply_to_message_id: replyToMessageId,
-        reply_markup: inline_keyboard ? { inline_keyboard } : undefined
+        message_thread_id: topicId
       };
+      
+      // 如果是转发用户消息，添加编辑/删除按钮
+      if (userId && userMessageId) {
+        requestBody.reply_markup = {
+          inline_keyboard: [
+            [
+              { text: "编辑消息", callback_data: `edit_${userId}_${userMessageId}` },
+              { text: "删除消息", callback_data: `delete_${userId}_${userMessageId}` }
+            ]
+          ]
+        };
+      }
       
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody)
       });
-      
       const data = await response.json();
       if (!data.ok) {
         throw new Error(`Failed to send message to topic ${topicId}: ${data.description}`);
       }
       
-      // 如果是用户发送的消息，记录到数据库
-      if (fromPrivateChatId) {
-        const messageId = data.result.message_id.toString();
-        await saveSentMessage(messageId, GROUP_ID, topicId, fromPrivateChatId, text);
-        
-        // 更新回调数据中的消息ID
-        if (addButtons) {
-          const updatedInlineKeyboard = [
-            [
-              { text: '✏️ 编辑', callback_data: `edit_${messageId}_${fromPrivateChatId}` },
-              { text: '🗑️ 删除', callback_data: `delete_${messageId}_${fromPrivateChatId}` }
-            ]
-          ];
-          
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: GROUP_ID,
-              message_id: messageId,
-              reply_markup: { inline_keyboard: updatedInlineKeyboard }
-            })
-          });
-        }
+      // 如果是转发用户消息，保存消息ID映射
+      if (userId && userMessageId) {
+        await env.D1.prepare(
+          'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
+        ).bind(userId, userMessageId, data.result.message_id.toString()).run();
       }
       
       return data;
-    }
-    
-    // 保存发送的消息到数据库
-    async function saveSentMessage(messageId, chatId, topicId, fromPrivateChatId, content) {
-      try {
-        const sentAt = Math.floor(Date.now() / 1000);
-        await env.D1.prepare(
-          'INSERT OR REPLACE INTO sent_messages (message_id, chat_id, topic_id, from_private_chat_id, content, sent_at) VALUES (?, ?, ?, ?, ?, ?)'
-        ).bind(messageId, chatId, topicId, fromPrivateChatId, content, sentAt).run();
-      } catch (error) {
-        console.error(`保存消息记录失败: ${error.message}`);
-        // 即使保存失败也继续处理
-      }
     }
 
     async function copyMessageToTopic(topicId, message) {
@@ -1528,7 +1672,15 @@ export default {
         from_chat_id: message.chat.id,
         message_id: message.message_id,
         message_thread_id: topicId,
-        disable_notification: true
+        disable_notification: true,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "编辑消息", callback_data: `edit_${message.chat.id}_${message.message_id}` },
+              { text: "删除消息", callback_data: `delete_${message.chat.id}_${message.message_id}` }
+            ]
+          ]
+        }
       };
       const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
         method: 'POST',
@@ -1539,6 +1691,13 @@ export default {
       if (!data.ok) {
         throw new Error(`Failed to copy message to topic ${topicId}: ${data.description}`);
       }
+      
+      // 保存消息ID映射
+      await env.D1.prepare(
+        'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
+      ).bind(message.chat.id.toString(), message.message_id.toString(), data.result.message_id.toString()).run();
+      
+      return data;
     }
 
     async function pinMessage(topicId, messageId) {
@@ -1559,6 +1718,45 @@ export default {
     }
 
     async function forwardMessageToPrivateChat(privateChatId, message) {
+      // 检查是否是回复消息
+      if (message.reply_to_message) {
+        // 查询原消息的映射，确认这是回复给哪个用户的哪条消息
+        const result = await env.D1.prepare(
+          'SELECT user_message_id FROM message_mapping WHERE group_message_id = ?'
+        ).bind(message.reply_to_message.message_id.toString()).first();
+        
+        // 如果找到原消息，则作为回复发送
+        if (result && result.user_message_id) {
+          const requestBody = {
+            chat_id: privateChatId,
+            text: message.text || "管理员发送了一条消息",
+            reply_to_message_id: result.user_message_id
+          };
+          
+          try {
+            const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(requestBody)
+            });
+            const data = await response.json();
+            
+            // 保存回复消息的映射
+            if (data.ok) {
+              await env.D1.prepare(
+                'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
+              ).bind(privateChatId, data.result.message_id.toString(), message.message_id.toString()).run();
+            }
+            
+            return;
+          } catch (error) {
+            console.error(`回复消息失败: ${error.message}`);
+            // 回复失败，继续尝试普通转发
+          }
+        }
+      }
+      
+      // 如果不是回复或回复失败，使用普通转发
       const requestBody = {
         chat_id: privateChatId,
         from_chat_id: message.chat.id,
@@ -1573,6 +1771,52 @@ export default {
       const data = await response.json();
       if (!data.ok) {
         throw new Error(`Failed to forward message to private chat: ${data.description}`);
+      }
+      
+      // 保存消息映射
+      if (data.ok) {
+        await env.D1.prepare(
+          'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
+        ).bind(privateChatId, data.result.message_id.toString(), message.message_id.toString()).run();
+      }
+    }
+
+    async function onEditedMessage(editedMessage) {
+      const chatId = editedMessage.chat.id.toString();
+      
+      // 如果是私聊消息，则转发编辑后的消息到群组
+      if (chatId !== GROUP_ID) {
+        const userInfo = await getUserInfo(chatId);
+        if (!userInfo) {
+          return;
+        }
+        
+        const topicId = await getExistingTopicId(chatId);
+        if (!topicId) {
+          return;
+        }
+        
+        // 查询原消息在群组中的对应消息ID
+        const result = await env.D1.prepare(
+          'SELECT group_message_id FROM message_mapping WHERE user_id = ? AND user_message_id = ?'
+        ).bind(chatId, editedMessage.message_id.toString()).first();
+        
+        if (result && result.group_message_id) {
+          const nickname = userInfo.nickname || userInfo.username || `User_${chatId}`;
+          const text = editedMessage.text;
+          if (text) {
+            const formattedMessage = `${nickname}:\n${text}\n\n(已编辑)`;
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: GROUP_ID,
+                message_id: result.group_message_id,
+                text: formattedMessage
+              })
+            });
+          }
+        }
       }
     }
 
@@ -1632,240 +1876,6 @@ export default {
         body: JSON.stringify({ url: '' })
       }).then(r => r.json());
       return new Response(response.ok ? 'Webhook removed' : JSON.stringify(response, null, 2));
-    }
-
-    // 简化版的 answerCallbackQuery 函数
-    async function answerCallbackQuery(callbackQueryId) {
-      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          callback_query_id: callbackQueryId
-        })
-      });
-    }
-
-    // 处理编辑消息请求
-    async function handleEditMessage(chatId, callbackMessageId, targetMessageId, privateChatId) {
-      try {
-        // 检查发送方是否是管理员
-        const senderId = chatId;
-        const isAdmin = await checkIfAdmin(senderId);
-        
-        // 如果不是管理员且不是同一个用户，则拒绝请求
-        if (!isAdmin && GROUP_ID !== chatId) {
-          await sendMessageToTopic(callbackMessageId.message_thread_id, '只有管理员可以编辑他人的消息。');
-          return;
-        }
-        
-        // 获取原始消息
-        let messageToEdit;
-        if (targetMessageId === '0') {
-          // 直接编辑当前消息
-          messageToEdit = {
-            message_id: callbackMessageId,
-            content: callbackMessageId.text
-          };
-        } else {
-          // 从数据库获取消息
-          messageToEdit = await env.D1.prepare(
-            'SELECT * FROM sent_messages WHERE message_id = ? AND chat_id = ?'
-          ).bind(targetMessageId, GROUP_ID).first();
-          
-          if (!messageToEdit) {
-            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: GROUP_ID,
-                message_id: callbackMessageId,
-                reply_markup: { 
-                  inline_keyboard: [[{ text: '⚠️ 消息记录不存在', callback_data: 'no_action' }]]
-                }
-              })
-            });
-            return;
-          }
-        }
-        
-        // 发送编辑提示消息给用户
-        await sendMessageToUser(privateChatId, '请发送新的消息内容，或发送 /cancel 取消编辑：');
-        
-        // 更新当前按钮为"正在编辑"状态
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_id: callbackMessageId,
-            reply_markup: { 
-              inline_keyboard: [[{ text: '⏳ 正在编辑...', callback_data: `cancel_edit_${targetMessageId}_${privateChatId}` }]]
-            }
-          })
-        });
-        
-        // 将用户状态设置为"正在编辑"
-        await env.D1.prepare(
-          'UPDATE user_states SET edit_message_id = ? WHERE chat_id = ?'
-        ).bind(targetMessageId, privateChatId).run();
-        
-      } catch (error) {
-        console.error(`处理编辑消息失败: ${error.message}`);
-      }
-    }
-    
-    // 处理取消编辑
-    async function handleCancelEdit(chatId, messageId, privateChatId) {
-      try {
-        // 恢复原始按钮
-        const targetMessageId = await env.D1.prepare(
-          'SELECT edit_message_id FROM user_states WHERE chat_id = ?'
-        ).bind(privateChatId).first();
-        
-        if (targetMessageId && targetMessageId.edit_message_id) {
-          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: GROUP_ID,
-              message_id: messageId,
-              reply_markup: { 
-                inline_keyboard: [
-                  [
-                    { text: '✏️ 编辑', callback_data: `edit_${targetMessageId.edit_message_id}_${privateChatId}` },
-                    { text: '🗑️ 删除', callback_data: `delete_${targetMessageId.edit_message_id}_${privateChatId}` }
-                  ]
-                ]
-              }
-            })
-          });
-        }
-        
-        // 清除编辑状态
-        await env.D1.prepare(
-          'UPDATE user_states SET edit_message_id = NULL WHERE chat_id = ?'
-        ).bind(privateChatId).run();
-        
-        // 通知用户
-        await sendMessageToUser(privateChatId, '已取消编辑。');
-        
-      } catch (error) {
-        console.error(`处理取消编辑失败: ${error.message}`);
-      }
-    }
-    
-    // 处理删除消息请求
-    async function handleDeleteMessage(chatId, callbackMessageId, targetMessageId, privateChatId) {
-      try {
-        // 检查发送方是否是管理员
-        const senderId = chatId;
-        const isAdmin = await checkIfAdmin(senderId);
-        
-        // 如果不是管理员且不是同一个用户，则拒绝请求
-        if (!isAdmin && GROUP_ID !== chatId) {
-          await sendMessageToUser(privateChatId, '只有管理员可以删除他人的消息。');
-          return;
-        }
-        
-        // 显示确认按钮
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_id: callbackMessageId,
-            reply_markup: { 
-              inline_keyboard: [
-                [
-                  { text: '✅ 确认删除', callback_data: `confirm_delete_${targetMessageId}_${privateChatId}` },
-                  { text: '❌ 取消', callback_data: `cancel_delete_${targetMessageId}_${privateChatId}` }
-                ]
-              ]
-            }
-          })
-        });
-        
-      } catch (error) {
-        console.error(`处理删除消息失败: ${error.message}`);
-      }
-    }
-    
-    // 处理确认删除
-    async function handleConfirmDelete(chatId, callbackMessageId, targetMessageId, privateChatId) {
-      try {
-        // 删除消息
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_id: targetMessageId === '0' ? callbackMessageId : targetMessageId
-          })
-        });
-        
-        // 从数据库中删除记录
-        if (targetMessageId !== '0') {
-          await env.D1.prepare(
-            'DELETE FROM sent_messages WHERE message_id = ? AND chat_id = ?'
-          ).bind(targetMessageId, GROUP_ID).run();
-        }
-        
-        // 通知用户
-        await sendMessageToUser(privateChatId, '消息已删除。');
-        
-      } catch (error) {
-        console.error(`处理确认删除失败: ${error.message}`);
-        
-        // 如果删除失败，恢复按钮
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_id: callbackMessageId,
-            reply_markup: { 
-              inline_keyboard: [
-                [
-                  { text: '✏️ 编辑', callback_data: `edit_${targetMessageId}_${privateChatId}` },
-                  { text: '🗑️ 删除', callback_data: `delete_${targetMessageId}_${privateChatId}` }
-                ]
-              ]
-            }
-          })
-        });
-        
-        // 通知用户
-        await sendMessageToUser(privateChatId, '删除消息失败，请稍后再试。');
-      }
-    }
-    
-    // 处理取消删除
-    async function handleCancelDelete(chatId, messageId, privateChatId) {
-      try {
-        // 恢复原始按钮
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_id: messageId,
-            reply_markup: { 
-              inline_keyboard: [
-                [
-                  { text: '✏️ 编辑', callback_data: `edit_${messageId}_${privateChatId}` },
-                  { text: '🗑️ 删除', callback_data: `delete_${messageId}_${privateChatId}` }
-                ]
-              ]
-            }
-          })
-        });
-        
-        // 通知用户
-        await sendMessageToUser(privateChatId, '已取消删除。');
-        
-      } catch (error) {
-        console.error(`处理取消删除失败: ${error.message}`);
-      }
     }
 
     try {
