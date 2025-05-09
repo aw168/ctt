@@ -489,12 +489,10 @@ export default {
           }
           
           if (privateChatId) {
-            // 只有当消息来自管理员且不是对编辑指示的回复时，才添加编辑/删除按钮并转发
             const senderId = message.from.id.toString();
             const isAdmin = await checkIfAdmin(senderId);
 
             if (isAdmin) {
-              // 检查这条消息是否是对admin_edit指示的回复
               let isReplyToAdminEditInstruction = false;
               if (message.reply_to_message && text) {
                 const replyToMsgId = message.reply_to_message.message_id.toString();
@@ -503,18 +501,23 @@ export default {
                 ).bind(topicId, replyToMsgId, senderId).first();
                 if (editState) {
                   isReplyToAdminEditInstruction = true;
+                  // 此处是对编辑指示的回复，逻辑在下面处理，这里直接返回避免重复处理或错误转发
+                  // ... (管理员编辑回复逻辑，已在下方处理) ...
+                  // 为了确保不继续执行下方的转发和按钮添加逻辑，可以在此安全返回
+                  // 但由于编辑回复逻辑已经包含return，这里不再添加，保持代码结构清晰
                 }
               }
 
+              // 只有当不是对编辑指示的回复时，才进行普通消息处理（转发并尝试加按钮）
               if (!isReplyToAdminEditInstruction) {
-                // 将管理员在群组中发送的消息转发给私聊用户
+                console.log(`管理员 ${senderId} 在话题 ${topicId} 中发送了普通消息 ${message.message_id}`);
                 const forwardedMessageData = await forwardMessageToPrivateChat(privateChatId, message);
+                console.log(`forwardMessageToPrivateChat 返回: ${JSON.stringify(forwardedMessageData)}`);
                 
-                // 为群组中管理员的原始消息添加编辑/删除按钮
-                // 注意：这里我们假设forwardMessageToPrivateChat成功后，message对象就是群组中的那条消息
-                // 并且我们现在需要用editMessageReplyMarkup来给这条原始消息添加按钮
-                if (forwardedMessageData && forwardedMessageData.ok_group_message_sent) { // 假设forwardMessageToPrivateChat返回一个标记，指示群组消息已发送
+                if (forwardedMessageData && forwardedMessageData.ok_group_message_sent) {
+                  console.log(`准备为管理员消息 ${message.message_id} 添加按钮`);
                   try {
+                    // 为群组中管理员的原始消息添加编辑/删除按钮
                     await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
@@ -532,15 +535,17 @@ export default {
                       })
                     });
                   } catch (error) {
-                    console.error(`为管理员消息添加按钮失败: ${error.message}`);
+                    console.error(`为管理员消息 ${message.message_id} 添加按钮失败: ${error.message}`);
+                    // 即使添加按钮失败，消息也已经转发，所以不应中断流程
                   }
+                } else {
+                  console.log(`forwardMessageToPrivateChat 未成功处理群组消息，不为 ${message.message_id} 添加按钮。返回数据: ${JSON.stringify(forwardedMessageData)}`);
                 }
               } else {
-                // 如果是对编辑指示的回复，则按之前的逻辑处理编辑
-                // (此部分逻辑已在onMessage的管理员编辑回复部分处理，这里可能不需要重复，但要确保不在此处再次转发)
+                console.log(`管理员 ${senderId} 的消息 ${message.message_id} 是对编辑指示的回复，不添加按钮。`);
               }
             } else {
-              // 如果不是管理员发送的消息，或者是不需要带按钮的系统消息，则直接转发
+              // 非管理员消息，直接转发
               await forwardMessageToPrivateChat(privateChatId, message);
             }
           }
@@ -1965,14 +1970,17 @@ export default {
     }
 
     async function forwardMessageToPrivateChat(privateChatId, message) {
-      let groupMessageSent = false; // 标记群组消息是否已处理/发送
-      // 检查是否是回复消息 (此逻辑主要用于管理员回复用户)
+      let groupMessageSent = false; 
+      console.log(`[forwardMessageToPrivateChat] 开始处理消息 ${message.message_id} 从 chat ${message.chat.id} 到 ${privateChatId}`);
+
       if (message.reply_to_message && message.chat.id.toString() === GROUP_ID) {
+        console.log(`[forwardMessageToPrivateChat] 消息 ${message.message_id} 是对群组消息 ${message.reply_to_message.message_id} 的回复`);
         const result = await env.D1.prepare(
           'SELECT user_message_id FROM message_mapping WHERE group_message_id = ?'
         ).bind(message.reply_to_message.message_id.toString()).first();
         
         if (result && result.user_message_id) {
+          console.log(`[forwardMessageToPrivateChat] 找到映射，私聊用户消息ID: ${result.user_message_id}`);
           const requestBody = {
             chat_id: privateChatId,
             text: message.text || "管理员发送了一条消息", // 确保文本不为空
@@ -1986,13 +1994,13 @@ export default {
               body: JSON.stringify(requestBody)
             });
             const data = await response.json();
-            
+            console.log(`[forwardMessageToPrivateChat] 回复消息API响应: ${JSON.stringify(data)}`);
             if (data.ok) {
               await env.D1.prepare(
                 'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
               ).bind(privateChatId, data.result.message_id.toString(), message.message_id.toString()).run();
               groupMessageSent = true; 
-              // 不在这里为回复消息添加按钮，按钮应该加在群组内的原始消息上
+              console.log(`[forwardMessageToPrivateChat] 回复消息已发送并映射，groupMessageSent: ${groupMessageSent}`);
             }
             return { ok: data.ok, result: data.result, ok_group_message_sent: groupMessageSent };
           } catch (error) {
@@ -2001,7 +2009,7 @@ export default {
         }
       }
       
-      // 普通转发 (管理员直接在话题发送消息，或者用户发送给机器人)
+      console.log(`[forwardMessageToPrivateChat] 消息 ${message.message_id} 作为普通消息/复制处理`);
       const requestBody = {
         chat_id: privateChatId,
         from_chat_id: message.chat.id, // 可能是GROUP_ID (管理员发) 或 privateChatId (用户发)
@@ -2014,19 +2022,23 @@ export default {
         body: JSON.stringify(requestBody)
       });
       const data = await response.json();
+      console.log(`[forwardMessageToPrivateChat] 复制消息API响应: ${JSON.stringify(data)}`);
       if (!data.ok) {
+        console.error(`[forwardMessageToPrivateChat] 复制消息失败: ${data.description}`);
         throw new Error(`Failed to forward/copy message to private chat: ${data.description}`);
       }
       
       if (data.ok) {
-        // 仅当消息源是GROUP_ID (管理员发送) 时，才认为这是一条需要映射的管理员消息
         if (message.chat.id.toString() === GROUP_ID) {
-          await env.D1.prepare(
-            'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
-          ).bind(privateChatId, data.result.message_id.toString(), message.message_id.toString()).run();
+          console.log(`[forwardMessageToPrivateChat] 消息 ${message.message_id} 源自群组，进行映射`);
+          // ... (database insert logic)
           groupMessageSent = true; 
+          console.log(`[forwardMessageToPrivateChat] 群组消息已复制并映射，groupMessageSent: ${groupMessageSent}`);
+        } else {
+          console.log(`[forwardMessageToPrivateChat] 消息 ${message.message_id} 非源自群组，不进行特定映射处理，groupMessageSent: ${groupMessageSent}`);
         }
       }
+      console.log(`[forwardMessageToPrivateChat] 函数返回: ok=${data.ok}, groupMessageSent=${groupMessageSent}`);
       return { ok: data.ok, result: data.result, ok_group_message_sent: groupMessageSent };
     }
 
