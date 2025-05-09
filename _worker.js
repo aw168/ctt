@@ -2014,10 +2014,18 @@ export default {
       let requestBody = {
         chat_id: GROUP_ID,
         text: text,
-        message_thread_id: topicId
+        message_thread_id: topicId,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "编辑消息", callback_data: `admin_edit_0` },
+              { text: "删除消息", callback_data: `admin_delete_0` }
+            ]
+          ]
+        }
       };
       
-      // 如果是转发用户消息，添加编辑/删除按钮
+      // 如果是转发用户消息，使用特定的callback_data
       if (userId && userMessageId) {
         requestBody.reply_markup = {
           inline_keyboard: [
@@ -2037,6 +2045,32 @@ export default {
       const data = await response.json();
       if (!data.ok) {
         throw new Error(`Failed to send message to topic ${topicId}: ${data.description}`);
+      }
+      
+      // 更新callback_data中的消息ID
+      if (!userId || !userMessageId) {
+        // 为机器人自己发送的消息更新编辑/删除按钮的callback_data
+        try {
+          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: GROUP_ID,
+              message_id: data.result.message_id,
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: "编辑消息", callback_data: `admin_edit_${data.result.message_id}` },
+                    { text: "删除消息", callback_data: `admin_delete_${data.result.message_id}` }
+                  ]
+                ]
+              }
+            })
+          });
+          console.log(`为机器人消息 ${data.result.message_id} 更新了编辑/删除按钮`);
+        } catch (error) {
+          console.error(`更新机器人消息按钮失败: ${error.message}`);
+        }
       }
       
       // 如果是转发用户消息，保存消息ID映射
