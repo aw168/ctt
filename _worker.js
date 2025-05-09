@@ -447,7 +447,7 @@ export default {
                 }
                 
                 // 发送编辑成功提示
-                await sendMessageToTopic(topicId, "✅ 好的，已将对应消息编辑。");
+                await sendMessageToTopic(topicId, "✅ 好的主人，已将对应消息编辑。");
                 
                 // 删除编辑状态和编辑指导消息
                 await env.D1.prepare('DELETE FROM admin_edit_state WHERE topic_id = ? AND instruction_message_id = ?')
@@ -489,7 +489,60 @@ export default {
           }
           
           if (privateChatId) {
-            await forwardMessageToPrivateChat(privateChatId, message);
+            // 只有当消息来自管理员且不是对编辑指示的回复时，才添加编辑/删除按钮并转发
+            const senderId = message.from.id.toString();
+            const isAdmin = await checkIfAdmin(senderId);
+
+            if (isAdmin) {
+              // 检查这条消息是否是对admin_edit指示的回复
+              let isReplyToAdminEditInstruction = false;
+              if (message.reply_to_message && text) {
+                const replyToMsgId = message.reply_to_message.message_id.toString();
+                const editState = await env.D1.prepare(
+                  'SELECT original_message_id FROM admin_edit_state WHERE topic_id = ? AND instruction_message_id = ? AND admin_id = ?'
+                ).bind(topicId, replyToMsgId, senderId).first();
+                if (editState) {
+                  isReplyToAdminEditInstruction = true;
+                }
+              }
+
+              if (!isReplyToAdminEditInstruction) {
+                // 将管理员在群组中发送的消息转发给私聊用户
+                const forwardedMessageData = await forwardMessageToPrivateChat(privateChatId, message);
+                
+                // 为群组中管理员的原始消息添加编辑/删除按钮
+                // 注意：这里我们假设forwardMessageToPrivateChat成功后，message对象就是群组中的那条消息
+                // 并且我们现在需要用editMessageReplyMarkup来给这条原始消息添加按钮
+                if (forwardedMessageData && forwardedMessageData.ok_group_message_sent) { // 假设forwardMessageToPrivateChat返回一个标记，指示群组消息已发送
+                  try {
+                    await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        chat_id: GROUP_ID,
+                        message_id: message.message_id, // 管理员在群组中发送的原始消息ID
+                        reply_markup: {
+                          inline_keyboard: [
+                            [
+                              { text: "编辑消息", callback_data: `admin_edit_${message.message_id}` },
+                              { text: "删除消息", callback_data: `admin_delete_${message.message_id}` }
+                            ]
+                          ]
+                        }
+                      })
+                    });
+                  } catch (error) {
+                    console.error(`为管理员消息添加按钮失败: ${error.message}`);
+                  }
+                }
+              } else {
+                // 如果是对编辑指示的回复，则按之前的逻辑处理编辑
+                // (此部分逻辑已在onMessage的管理员编辑回复部分处理，这里可能不需要重复，但要确保不在此处再次转发)
+              }
+            } else {
+              // 如果不是管理员发送的消息，或者是不需要带按钮的系统消息，则直接转发
+              await forwardMessageToPrivateChat(privateChatId, message);
+            }
           }
         }
         return;
@@ -1130,10 +1183,10 @@ export default {
         privateChatId = parts.slice(2).join('_');
       } else if (data.startsWith('admin_edit_')) {
         action = 'admin_edit';
-        privateChatId = '';
+        privateChatId = ''; // 管理员操作不涉及特定私聊ID
       } else if (data.startsWith('admin_delete_')) {
         action = 'admin_delete';
-        privateChatId = '';
+        privateChatId = ''; // 管理员操作不涉及特定私聊ID
       } else if (data.startsWith('edit_')) {
         action = 'edit';
         privateChatId = parts[1];
@@ -1912,18 +1965,17 @@ export default {
     }
 
     async function forwardMessageToPrivateChat(privateChatId, message) {
-      // 检查是否是回复消息
-      if (message.reply_to_message) {
-        // 查询原消息的映射，确认这是回复给哪个用户的哪条消息
+      let groupMessageSent = false; // 标记群组消息是否已处理/发送
+      // 检查是否是回复消息 (此逻辑主要用于管理员回复用户)
+      if (message.reply_to_message && message.chat.id.toString() === GROUP_ID) {
         const result = await env.D1.prepare(
           'SELECT user_message_id FROM message_mapping WHERE group_message_id = ?'
         ).bind(message.reply_to_message.message_id.toString()).first();
         
-        // 如果找到原消息，则作为回复发送
         if (result && result.user_message_id) {
           const requestBody = {
             chat_id: privateChatId,
-            text: message.text || "管理员发送了一条消息",
+            text: message.text || "管理员发送了一条消息", // 确保文本不为空
             reply_to_message_id: result.user_message_id
           };
           
@@ -1935,43 +1987,24 @@ export default {
             });
             const data = await response.json();
             
-            // 保存回复消息的映射
             if (data.ok) {
               await env.D1.prepare(
                 'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
               ).bind(privateChatId, data.result.message_id.toString(), message.message_id.toString()).run();
-              
-              // 为群组中的管理员消息添加编辑/删除按钮
-              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  chat_id: GROUP_ID,
-                  message_id: message.message_id,
-                  reply_markup: {
-                    inline_keyboard: [
-                      [
-                        { text: "编辑消息", callback_data: `admin_edit_${message.message_id}` },
-                        { text: "删除消息", callback_data: `admin_delete_${message.message_id}` }
-                      ]
-                    ]
-                  }
-                })
-              });
+              groupMessageSent = true; 
+              // 不在这里为回复消息添加按钮，按钮应该加在群组内的原始消息上
             }
-            
-            return;
+            return { ok: data.ok, result: data.result, ok_group_message_sent: groupMessageSent };
           } catch (error) {
             console.error(`回复消息失败: ${error.message}`);
-            // 回复失败，继续尝试普通转发
           }
         }
       }
       
-      // 如果不是回复或回复失败，使用普通转发
+      // 普通转发 (管理员直接在话题发送消息，或者用户发送给机器人)
       const requestBody = {
         chat_id: privateChatId,
-        from_chat_id: message.chat.id,
+        from_chat_id: message.chat.id, // 可能是GROUP_ID (管理员发) 或 privateChatId (用户发)
         message_id: message.message_id,
         disable_notification: true
       };
@@ -1982,33 +2015,19 @@ export default {
       });
       const data = await response.json();
       if (!data.ok) {
-        throw new Error(`Failed to forward message to private chat: ${data.description}`);
+        throw new Error(`Failed to forward/copy message to private chat: ${data.description}`);
       }
       
-      // 保存消息映射
       if (data.ok) {
-        await env.D1.prepare(
-          'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
-        ).bind(privateChatId, data.result.message_id.toString(), message.message_id.toString()).run();
-        
-        // 为群组中的管理员消息添加编辑/删除按钮
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: GROUP_ID,
-            message_id: message.message_id,
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  { text: "编辑消息", callback_data: `admin_edit_${message.message_id}` },
-                  { text: "删除消息", callback_data: `admin_delete_${message.message_id}` }
-                ]
-              ]
-            }
-          })
-        });
+        // 仅当消息源是GROUP_ID (管理员发送) 时，才认为这是一条需要映射的管理员消息
+        if (message.chat.id.toString() === GROUP_ID) {
+          await env.D1.prepare(
+            'INSERT OR REPLACE INTO message_mapping (user_id, user_message_id, group_message_id) VALUES (?, ?, ?)'
+          ).bind(privateChatId, data.result.message_id.toString(), message.message_id.toString()).run();
+          groupMessageSent = true; 
+        }
       }
+      return { ok: data.ok, result: data.result, ok_group_message_sent: groupMessageSent };
     }
 
     async function onEditedMessage(editedMessage) {
