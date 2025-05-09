@@ -185,9 +185,9 @@ export default {
             topic_id: 'TEXT NOT NULL',
             from_private_chat_id: 'TEXT',
             content: 'TEXT',
-            sent_at: 'INTEGER',
-            PRIMARY KEY: '(message_id, chat_id)'
-          }
+            sent_at: 'INTEGER'
+          },
+          primaryKey: '(message_id, chat_id)'
         }
       };
 
@@ -241,7 +241,14 @@ export default {
       const columnsDef = Object.entries(structure.columns)
         .map(([name, def]) => `${name} ${def}`)
         .join(', ');
-      const createSQL = `CREATE TABLE ${tableName} (${columnsDef})`;
+      
+      // 添加主键定义
+      let createSQL = `CREATE TABLE ${tableName} (${columnsDef}`;
+      if (structure.primaryKey) {
+        createSQL += `, PRIMARY KEY${structure.primaryKey}`;
+      }
+      createSQL += `)`;
+      
       await d1.exec(createSQL);
     }
 
