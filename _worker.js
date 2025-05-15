@@ -69,6 +69,9 @@ const topicIdCache = new LRUCache(1000);
 const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
 
+// 添加分布式锁机制
+const CREATION_LOCKS = new Map();
+
 export default {
   async fetch(request, env) {
     BOT_TOKEN = env.BOT_TOKEN_ENV || null;
@@ -303,6 +306,17 @@ export default {
 
     async function cleanupCreatingTopics(d1) {
       try {
+        // 清理创建锁中过期的项（超过5分钟的锁视为异常）
+        const now = Date.now();
+        const lockTimeout = 5 * 60 * 1000; // 5分钟
+        
+        for (const [key, timestamp] of CREATION_LOCKS.entries()) {
+          if (now - timestamp > lockTimeout) {
+            console.log(`清理过期的创建锁: ${key}`);
+            CREATION_LOCKS.delete(key);
+          }
+        }
+        
         // 查找所有标记为正在创建的话题映射
         const creatingTopics = await d1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
           .bind('creating')
@@ -694,35 +708,95 @@ export default {
     }
 
     async function ensureUserTopic(chatId, userInfo) {
-      // 先查数据库
-      const existingMapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      if (existingMapping && existingMapping.topic_id && existingMapping.topic_id !== 'creating') {
-        topicIdCache.set(chatId, existingMapping.topic_id);
-        return existingMapping.topic_id;
+      try {
+        // 首先检查是否已有话题ID（先查缓存，再查数据库）
+        let topicId = topicIdCache.get(chatId);
+        if (topicId && topicId !== 'creating') {
+          console.log(`缓存中发现用户 ${chatId} 已有话题ID: ${topicId}`);
+          return topicId;
+        }
+        
+        // 查询数据库中的有效映射
+        const existingMapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id != ?')
+          .bind(chatId, 'creating')
+          .first();
+          
+        if (existingMapping && existingMapping.topic_id) {
+          console.log(`数据库中发现用户 ${chatId} 已有话题ID: ${existingMapping.topic_id}`);
+          topicIdCache.set(chatId, existingMapping.topic_id);
+          return existingMapping.topic_id;
+        }
+        
+        // 检查是否有临时标记，如果有且创建时间超过5分钟，则清除
+        const tempMapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+          .bind(chatId, 'creating')
+          .first();
+          
+        if (tempMapping) {
+          console.log(`发现用户 ${chatId} 有临时标记，可能是之前创建失败`);
+          
+          // 删除过时的临时标记
+          await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+            .bind(chatId, 'creating')
+            .run();
+        }
+        
+        // 创建新的临时标记，防止并发创建
+        await env.D1.prepare('INSERT OR IGNORE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
+          .bind(chatId, 'creating')
+          .run();
+        
+        // 再次检查，以防在插入临时标记期间其他进程已创建话题
+        const doubleCheck = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id != ?')
+          .bind(chatId, 'creating')
+          .first();
+          
+        if (doubleCheck && doubleCheck.topic_id) {
+          console.log(`临时标记后发现用户 ${chatId} 已有话题ID: ${doubleCheck.topic_id}`);
+          
+          // 删除临时标记
+          await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+            .bind(chatId, 'creating')
+            .run();
+          
+          topicIdCache.set(chatId, doubleCheck.topic_id);
+          return doubleCheck.topic_id;
+        }
+        
+        // 设置缓存标记为创建中
+        topicIdCache.set(chatId, 'creating');
+        
+        // 获取用户信息
+        const userName = userInfo.username || `User_${chatId}`;
+        const nickname = userInfo.nickname || userName;
+        
+        // 创建话题
+        try {
+          topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
+          if (topicId) {
+            console.log(`为用户 ${chatId} 成功创建话题: ${topicId}`);
+            topicIdCache.set(chatId, topicId);
+            return topicId;
+          } else {
+            throw new Error('创建话题失败，未返回话题ID');
+          }
+        } catch (error) {
+          console.error(`创建话题失败: ${error.message}`);
+          
+          // 清除缓存和临时标记
+          topicIdCache.set(chatId, undefined);
+          await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+            .bind(chatId, 'creating')
+            .run();
+          
+          throw error;
+        }
+      } catch (error) {
+        // 确保在发生错误时清除缓存
+        topicIdCache.set(chatId, undefined);
+        console.error(`确保用户话题过程中发生错误: ${error.message}`);
+        throw error;
       }
-      // 没有记录才允许新建
-      await env.D1.prepare('INSERT OR IGNORE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-        .bind(chatId, 'creating')
-        .run();
-      // 再查一次，防止并发
-      const checkAgain = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-        .bind(chatId)
-        .first();
-      if (checkAgain && checkAgain.topic_id !== 'creating') {
-        topicIdCache.set(chatId, checkAgain.topic_id);
-        return checkAgain.topic_id;
-      }
-      // 真正新建
-      const userName = userInfo.username || `User_${chatId}`;
-      const nickname = userInfo.nickname || userName;
-      const topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
-      await env.D1.prepare('UPDATE chat_topic_mappings SET topic_id = ? WHERE chat_id = ?')
-        .bind(topicId, chatId)
-        .run();
-      topicIdCache.set(chatId, topicId);
-      return topicId;
     }
 
     async function handleResetUser(chatId, topicId, text) {
@@ -1417,50 +1491,147 @@ export default {
 
     async function createForumTopic(topicName, userName, nickname, userId) {
       try {
-        console.log(`开始创建话题，昵称: ${nickname}, 用户名: ${userName}, 用户ID: ${userId}`);
-        
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: GROUP_ID, name: `${nickname}` })
-        });
-        
-        const data = await response.json();
-        if (!data.ok) {
-          throw new Error(`创建话题失败: ${data.description || '未知错误'}`);
-        }
-        
-        const topicId = data.result.message_thread_id;
-        console.log(`话题创建成功，ID: ${topicId}`);
+        // 先检查数据库中是否已有映射
+        const existingMapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id != ?')
+          .bind(userId, 'creating')
+          .first();
 
-        const now = new Date();
-        const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
-        const notificationContent = await getNotificationContent();
-        const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
-        
-        console.log(`发送置顶消息到话题: ${topicId}`);
-        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
-        
-        if (!messageResponse || !messageResponse.ok) {
-          console.error(`发送置顶消息失败: ${messageResponse?.description || '未知错误'}`);
-          return topicId; // 仍然返回话题ID，即使置顶消息发送失败
+        if (existingMapping && existingMapping.topic_id) {
+          console.log(`用户 ${userId} 已有话题ID: ${existingMapping.topic_id}，直接返回现有话题`);
+          return existingMapping.topic_id;
         }
         
-        const messageId = messageResponse.result.message_id;
-        console.log(`置顶消息创建成功，ID: ${messageId}`);
+        // 检查是否有其他进程正在创建话题
+        const lockKey = `create_topic:${userId}`;
+        if (CREATION_LOCKS.has(lockKey)) {
+          console.log(`用户 ${userId} 已有其他进程正在创建话题，等待结果`);
+          
+          // 在等待过程中定期检查数据库，看是否已经创建完成
+          for (let i = 0; i < 10; i++) {
+            // 每次等待时间递增
+            await new Promise(resolve => setTimeout(resolve, 300 * (i + 1)));
+            
+            const checkAgain = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id != ?')
+              .bind(userId, 'creating')
+              .first();
+            
+            if (checkAgain && checkAgain.topic_id) {
+              console.log(`等待期间发现用户 ${userId} 已有话题ID: ${checkAgain.topic_id}`);
+              return checkAgain.topic_id;
+            }
+          }
+          
+          // 如果等待超时，则强制清理旧的锁并重试
+          console.log(`等待创建话题超时，强制清理旧锁`);
+        }
+        
+        // 获取创建锁
+        CREATION_LOCKS.set(lockKey, Date.now());
         
         try {
-          await pinMessage(topicId, messageId);
-          console.log(`消息置顶成功，话题ID: ${topicId}, 消息ID: ${messageId}`);
-        } catch (pinError) {
-          console.error(`消息置顶失败: ${pinError.message}`);
-          // 置顶失败不影响话题使用
+          console.log(`开始为用户 ${userId} 创建话题: ${topicName}`);
+          
+          // 再次检查数据库确保无重复创建
+          const lastCheck = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id != ?')
+            .bind(userId, 'creating')
+            .first();
+            
+          if (lastCheck && lastCheck.topic_id) {
+            console.log(`最后检查发现用户 ${userId} 已有话题ID: ${lastCheck.topic_id}`);
+            return lastCheck.topic_id;
+          }
+          
+          // 创建话题
+          const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: GROUP_ID,
+              name: topicName,
+              icon_color: 9367192
+            })
+          });
+          
+          if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(`创建话题失败: ${errorData.description || '未知错误'}`);
+          }
+          
+          const data = await response.json();
+          const topicId = data.result.message_thread_id;
+          console.log(`成功创建话题，ID: ${topicId}`);
+          
+          // 更新数据库，从临时标记改为实际话题ID
+          try {
+            await env.D1.prepare('UPDATE chat_topic_mappings SET topic_id = ? WHERE chat_id = ?')
+              .bind(topicId, userId)
+              .run();
+              
+            console.log(`话题ID已更新到数据库 - 用户: ${userId}, 话题ID: ${topicId}`);
+          } catch (dbError) {
+            console.error(`更新话题ID到数据库失败: ${dbError.message}`);
+            
+            // 如果更新失败，尝试插入
+            try {
+              await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
+                .bind(userId, topicId)
+                .run();
+              console.log(`话题ID已插入到数据库 - 用户: ${userId}, 话题ID: ${topicId}`);
+            } catch (insertError) {
+              console.error(`插入话题ID失败: ${insertError.message}`);
+            }
+          }
+          
+          // 更新缓存
+          topicIdCache.set(userId, topicId);
+          
+          // 发送欢迎消息到新话题
+          const now = new Date();
+          const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
+          const notificationContent = await getNotificationContent();
+          const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+          
+          try {
+            // 发送消息并尝试置顶
+            const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
+            if (messageResponse && messageResponse.ok) {
+              const messageId = messageResponse.result.message_id;
+              try {
+                await pinMessage(topicId, messageId);
+              } catch (pinError) {
+                console.error(`消息置顶失败: ${pinError.message}`);
+              }
+            }
+          } catch (messageError) {
+            console.error(`发送欢迎消息失败: ${messageError.message}`);
+            // 不影响主流程
+          }
+          
+          return topicId;
+        } finally {
+          // 无论成功失败都释放锁
+          CREATION_LOCKS.delete(lockKey);
         }
-
-        return topicId;
       } catch (error) {
         console.error(`创建话题过程中发生错误: ${error.message}`);
-        throw error; // 重新抛出错误，让调用者处理
+        
+        // 清理可能的临时标记
+        try {
+          const tempMapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+            .bind(userId, 'creating')
+            .first();
+            
+          if (tempMapping) {
+            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+              .bind(userId, 'creating')
+              .run();
+            console.log(`已清理临时标记 - 用户: ${userId}`);
+          }
+        } catch (cleanupError) {
+          console.error(`清理临时标记失败: ${cleanupError.message}`);
+        }
+        
+        throw error;
       }
     }
 
