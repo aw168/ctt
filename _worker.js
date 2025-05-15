@@ -4,8 +4,8 @@ let MAX_MESSAGES_PER_MINUTE;
 
 // 添加当前版本常量
 const CURRENT_VERSION = "v1.3.0";
-const VERSION_CHECK_URL = "https://raw.githubusercontent.com/iawooo/tz/refs/heads/main/CFTeleTrans/tag.md?token=GHSAT0AAAAAADAQE7XDNTJMBTSZB6F4AG6U2BFR63Q";
-const UPDATE_INFO_URL = "https://raw.githubusercontent.com/iawooo/tz/refs/heads/main/CFTeleTrans/admin.md?token=GHSAT0AAAAAADAQE7XCXKEPJGD2UXCQZFDY2BFR7GA";
+const VERSION_CHECK_URL = "https://raw.githubusercontent.com/iawooo/tz/refs/heads/main/CFTeleTrans/tag.md?token=GHSAT0AAAAAADAQE7XCFVLEXGIPRG3JGR4Y2BFS4MA";
+const UPDATE_INFO_URL = "https://raw.githubusercontent.com/iawooo/tz/refs/heads/main/CFTeleTrans/admin.md?token=GHSAT0AAAAAADAQE7XC3UOM36HI5FLNWL5I2BFS35A";
 
 let lastCleanupTime = 0;
 let lastCacheCleanupTime = 0;
