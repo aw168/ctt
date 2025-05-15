@@ -714,56 +714,81 @@ export default {
     }
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
-      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-      const hasUpdate = await hasNewVersion();
+      try {
+        const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+        const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
+        
+        // 增加try-catch，确保版本检测失败不影响面板显示
+        let hasUpdate = false;
+        try {
+          hasUpdate = await hasNewVersion();
+        } catch (error) {
+          console.error(`版本检测失败: ${error.message}`);
+        }
 
-      const buttons = [
-        [
-          { text: '拉黑用户', callback_data: `block_${privateChatId}` },
-          { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
-        ],
-        [
-          { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
-          { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
-        ],
-        [
-          { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
-          { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
-        ],
-        [
-          { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
-        ]
-      ];
-      
-      // 如果有新版本，添加更新信息按钮
-      if (hasUpdate) {
-        buttons.push([
-          { text: '🔄 有新版本可用', callback_data: `show_update_${privateChatId}` }
+        const buttons = [
+          [
+            { text: '拉黑用户', callback_data: `block_${privateChatId}` },
+            { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
+          ],
+          [
+            { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
+            { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
+          ],
+          [
+            { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
+            { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
+          ],
+          [
+            { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
+          ]
+        ];
+        
+        // 如果有新版本，添加更新信息按钮
+        if (hasUpdate) {
+          buttons.push([
+            { text: '🔄 有新版本可用', callback_data: `show_update_${privateChatId}` }
+          ]);
+        }
+
+        const adminMessage = '管理员面板：请选择操作' + (hasUpdate ? '\n🔄 检测到新版本！' : '');
+        await Promise.all([
+          fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_thread_id: topicId,
+              text: adminMessage,
+              reply_markup: { inline_keyboard: buttons }
+            })
+          }),
+          fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: messageId
+            })
+          })
         ]);
+      } catch (error) {
+        console.error(`发送管理面板失败: ${error.message}`);
+        // 尝试发送简化版面板
+        try {
+          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_thread_id: topicId,
+              text: '管理员面板加载失败，请稍后再试。'
+            })
+          });
+        } catch (sendError) {
+          console.error(`发送简化面板也失败: ${sendError.message}`);
+        }
       }
-
-      const adminMessage = '管理员面板：请选择操作' + (hasUpdate ? '\n🔄 检测到新版本！' : '');
-      await Promise.all([
-        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_thread_id: topicId,
-            text: adminMessage,
-            reply_markup: { inline_keyboard: buttons }
-          })
-        }),
-        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: messageId
-          })
-        })
-      ]);
     }
 
     async function getVerificationSuccessMessage() {
@@ -1089,14 +1114,19 @@ export default {
           ]);
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
         } else if (action === 'show_update') {
-          const hasUpdate = await hasNewVersion();
-          if (hasUpdate) {
-            const updateInfo = await getUpdateInfo();
-            const remoteVersion = await getRemoteVersion();
-            const updateMessage = `🔄 检测到新版本！\n\n当前版本: ${CURRENT_VERSION}\n最新版本: ${remoteVersion}\n\n${updateInfo}\n\n请访问GitHub项目更新: https://github.com/iawooo/ctt`;
-            await sendMessageToTopic(topicId, updateMessage);
-          } else {
-            await sendMessageToTopic(topicId, `当前已是最新版本 ${CURRENT_VERSION}，无需更新。`);
+          try {
+            const hasUpdate = await hasNewVersion();
+            if (hasUpdate) {
+              const updateInfo = await getUpdateInfo();
+              const remoteVersion = await getRemoteVersion();
+              const updateMessage = `🔄 检测到新版本！\n\n当前版本: ${CURRENT_VERSION}\n最新版本: ${remoteVersion}\n\n${updateInfo}\n\n请访问GitHub项目更新: https://github.com/iawooo/ctt`;
+              await sendMessageToTopic(topicId, updateMessage);
+            } else {
+              await sendMessageToTopic(topicId, `当前已是最新版本 ${CURRENT_VERSION}，无需更新。`);
+            }
+          } catch (error) {
+            console.error(`显示更新信息失败: ${error.message}`);
+            await sendMessageToTopic(topicId, `获取更新信息失败，请稍后再试或直接访问GitHub项目: https://github.com/iawooo/ctt`);
           }
         } else {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
@@ -1565,7 +1595,13 @@ export default {
     // 获取远程版本信息
     async function getRemoteVersion() {
       try {
-        const response = await fetch(VERSION_CHECK_URL);
+        // 添加超时控制
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 3000); // 3秒超时
+        
+        const response = await fetch(VERSION_CHECK_URL, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        
         if (!response.ok) {
           console.error(`获取远程版本失败: ${response.status}`);
           return CURRENT_VERSION; // 如果获取失败，返回当前版本，防止误报更新
@@ -1582,7 +1618,13 @@ export default {
     // 获取更新信息
     async function getUpdateInfo() {
       try {
-        const response = await fetch(UPDATE_INFO_URL);
+        // 添加超时控制
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 3000); // 3秒超时
+        
+        const response = await fetch(UPDATE_INFO_URL, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        
         if (!response.ok) {
           console.error(`获取更新信息失败: ${response.status}`);
           return "获取更新信息失败，请直接访问项目仓库查看。";
@@ -1598,8 +1640,13 @@ export default {
 
     // 检查是否有新版本
     async function hasNewVersion() {
-      const remoteVersion = await getRemoteVersion();
-      return remoteVersion !== CURRENT_VERSION;
+      try {
+        const remoteVersion = await getRemoteVersion();
+        return remoteVersion !== CURRENT_VERSION;
+      } catch (error) {
+        console.error(`版本比较失败: ${error.message}`);
+        return false; // 如果发生错误，返回false表示没有新版本
+      }
     }
 
     try {
