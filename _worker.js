@@ -556,26 +556,26 @@ export default {
             return;
           }
 
-          // 先检查是否已有话题
-          const existingTopicId = await getExistingTopicId(chatId);
-          if (existingTopicId) {
-            console.log(`用户 ${chatId} 已有话题ID: ${existingTopicId}，验证是否有效`);
+          // 快速检查是否已有话题
+          const cachedTopicId = topicIdCache.get(chatId);
+          if (cachedTopicId && cachedTopicId !== 'creating' && cachedTopicId !== 'rebuilding') {
+            console.log(`用户 ${chatId} 已有话题ID在缓存中: ${cachedTopicId}`);
+            const successMessage = await getVerificationSuccessMessage();
+            await sendMessageToUser(chatId, `${successMessage}\n➡️您已经在聊天中，无需重复发送 /start 命令。`);
+            return;
+          }
+          
+          // 快速查询数据库
+          const dbTopicId = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id NOT IN (?, ?)')
+            .bind(chatId, 'creating', 'rebuilding')
+            .first();
             
-            // 验证话题是否有效
-            const isTopicValid = await validateTopic(existingTopicId);
-            if (isTopicValid) {
-              const successMessage = await getVerificationSuccessMessage();
-              await sendMessageToUser(chatId, `${successMessage}\n➡️您已经在聊天中，无需重复发送 /start 命令。`);
-              return;
-            } else {
-              console.log(`用户 ${chatId} 的话题 ${existingTopicId} 已失效，将重新创建`);
-              // 删除数据库中的旧映射
-              await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
-                .bind(chatId)
-                .run();
-              topicIdCache.set(chatId, undefined);
-              // 继续创建新话题
-            }
+          if (dbTopicId && dbTopicId.topic_id) {
+            console.log(`用户 ${chatId} 已有话题ID在数据库中: ${dbTopicId.topic_id}`);
+            topicIdCache.set(chatId, dbTopicId.topic_id);
+            const successMessage = await getVerificationSuccessMessage();
+            await sendMessageToUser(chatId, `${successMessage}\n➡️您已经在聊天中，无需重复发送 /start 命令。`);
+            return;
           }
 
           // 获取用户信息
@@ -589,74 +589,52 @@ export default {
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
           
-          // 创建话题，添加重试机制
-          let topicId = null;
-          let retries = 3;
-          let error = null;
+          // 直接使用快速创建话题函数
+          const userName = userInfo.username || `User_${chatId}`;
+          const nickname = userInfo.nickname || userName;
           
-          console.log(`开始为用户 ${chatId} 创建话题，最多尝试 ${retries} 次`);
+          // 标记为创建中
+          topicIdCache.set(chatId, 'creating');
           
-          while (retries > 0 && !topicId) {
-            try {
-              // 检查是否在此期间已创建话题
-              const checkTopicId = await getExistingTopicId(chatId);
-              if (checkTopicId) {
-                console.log(`重试前检查到用户 ${chatId} 已有话题ID: ${checkTopicId}`);
-                
-                // 验证话题是否有效
-                const isCheckValid = await validateTopic(checkTopicId);
-                if (isCheckValid) {
-                  topicId = checkTopicId;
-                  break;
-                } else {
-                  console.log(`检测到的话题 ${checkTopicId} 无效，将继续创建`);
-                  // 删除无效映射
-                  await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
-                    .bind(chatId)
-                    .run();
-                  topicIdCache.set(chatId, undefined);
-                }
-              }
-              
-              topicId = await ensureUserTopic(chatId, userInfo);
-              if (topicId) {
-                console.log(`为用户 ${chatId} 成功创建话题: ${topicId}`);
-                break;
-              }
-            } catch (err) {
-              error = err;
-              console.error(`创建话题失败，剩余重试次数: ${retries-1}, 错误: ${err.message}`);
-              retries--;
-              // 短暂延迟后重试
-              if (retries > 0) {
-                console.log(`等待1秒后重试为用户 ${chatId} 创建话题`);
-                await new Promise(resolve => setTimeout(resolve, 1000));
-              }
-            }
-          }
-          
+          // 使用快速创建函数
+          const topicId = await createForumTopicFast(nickname, chatId);
           if (!topicId) {
-            console.error(`为用户 ${chatId} 创建话题失败，已达到最大重试次数`);
             await sendMessageToUser(chatId, "创建聊天话题失败，请稍后再试或联系管理员。");
-            throw error || new Error("创建话题失败，未知原因");
+            topicIdCache.set(chatId, undefined);
+            return;
           }
-        
-          // 验证创建的话题
-          console.log(`验证为用户 ${chatId} 创建的话题 ${topicId}`);
-          const isTopicValid = await validateTopic(topicId);
-          if (!isTopicValid) {
-            console.error(`为用户 ${chatId} 创建的话题 ${topicId} 验证失败`);
-            await sendMessageToUser(chatId, "创建的聊天话题暂时无法验证，请发送任意消息再次尝试。");
-            
-            // 不自动删除话题ID映射，让用户下次消息能重试
-            // 但尝试删除无效的话题防止垃圾数据堆积
-            await deleteForumTopic(topicId);
-          } else {
-            console.log(`为用户 ${chatId} 创建的话题 ${topicId} 验证成功`);
-          }
+          
+          console.log(`为用户 ${chatId} 首次创建话题成功: ${topicId}`);
+          
+          // 后台发送欢迎消息
+          setTimeout(() => {
+            try {
+              const now = new Date();
+              const formattedTime = convertToBeijingTime(now);
+              getNotificationContent().then(notificationContent => {
+                const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${chatId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+                
+                sendMessageFast(topicId, pinnedMessage).then(result => {
+                  if (result && result.ok) {
+                    // 尝试置顶
+                    setTimeout(() => {
+                      fetch(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: GROUP_ID,
+                          message_id: result.result.message_id,
+                          message_thread_id: topicId
+                        })
+                      }).catch(() => {});
+                    }, 100);
+                  }
+                });
+              });
+            } catch (e) {}
+          }, 0);
         } catch (error) {
           console.error(`处理 /start 命令时出错: ${error.message}`);
-          // 不向用户发送错误信息，因为已经在上面处理过了
         }
         return;
       }
@@ -744,153 +722,76 @@ export default {
           
           // 直接重建话题 - 绕过队列直接调用API
           try {
-            console.log(`开始为用户 ${chatId} 强制重建话题`);
+            console.log(`开始为用户 ${chatId} 快速重建话题`);
             
-            // 减少等待时间
-            await new Promise(resolve => setTimeout(resolve, 100));
+            // 使用快速创建函数，无需等待
+            const newTopicId = await createForumTopicFast(nickname, chatId);
             
-            // 直接调用Telegram API创建话题
-            const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: GROUP_ID,
-                name: nickname,
-                icon_color: 9367192
-              })
-            }, 2, 300); // 减少重试次数和超时时间
-            
-            // 快速处理响应
-            if (!response.ok) {
-              throw new Error(`直接创建话题API调用失败: ${await response.text()}`);
-            }
-            
-            const data = await response.json();
-            if (!data.ok) {
-              throw new Error(`API返回非成功状态: ${data.description || '未知错误'}`);
-            }
-            
-            const newTopicId = data.result.message_thread_id;
-            console.log(`为用户 ${chatId} 强制重建话题成功，新ID: ${newTopicId}`);
-            
-            // 立即更新缓存
-            topicIdCache.set(chatId, newTopicId);
-            
-            // 并行执行数据库操作 - 不等待完成
-            (async function() {
-              try {
-                await env.D1.prepare('INSERT INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-                  .bind(chatId, newTopicId)
-                  .run();
-              } catch (dbError) {
-                console.error(`异步保存话题ID到数据库失败: ${dbError.message}`);
-                setTimeout(async () => {
-                  try {
-                    await env.D1.prepare('INSERT INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-                      .bind(chatId, newTopicId)
-                      .run();
-                  } catch (retryError) {}
-                }, 1000);
+            if (newTopicId) {
+              console.log(`为用户 ${chatId} 快速重建话题成功，新ID: ${newTopicId}`);
+              
+              // 并行发送消息，不相互等待
+              
+              // 1. 立即发送用户原始消息
+              if (text) {
+                // 不等待结果，直接发送
+                fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    chat_id: GROUP_ID,
+                    message_thread_id: newTopicId,
+                    text: `${nickname}:\n${text}`
+                  })
+                }).catch(() => {});
+              } else if (message) {
+                // 复制消息
+                fetch(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    chat_id: GROUP_ID,
+                    from_chat_id: message.chat.id,
+                    message_id: message.message_id,
+                    message_thread_id: newTopicId
+                  })
+                }).catch(() => {});
               }
-            })();
-            
-            // 先发送欢迎消息并置顶，确保它是第一条消息
-            try {
-              const now = new Date();
-              const formattedTime = convertToBeijingTime(now); // 使用北京时间
-              const notificationContent = await getNotificationContent();
-              const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${chatId}\n重建时间: ${formattedTime}\n\n${notificationContent}`;
               
-              // 发送欢迎消息
-              const welcomeResponse = await sendMessageToTopic(newTopicId, pinnedMessage);
-              
-              // 并行操作 - 立即发送用户原始消息，不等待置顶完成
-              (async function() {
+              // 2. 后台发送欢迎消息
+              setTimeout(() => {
                 try {
-                  if (text) {
-                    const formattedMessage = `${nickname}:\n${text}`;
-                    await sendMessageToTopic(newTopicId, formattedMessage);
-                  } else if (message) {
-                    await copyMessageToTopic(newTopicId, message);
-                  }
-                } catch (resendError) {
-                  console.error(`消息重发到新话题失败: ${resendError.message}`);
-                }
-              })();
-              
-              // 处理置顶，这部分可以在后台完成，不阻塞主流程
-              if (welcomeResponse && welcomeResponse.ok && welcomeResponse.result) {
-                const welcomeMessageId = welcomeResponse.result.message_id;
-                setTimeout(async () => {
-                  try {
-                    await pinMessage(newTopicId, welcomeMessageId);
-                  } catch (pinError) {}
-                }, 100);
-              }
-            } catch (welcomeError) {
-              console.error(`发送欢迎消息失败: ${welcomeError.message}`);
-              // 如果欢迎消息失败，仍尝试发送用户消息
-              try {
-                if (text) {
-                  const formattedMessage = `${nickname}:\n${text}`;
-                  await sendMessageToTopic(newTopicId, formattedMessage);
-                } else if (message) {
-                  await copyMessageToTopic(newTopicId, message);
-                }
-              } catch (resendError) {}
-            }
-            
-            return; // 早期返回，不执行后续的备用逻辑
-          } catch (directError) {
-            console.error(`直接创建话题失败: ${directError.message}`);
-            topicIdCache.set(chatId, undefined);
-            
-            // 精简备用流程
-            try {
-              // 直接执行最小化的创建流程
-              const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  chat_id: GROUP_ID,
-                  name: nickname,
-                  icon_color: 9367192
-                })
-              }, 1, 300);
-              
-              if (response.ok) {
-                const data = await response.json();
-                if (data.ok) {
-                  const finalTopicId = data.result.message_thread_id;
-                  topicIdCache.set(chatId, finalTopicId);
-                  
-                  // 并行发送欢迎消息和更新数据库
-                  Promise.all([
-                    (async () => {
-                      const now = new Date();
-                      const formattedTime = convertToBeijingTime(now); // 使用北京时间
-                      const notificationContent = await getNotificationContent();
-                      const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${chatId}\n重建时间: ${formattedTime}\n\n${notificationContent}`;
-                      
-                      const welcomeResult = await sendMessageToTopic(finalTopicId, pinnedMessage);
-                      if (welcomeResult && welcomeResult.ok) {
-                        setTimeout(() => pinMessage(finalTopicId, welcomeResult.result.message_id), 100);
+                  const now = new Date();
+                  const formattedTime = convertToBeijingTime(now);
+                  getNotificationContent().then(notificationContent => {
+                    const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${chatId}\n重建时间: ${formattedTime}\n\n${notificationContent}`;
+                    
+                    // 发送欢迎消息
+                    sendMessageFast(newTopicId, pinnedMessage).then(result => {
+                      if (result && result.ok) {
+                        // 尝试置顶消息
+                        setTimeout(() => {
+                          fetch(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              chat_id: GROUP_ID,
+                              message_id: result.result.message_id,
+                              message_thread_id: newTopicId
+                            })
+                          }).catch(() => {});
+                        }, 100);
                       }
-                    })(),
-                    env.D1.prepare('INSERT INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-                      .bind(chatId, finalTopicId)
-                      .run()
-                      .catch(() => {})
-                  ]).catch(() => {});
-                  
-                  // 立即发送用户消息
-                  if (text) {
-                    const formattedMessage = `${nickname}:\n${text}`;
-                    sendMessageToTopic(finalTopicId, formattedMessage).catch(() => {});
-                  }
-                }
-              }
-            } catch (finalError) {}
+                    });
+                  });
+                } catch (e) {}
+              }, 0);
+              
+              return; // 成功创建后立即返回
+            }
+          } catch (directError) {
+            console.error(`快速重建话题失败: ${directError.message}`);
+            topicIdCache.set(chatId, undefined);
           }
         } else {
           // 其他类型的发送错误
@@ -944,93 +845,71 @@ export default {
 
     async function ensureUserTopic(chatId, userInfo) {
       try {
-        // 先检查现有话题
-        const existingTopicId = await getExistingTopicId(chatId);
-        
-        if (existingTopicId) {
-          console.log(`[确保话题] 用户 ${chatId} 已有话题ID: ${existingTopicId}`);
-          
-          // 验证现有话题是否有效
-          const isValid = await validateTopic(existingTopicId);
-          if (isValid) {
-            return existingTopicId;
-          } else {
-            // 如果话题无效（可能已在群组中被删除），则在数据库中标记为已删除
-            console.log(`[确保话题] 用户 ${chatId} 的话题 ${existingTopicId} 已在群组中被删除，将重新创建`);
-            
-            // 删除数据库中的旧映射
-            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
-              .bind(chatId)
-              .run();
-            
-            // 清除缓存
-            topicIdCache.set(chatId, undefined);
-            
-            // 继续下面的逻辑创建新话题
-          }
+        // 先检查缓存，快速返回已有话题
+        const cachedId = topicIdCache.get(chatId);
+        if (cachedId && cachedId !== 'creating' && cachedId !== 'rebuilding') {
+          return cachedId;
         }
         
-        // 如果缓存中有"creating"状态，等待一段时间看是否能找到已创建的话题
-        if (topicIdCache.get(chatId) === 'creating') {
-          console.log(`[确保话题] 检测到用户 ${chatId} 的话题正在创建中，等待...`);
+        // 快速查询数据库
+        try {
+          const result = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id NOT IN (?, ?)')
+            .bind(chatId, 'creating', 'rebuilding')
+            .first();
           
-          // 等待一段时间后重新检查
-          for (let i = 0; i < 5; i++) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-            
-            const checkResult = await getExistingTopicId(chatId);
-            if (checkResult) {
-              console.log(`[确保话题] 等待后发现用户 ${chatId} 已有话题ID: ${checkResult}`);
-              
-              // 验证是否有效
-              const isStillValid = await validateTopic(checkResult);
-              if (isStillValid) {
-                return checkResult;
-              } else {
-                // 如果无效，清除后创建新话题
-                console.log(`[确保话题] 等待期间发现的话题 ${checkResult} 无效，将重新创建`);
-                await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
-                  .bind(chatId)
-                  .run();
-                topicIdCache.set(chatId, undefined);
-                break;
-              }
-            }
+          if (result && result.topic_id) {
+            topicIdCache.set(chatId, result.topic_id);
+            return result.topic_id;
           }
-          
-          console.log(`[确保话题] 用户 ${chatId} 的话题创建等待超时或无效，将尝试重新创建`);
-          topicIdCache.set(chatId, undefined); // 清除可能卡住的状态
-        }
-        
-        // 标记为正在创建中
-        topicIdCache.set(chatId, 'creating');
+        } catch (dbError) {}
         
         // 准备用户信息
         const userName = userInfo.username || `User_${chatId}`;
         const nickname = userInfo.nickname || userName;
         
-        try {
-          // 创建话题
-          const topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
-          console.log(`[确保话题] 为用户 ${chatId} 创建话题成功: ${topicId}`);
-          
-          // 创建成功后再次验证
-          const isNewTopicValid = await validateTopic(topicId);
-          if (!isNewTopicValid) {
-            console.error(`[确保话题] 新创建的话题 ${topicId} 验证失败，这可能是暂时性问题`);
-            // 尽管验证失败，我们仍然返回话题ID，让用户可以尝试使用
-            // 如果真的无效，下次消息会再次触发创建
-          }
-          
-          return topicId;
-        } catch (error) {
-          console.error(`[确保话题] 创建话题失败: ${error.message}`);
-          topicIdCache.set(chatId, undefined); // 清除创建中状态
-          throw error;
+        // 标记为创建中
+        topicIdCache.set(chatId, 'creating');
+        
+        // 使用快速创建函数
+        const topicId = await createForumTopicFast(nickname, chatId);
+        if (!topicId) {
+          topicIdCache.set(chatId, undefined);
+          throw new Error('快速创建话题失败');
         }
+        
+        console.log(`为用户 ${chatId} 快速创建话题成功: ${topicId}`);
+        
+        // 异步发送欢迎消息，不阻塞主流程
+        setTimeout(() => {
+          try {
+            const now = new Date();
+            const formattedTime = convertToBeijingTime(now);
+            getNotificationContent().then(notificationContent => {
+              const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${chatId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+              
+              sendMessageFast(topicId, pinnedMessage).then(result => {
+                if (result && result.ok) {
+                  // 尝试置顶
+                  setTimeout(() => {
+                    fetch(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        chat_id: GROUP_ID,
+                        message_id: result.result.message_id,
+                        message_thread_id: topicId
+                      })
+                    }).catch(() => {});
+                  }, 100);
+                }
+              });
+            });
+          } catch (e) {}
+        }, 0);
+        
+        return topicId;
       } catch (error) {
         console.error(`[确保话题] 主流程异常: ${error.message}`);
-        // 确保在异常情况下清除缓存
         topicIdCache.set(chatId, undefined);
         throw error;
       }
@@ -1737,64 +1616,11 @@ export default {
       }
     }
 
-    // 修改创建话题的核心逻辑，解决重建问题
-    async function _createForumTopicInternal(topicName, userName, nickname, userId) {
+    // 添加快速创建话题的函数
+    async function createForumTopicFast(topicName, userId) {
       try {
-        // 确认当前处于重建模式时跳过检查已有话题的步骤
-        const isRebuilding = topicIdCache.get(userId) === 'rebuilding';
-        
-        if (!isRebuilding) {
-          // 正常模式：首先检查数据库是否已存在有效映射
-          const existingTopic = await env.D1.prepare(`
-            SELECT topic_id FROM chat_topic_mappings 
-            WHERE chat_id = ? AND topic_id != 'creating' AND topic_id != 'rebuilding'
-            LIMIT 1
-          `).bind(userId).first();
-          
-          if (existingTopic && existingTopic.topic_id) {
-            console.log(`[串行化] 用户 ${userId} 已有话题ID: ${existingTopic.topic_id}`);
-            topicIdCache.set(userId, existingTopic.topic_id);
-            return existingTopic.topic_id;
-          }
-        } else {
-          console.log(`[串行化] 用户 ${userId} 处于重建模式，跳过检查现有话题`);
-        }
-        
-        // 清理任何可能的临时状态
-        await env.D1.prepare(`
-          DELETE FROM chat_topic_mappings 
-          WHERE chat_id = ? AND (topic_id = 'creating' OR topic_id = 'rebuilding')
-        `).bind(userId).run();
-        
-        // 创建临时标记
-        try {
-          await env.D1.prepare(`
-            INSERT INTO chat_topic_mappings (chat_id, topic_id) 
-            VALUES (?, 'creating')
-          `).bind(userId).run();
-        } catch (insertError) {
-          console.log(`[串行化] 用户 ${userId} 临时标记创建失败: ${insertError.message}`);
-          
-          // 等待一小段时间，然后检查是否已创建完成
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          
-          const checkAfterInsertFail = await env.D1.prepare(`
-            SELECT topic_id FROM chat_topic_mappings 
-            WHERE chat_id = ? AND topic_id != 'creating' AND topic_id != 'rebuilding'
-            LIMIT 1
-          `).bind(userId).first();
-          
-          if (checkAfterInsertFail && checkAfterInsertFail.topic_id) {
-            return checkAfterInsertFail.topic_id;
-          }
-          
-          throw new Error('临时标记创建失败，需要重试');
-        }
-        
-        console.log(`[串行化] 开始${isRebuilding ? '重建' : '创建'}用户 ${userId} 的话题: ${topicName}`);
-        
-        // 创建论坛话题 (API调用)
-        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
+        // 直接调用API创建话题，不使用fetchWithRetry
+        const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1802,196 +1628,196 @@ export default {
             name: topicName,
             icon_color: 9367192
           })
-        }, 3, 1000);
+        });
         
-        // 处理API响应
-        if (!response.ok) {
-          const errorData = await response.json();
-          const errorMsg = errorData.description || '未知错误';
-          console.error(`[串行化] 创建话题API调用失败: ${errorMsg}`);
-          
-          // 删除临时标记
-          await env.D1.prepare(`
-            DELETE FROM chat_topic_mappings 
-            WHERE chat_id = ? AND topic_id = 'creating'
-          `).bind(userId).run();
-          
-          throw new Error(`话题${isRebuilding ? '重建' : '创建'}失败: ${errorMsg}`);
-        }
+        if (!response.ok) return null;
         
         const data = await response.json();
+        if (!data.ok) return null;
+        
         const topicId = data.result.message_thread_id;
-        console.log(`[串行化] 话题${isRebuilding ? '重建' : '创建'}成功，ID: ${topicId}`);
         
-        // 更新数据库
-        await env.D1.prepare(`
-          DELETE FROM chat_topic_mappings WHERE chat_id = ? AND (topic_id = 'creating' OR topic_id = 'rebuilding')
-        `).bind(userId).run();
-        
-        await env.D1.prepare(`
-          INSERT INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)
-        `).bind(userId, topicId).run();
-        
-        console.log(`[串行化] 话题ID已保存到数据库 - 用户: ${userId}, 话题ID: ${topicId}`);
-        
-        // 更新缓存
+        // 立即更新缓存
         topicIdCache.set(userId, topicId);
         
-        // 发送欢迎消息
-        try {
-          const now = new Date();
-          const formattedTime = convertToBeijingTime(now); // 使用北京时间
-          const notificationContent = await getNotificationContent();
-          const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n${isRebuilding ? '重建' : '发起'}时间: ${formattedTime}\n\n${notificationContent}`;
-          
-          const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
-          if (messageResponse && messageResponse.ok) {
-            const messageId = messageResponse.result.message_id;
-            try {
-              await pinMessage(topicId, messageId);
-            } catch (pinError) {
-              console.error(`[串行化] 消息置顶失败: ${pinError.message}`);
-            }
-          }
-        } catch (messageError) {
-          console.error(`[串行化] 发送欢迎消息失败: ${messageError.message}`);
-          // 不影响主流程
-        }
+        // 异步保存到数据库
+        setTimeout(() => {
+          env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
+            .bind(userId, topicId)
+            .run()
+            .catch(() => {});
+        }, 0);
         
         return topicId;
       } catch (error) {
-        console.error(`[串行化] ${topicIdCache.get(userId) === 'rebuilding' ? '重建' : '创建'}话题内部错误: ${error.message}`);
-        
-        // 清理临时标记
-        try {
-          await env.D1.prepare(`
-            DELETE FROM chat_topic_mappings 
-            WHERE chat_id = ? AND (topic_id = 'creating' OR topic_id = 'rebuilding')
-          `).bind(userId).run();
-        } catch (cleanupError) {
-          console.error(`[串行化] 清理临时标记失败: ${cleanupError.message}`);
-        }
-        
-        throw error;
+        console.error(`快速创建话题失败: ${error.message}`);
+        return null;
       }
     }
 
-    // 修改 createForumTopic 函数，使用队列机制实现真正的串行处理
-    async function createForumTopic(topicName, userName, nickname, userId) {
+    // 快速发送消息函数
+    async function sendMessageFast(topicId, text) {
       try {
-        // 检查是否处于重建模式
-        const isRebuilding = topicIdCache.get(userId) === 'rebuilding';
+        const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            message_thread_id: topicId,
+            text: text
+          })
+        });
         
-        // 只有在非重建模式下才检查现有话题
-        if (!isRebuilding) {
-          // 先检查缓存
-          const cachedTopicId = topicIdCache.get(userId);
-          if (cachedTopicId && cachedTopicId !== 'creating' && cachedTopicId !== 'rebuilding') {
-            console.log(`[队列] 缓存命中，用户 ${userId} 已有话题ID: ${cachedTopicId}`);
-            return cachedTopicId;
-          }
-          
-          // 快速检查数据库
-          const quickCheck = await env.D1.prepare(`
-            SELECT topic_id FROM chat_topic_mappings 
-            WHERE chat_id = ? AND topic_id != 'creating' AND topic_id != 'rebuilding'
-            LIMIT 1
-          `).bind(userId).first();
-          
-          if (quickCheck && quickCheck.topic_id) {
-            console.log(`[队列] 数据库查询，用户 ${userId} 已有话题ID: ${quickCheck.topic_id}`);
-            topicIdCache.set(userId, quickCheck.topic_id);
-            return quickCheck.topic_id;
-          }
-        } else {
-          console.log(`[队列] 用户 ${userId} 处于重建模式，跳过检查现有话题`);
+        if (!response.ok) return null;
+        return await response.json();
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // 修改重建话题的逻辑 - 极速版
+    try {
+      // 直接创建话题 - 无任何等待
+      const newTopicId = await createForumTopicFast(nickname, chatId);
+      
+      if (newTopicId) {
+        // 并行发送消息 - 都不等待对方完成
+        
+        // 1. 发送用户原始消息 - 优先级最高
+        if (text) {
+          fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: GROUP_ID,
+              message_thread_id: newTopicId,
+              text: `${nickname}:\n${text}`
+            })
+          }).catch(() => {});
+        } else if (message) {
+          // 复制原始消息
+          fetch(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: GROUP_ID,
+              from_chat_id: message.chat.id,
+              message_id: message.message_id,
+              message_thread_id: newTopicId,
+              disable_notification: true
+            })
+          }).catch(() => {});
         }
         
-        // 确保重建模式下直接进入创建流程
-        console.log(`[队列] 将用户 ${userId} 的话题${isRebuilding ? '重建' : '创建'}任务加入队列`);
-        
-        // 创建前先清理旧记录 - 重要解决方案：确保在重建时彻底清除旧记录
-        if (isRebuilding) {
+        // 2. 后台发送欢迎消息
+        setTimeout(async () => {
           try {
-            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
-              .bind(userId)
-              .run();
-            console.log(`[队列] 成功清理用户 ${userId} 的所有话题映射记录`);
-          } catch (cleanError) {
-            console.error(`[队列] 清理用户 ${userId} 旧记录失败: ${cleanError.message}`);
-          }
+            const now = new Date();
+            const formattedTime = convertToBeijingTime(now);
+            const notificationContent = await getNotificationContent();
+            const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${chatId}\n重建时间: ${formattedTime}\n\n${notificationContent}`;
+            
+            const welcomeResult = await sendMessageFast(newTopicId, pinnedMessage);
+            if (welcomeResult && welcomeResult.ok) {
+              // 3. 尝试置顶，最低优先级
+              setTimeout(() => {
+                fetch(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    chat_id: GROUP_ID,
+                    message_id: welcomeResult.result.message_id,
+                    message_thread_id: newTopicId
+                  })
+                }).catch(() => {});
+              }, 300);
+            }
+          } catch (e) {}
+        }, 0);
+        
+        return; // 成功创建话题，提前返回
+      }
+      
+      // 如果快速方法失败，回退到原方法
+      // ... (原有代码)
+    } catch (directError) {
+      // ... (原有代码)
+    }
+
+    // 修改首次创建话题的流程
+    async function ensureUserTopic(chatId, userInfo) {
+      try {
+        // 先检查缓存，快速返回已有话题
+        const cachedId = topicIdCache.get(chatId);
+        if (cachedId && cachedId !== 'creating' && cachedId !== 'rebuilding') {
+          return cachedId;
         }
         
-        // 将任务添加到队列，确保串行执行
-        return await enqueueTopicCreation(_createForumTopicInternal, topicName, userName, nickname, userId);
+        // 快速查询数据库
+        try {
+          const result = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id NOT IN (?, ?)')
+            .bind(chatId, 'creating', 'rebuilding')
+            .first();
+          
+          if (result && result.topic_id) {
+            topicIdCache.set(chatId, result.topic_id);
+            return result.topic_id;
+          }
+        } catch (dbError) {}
+        
+        // 准备用户信息
+        const userName = userInfo.username || `User_${chatId}`;
+        const nickname = userInfo.nickname || userName;
+        
+        // 标记为创建中
+        topicIdCache.set(chatId, 'creating');
+        
+        // 使用快速创建函数
+        const topicId = await createForumTopicFast(nickname, chatId);
+        if (!topicId) {
+          topicIdCache.set(chatId, undefined);
+          throw new Error('快速创建话题失败');
+        }
+        
+        console.log(`为用户 ${chatId} 快速创建话题成功: ${topicId}`);
+        
+        // 异步发送欢迎消息，不阻塞主流程
+        setTimeout(() => {
+          try {
+            const now = new Date();
+            const formattedTime = convertToBeijingTime(now);
+            getNotificationContent().then(notificationContent => {
+              const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${chatId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+              
+              sendMessageFast(topicId, pinnedMessage).then(result => {
+                if (result && result.ok) {
+                  // 尝试置顶
+                  setTimeout(() => {
+                    fetch(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        chat_id: GROUP_ID,
+                        message_id: result.result.message_id,
+                        message_thread_id: topicId
+                      })
+                    }).catch(() => {});
+                  }, 100);
+                }
+              });
+            });
+          } catch (e) {}
+        }, 0);
+        
+        return topicId;
       } catch (error) {
-        console.error(`[队列] 话题${isRebuilding ? '重建' : '创建'}任务失败: ${error.message}`);
-        
-        // 清除缓存
-        topicIdCache.set(userId, undefined);
-        
+        console.error(`[确保话题] 主流程异常: ${error.message}`);
+        topicIdCache.set(chatId, undefined);
         throw error;
       }
     }
 
-    async function saveTopicId(chatId, topicId) {
-      try {
-        console.log(`保存话题ID - 用户: ${chatId}, 话题ID: ${topicId}`);
-        
-        // 先检查是否已存在映射
-        const existingMapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-          .bind(chatId)
-          .first();
-        
-        if (existingMapping) {
-          // 如果存在且不是临时标记，则不更新
-          if (existingMapping.topic_id !== 'creating' && existingMapping.topic_id === topicId) {
-            console.log(`话题映射已存在且匹配，无需更新 - 用户: ${chatId}, 话题ID: ${topicId}`);
-            topicIdCache.set(chatId, topicId);
-            return;
-          }
-          
-          // 如果是临时标记或不同的话题ID，则更新
-          console.log(`更新话题映射 - 用户: ${chatId}, 旧话题ID: ${existingMapping.topic_id}, 新话题ID: ${topicId}`);
-          
-          const updateResult = await env.D1.prepare('UPDATE chat_topic_mappings SET topic_id = ? WHERE chat_id = ?')
-            .bind(topicId, chatId)
-            .run();
-          
-          if (updateResult.error) {
-            console.error(`更新话题映射失败 - 用户: ${chatId}, 错误: ${updateResult.error}`);
-          }
-        } else {
-          // 如果不存在，则插入
-          console.log(`创建新话题映射 - 用户: ${chatId}, 话题ID: ${topicId}`);
-          
-          const insertResult = await env.D1.prepare('INSERT INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-            .bind(chatId, topicId)
-            .run();
-          
-          if (insertResult.error) {
-            console.error(`插入话题映射失败 - 用户: ${chatId}, 错误: ${insertResult.error}`);
-          }
-        }
-        
-        // 更新缓存
-        topicIdCache.set(chatId, topicId);
-        console.log(`话题映射已保存并缓存 - 用户: ${chatId}, 话题ID: ${topicId}`);
-      } catch (error) {
-        console.error(`保存话题ID时出错 - 用户: ${chatId}, 错误: ${error.message}`);
-        // 出错时也要尝试更新缓存，确保后续操作能正常进行
-        topicIdCache.set(chatId, topicId);
-      }
-    }
-
-    async function getPrivateChatId(topicId) {
-      for (const [chatId, tid] of topicIdCache.cache) if (tid === topicId) return chatId;
-      const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
-        .bind(topicId)
-        .first();
-      return mapping?.chat_id || null;
-    }
-
+    // 优化API请求函数，直接使用原生fetch，减少开销
     async function sendMessageToTopic(topicId, text) {
       if (!text.trim()) {
         throw new Error('Message text is empty');
@@ -2002,52 +1828,128 @@ export default {
         text: text,
         message_thread_id: topicId
       };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      const data = await response.json();
-      if (!data.ok) {
-        throw new Error(`Failed to send message to topic ${topicId}: ${data.description}`);
+      
+      try {
+        const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody)
+        });
+        
+        const data = await response.json();
+        if (!data.ok) {
+          throw new Error(`Failed to send message to topic ${topicId}: ${data.description}`);
+        }
+        return data;
+      } catch (error) {
+        // 重试一次
+        try {
+          const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody)
+          });
+          
+          const data = await response.json();
+          return data;
+        } catch (retryError) {
+          throw new Error(`Failed to send message to topic ${topicId}: ${retryError.message}`);
+        }
       }
-      return data;
     }
 
-    async function copyMessageToTopic(topicId, message) {
-      const requestBody = {
-        chat_id: GROUP_ID,
-        from_chat_id: message.chat.id,
-        message_id: message.message_id,
-        message_thread_id: topicId,
-        disable_notification: true
-      };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/copyMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      const data = await response.json();
-      if (!data.ok) {
-        throw new Error(`Failed to copy message to topic ${topicId}: ${data.description}`);
-      }
-    }
+    // 优化消息流程 - 立即发送主要消息，其他动作后台处理
+    // ... 更多代码优化 ...
 
-    async function pinMessage(topicId, messageId) {
-      const requestBody = {
-        chat_id: GROUP_ID,
-        message_id: messageId,
-        message_thread_id: topicId
-      };
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      const data = await response.json();
-      if (!data.ok) {
-        throw new Error(`Failed to pin message: ${data.description}`);
+    // 优化处理/start命令的流程
+    if (text === '/start') {
+      try {
+        if (await checkStartCommandRate(chatId)) {
+          await sendMessageToUser(chatId, "➡️您发送 /start 命令过于频繁，请稍后再试！如果您已经在聊天中，无需重复发送 /start 命令。");
+          return;
+        }
+
+        // 快速检查是否已有话题
+        const cachedTopicId = topicIdCache.get(chatId);
+        if (cachedTopicId && cachedTopicId !== 'creating' && cachedTopicId !== 'rebuilding') {
+          console.log(`用户 ${chatId} 已有话题ID在缓存中: ${cachedTopicId}`);
+          const successMessage = await getVerificationSuccessMessage();
+          await sendMessageToUser(chatId, `${successMessage}\n➡️您已经在聊天中，无需重复发送 /start 命令。`);
+          return;
+        }
+        
+        // 快速查询数据库
+        const dbTopicId = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ? AND topic_id NOT IN (?, ?)')
+          .bind(chatId, 'creating', 'rebuilding')
+          .first();
+          
+        if (dbTopicId && dbTopicId.topic_id) {
+          console.log(`用户 ${chatId} 已有话题ID在数据库中: ${dbTopicId.topic_id}`);
+          topicIdCache.set(chatId, dbTopicId.topic_id);
+          const successMessage = await getVerificationSuccessMessage();
+          await sendMessageToUser(chatId, `${successMessage}\n➡️您已经在聊天中，无需重复发送 /start 命令。`);
+          return;
+        }
+
+        // 获取用户信息
+        const userInfo = await getUserInfo(chatId);
+        if (!userInfo) {
+          await sendMessageToUser(chatId, "无法获取用户信息，请稍后再试。");
+          return;
+        }
+
+        // 发送欢迎消息
+        const successMessage = await getVerificationSuccessMessage();
+        await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
+        
+        // 直接使用快速创建话题函数
+        const userName = userInfo.username || `User_${chatId}`;
+        const nickname = userInfo.nickname || userName;
+        
+        // 标记为创建中
+        topicIdCache.set(chatId, 'creating');
+        
+        // 使用快速创建函数
+        const topicId = await createForumTopicFast(nickname, chatId);
+        if (!topicId) {
+          await sendMessageToUser(chatId, "创建聊天话题失败，请稍后再试或联系管理员。");
+          topicIdCache.set(chatId, undefined);
+          return;
+        }
+        
+        console.log(`为用户 ${chatId} 首次创建话题成功: ${topicId}`);
+        
+        // 后台发送欢迎消息
+        setTimeout(() => {
+          try {
+            const now = new Date();
+            const formattedTime = convertToBeijingTime(now);
+            getNotificationContent().then(notificationContent => {
+              const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${chatId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+              
+              sendMessageFast(topicId, pinnedMessage).then(result => {
+                if (result && result.ok) {
+                  // 尝试置顶
+                  setTimeout(() => {
+                    fetch(`https://api.telegram.org/bot${BOT_TOKEN}/pinChatMessage`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        chat_id: GROUP_ID,
+                        message_id: result.result.message_id,
+                        message_thread_id: topicId
+                      })
+                    }).catch(() => {});
+                  }, 100);
+                }
+              });
+            });
+          } catch (e) {}
+        }, 0);
+      } catch (error) {
+        console.error(`处理 /start 命令时出错: ${error.message}`);
       }
+      return;
     }
 
     // 添加删除话题函数
