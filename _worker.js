@@ -4,8 +4,9 @@ let MAX_MESSAGES_PER_MINUTE;
 
 // 添加当前版本常量
 const CURRENT_VERSION = "v1.3.0";
-const VERSION_CHECK_URL = "https://raw.githubusercontent.com/iawooo/tz/refs/heads/main/CFTeleTrans/tag.md?token=GHSAT0AAAAAADAQE7XCFVLEXGIPRG3JGR4Y2BFS4MA";
-const UPDATE_INFO_URL = "https://raw.githubusercontent.com/iawooo/tz/refs/heads/main/CFTeleTrans/admin.md?token=GHSAT0AAAAAADAQE7XC3UOM36HI5FLNWL5I2BFS35A";
+// 更新链接，移除已过期的token
+const VERSION_CHECK_URL = "https://raw.githubusercontent.com/iawooo/tz/main/CFTeleTrans/tag.md";
+const UPDATE_INFO_URL = "https://raw.githubusercontent.com/iawooo/tz/main/CFTeleTrans/admin.md";
 
 let lastCleanupTime = 0;
 let lastCacheCleanupTime = 0;
@@ -713,7 +714,7 @@ export default {
       await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
     }
 
-    async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
+    async function sendAdminPanel(chatId, topicId, privateChatId, messageId, forceCheckUpdate = true) {
       try {
         const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
         const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
@@ -721,7 +722,13 @@ export default {
         // 增加try-catch，确保版本检测失败不影响面板显示
         let hasUpdate = false;
         try {
-          hasUpdate = await hasNewVersion();
+          if (forceCheckUpdate) {
+            console.log("强制检查更新...");
+            // 清除缓存，确保获取最新版本
+            hasUpdate = await hasNewVersion();
+          } else {
+            hasUpdate = await hasNewVersion();
+          }
         } catch (error) {
           console.error(`版本检测失败: ${error.message}`);
         }
@@ -740,7 +747,8 @@ export default {
             { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
           ],
           [
-            { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
+            { text: '删除用户', callback_data: `delete_user_${privateChatId}` },
+            { text: '检查更新', callback_data: `check_update_${privateChatId}` }
           ]
         ];
         
@@ -946,6 +954,9 @@ export default {
       } else if (data.startsWith('show_update_')) {
         action = 'show_update';
         privateChatId = parts.slice(2).join('_');
+      } else if (data.startsWith('check_update_')) {
+        action = 'check_update';
+        privateChatId = parts.slice(2).join('_');
       } else {
         action = data;
         privateChatId = '';
@@ -1127,6 +1138,22 @@ export default {
           } catch (error) {
             console.error(`显示更新信息失败: ${error.message}`);
             await sendMessageToTopic(topicId, `获取更新信息失败，请稍后再试或直接访问GitHub项目: https://github.com/iawooo/ctt`);
+          }
+        } else if (action === 'check_update') {
+          await sendMessageToTopic(topicId, `正在检查更新...`);
+          try {
+            const remoteVersion = await getRemoteVersion();
+            const hasUpdate = remoteVersion.toLowerCase().trim() !== CURRENT_VERSION.toLowerCase().trim();
+            if (hasUpdate) {
+              const updateInfo = await getUpdateInfo();
+              const updateMessage = `🔄 检测到新版本！\n\n当前版本: ${CURRENT_VERSION}\n最新版本: ${remoteVersion}\n\n${updateInfo}\n\n请访问GitHub项目更新: https://github.com/iawooo/ctt`;
+              await sendMessageToTopic(topicId, updateMessage);
+            } else {
+              await sendMessageToTopic(topicId, `当前已是最新版本 ${CURRENT_VERSION}，无需更新。`);
+            }
+          } catch (error) {
+            console.error(`检查更新失败: ${error.message}`);
+            await sendMessageToTopic(topicId, `检查更新失败，请稍后再试: ${error.message}`);
           }
         } else {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
@@ -1599,7 +1626,7 @@ export default {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 3000); // 3秒超时
         
-        const response = await fetch(VERSION_CHECK_URL, { signal: controller.signal });
+        const response = await fetch(VERSION_CHECK_URL, { signal: controller.signal, cache: 'no-store' });
         clearTimeout(timeoutId);
         
         if (!response.ok) {
@@ -1622,7 +1649,7 @@ export default {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 3000); // 3秒超时
         
-        const response = await fetch(UPDATE_INFO_URL, { signal: controller.signal });
+        const response = await fetch(UPDATE_INFO_URL, { signal: controller.signal, cache: 'no-store' });
         clearTimeout(timeoutId);
         
         if (!response.ok) {
@@ -1642,7 +1669,9 @@ export default {
     async function hasNewVersion() {
       try {
         const remoteVersion = await getRemoteVersion();
-        return remoteVersion !== CURRENT_VERSION;
+        console.log(`当前版本: ${CURRENT_VERSION}, 远程版本: ${remoteVersion}`);
+        // 精确比较，避免字符串误差
+        return remoteVersion.toLowerCase().trim() !== CURRENT_VERSION.toLowerCase().trim();
       } catch (error) {
         console.error(`版本比较失败: ${error.message}`);
         return false; // 如果发生错误，返回false表示没有新版本
