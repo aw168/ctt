@@ -1142,10 +1142,10 @@ export default {
         } else if (action === 'check_update') {
           await sendMessageToTopic(topicId, `正在检查更新...`);
           try {
-            const remoteVersion = await getRemoteVersion();
-            const hasUpdate = remoteVersion.toLowerCase().trim() !== CURRENT_VERSION.toLowerCase().trim();
+            const hasUpdate = await hasNewVersion();
             if (hasUpdate) {
               const updateInfo = await getUpdateInfo();
+              const remoteVersion = await getRemoteVersion();
               const updateMessage = `🔄 检测到新版本！\n\n当前版本: ${CURRENT_VERSION}\n最新版本: ${remoteVersion}\n\n${updateInfo}\n\n请访问GitHub项目更新: https://github.com/iawooo/ctt`;
               await sendMessageToTopic(topicId, updateMessage);
             } else {
@@ -1626,7 +1626,17 @@ export default {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 3000); // 3秒超时
         
-        const response = await fetch(VERSION_CHECK_URL, { signal: controller.signal, cache: 'no-store' });
+        // 添加随机参数破坏缓存
+        const cacheBuster = `?t=${Date.now()}`;
+        const response = await fetch(`${VERSION_CHECK_URL}${cacheBuster}`, { 
+          signal: controller.signal, 
+          cache: 'no-store',
+          headers: {
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
+          }
+        });
         clearTimeout(timeoutId);
         
         if (!response.ok) {
@@ -1649,7 +1659,17 @@ export default {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 3000); // 3秒超时
         
-        const response = await fetch(UPDATE_INFO_URL, { signal: controller.signal, cache: 'no-store' });
+        // 添加随机参数破坏缓存
+        const cacheBuster = `?t=${Date.now()}`;
+        const response = await fetch(`${UPDATE_INFO_URL}${cacheBuster}`, { 
+          signal: controller.signal, 
+          cache: 'no-store',
+          headers: {
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
+          }
+        });
         clearTimeout(timeoutId);
         
         if (!response.ok) {
@@ -1668,10 +1688,22 @@ export default {
     // 检查是否有新版本
     async function hasNewVersion() {
       try {
+        // 每次都重新获取，不使用缓存
         const remoteVersion = await getRemoteVersion();
-        console.log(`当前版本: ${CURRENT_VERSION}, 远程版本: ${remoteVersion}`);
-        // 精确比较，避免字符串误差
-        return remoteVersion.toLowerCase().trim() !== CURRENT_VERSION.toLowerCase().trim();
+        
+        // 规范化版本字符串 - 去除所有空白字符和转为小写
+        const normalizedRemote = remoteVersion.toLowerCase().replace(/\s+/g, '');
+        const normalizedCurrent = CURRENT_VERSION.toLowerCase().replace(/\s+/g, '');
+        
+        console.log(`版本比较详情:`);
+        console.log(`- 当前版本(原始): "${CURRENT_VERSION}"`);
+        console.log(`- 远程版本(原始): "${remoteVersion}"`);
+        console.log(`- 当前版本(规范化): "${normalizedCurrent}"`);
+        console.log(`- 远程版本(规范化): "${normalizedRemote}"`);
+        console.log(`- 是否需要更新: ${normalizedRemote !== normalizedCurrent}`);
+        
+        // 如果版本不同，则需要更新
+        return normalizedRemote !== normalizedCurrent;
       } catch (error) {
         console.error(`版本比较失败: ${error.message}`);
         return false; // 如果发生错误，返回false表示没有新版本
