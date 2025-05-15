@@ -714,50 +714,105 @@ export default {
         if (sendError.message && (
             sendError.message.includes("Bad Request") ||
             sendError.message.includes("chat not found") ||
-            sendError.message.includes("message thread not found")
+            sendError.message.includes("message thread not found") ||
+            sendError.message.includes("Thread")
           )) {
           console.log(`话题 ${topicId} 已失效，启动强制重建流程`);
           
-          // 强制删除现有映射
-          await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
-            .bind(chatId)
-            .run();
+          // 强制删除现有映射 - 关键修复：确保所有数据库记录都被清除
+          try {
+            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+              .bind(chatId)
+              .run();
+            console.log(`删除数据库映射成功`);
+          } catch (dbError) {
+            console.error(`删除数据库映射失败: ${dbError.message}`);
+          }
           
-          // 标记为正在重建状态
+          // 清空缓存并重新标记为重建状态
           topicIdCache.set(chatId, 'rebuilding');
           
-          // 直接进入重建流程
+          // 直接重建话题 - 绕过队列直接调用API
           try {
             console.log(`开始为用户 ${chatId} 强制重建话题`);
             
             // 等待一小段时间确保群组处理完成
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // 直接调用Telegram API创建话题
+            const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/createForumTopic`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: GROUP_ID,
+                name: nickname,
+                icon_color: 9367192
+              })
+            }, 3, 1000);
+            
+            // 处理响应
+            if (!response.ok) {
+              throw new Error(`直接创建话题API调用失败: ${await response.text()}`);
+            }
+            
+            const data = await response.json();
+            if (!data.ok) {
+              throw new Error(`API返回非成功状态: ${data.description || '未知错误'}`);
+            }
+            
+            const newTopicId = data.result.message_thread_id;
+            console.log(`为用户 ${chatId} 强制重建话题成功，新ID: ${newTopicId}`);
+            
+            // 保存到数据库
+            await env.D1.prepare('INSERT INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
+              .bind(chatId, newTopicId)
+              .run();
+              
+            // 更新缓存
+            topicIdCache.set(chatId, newTopicId);
+            
+            // 等待一小段时间以确保新话题生效
             await new Promise(resolve => setTimeout(resolve, 500));
             
-            // 使用强制重建模式
-            const newTopicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
-            
-            if (newTopicId) {
-              console.log(`为用户 ${chatId} 强制重建话题成功: ${newTopicId}`);
-              
-              // 等待一小段时间以确保新话题生效
-              await new Promise(resolve => setTimeout(resolve, 300));
-              
-              // 使用新话题ID重新发送消息
-              try {
-                if (text) {
-                  const formattedMessage = `${nickname}:\n${text}`;
-                  await sendMessageToTopic(newTopicId, formattedMessage);
-                } else {
-                  await copyMessageToTopic(newTopicId, message);
-                }
-                console.log(`消息重发到新话题 ${newTopicId} 成功`);
-              } catch (resendError) {
-                console.error(`消息重发到新话题失败: ${resendError.message}`);
+            // 使用新话题ID重新发送消息
+            try {
+              if (text) {
+                const formattedMessage = `${nickname}:\n${text}`;
+                await sendMessageToTopic(newTopicId, formattedMessage);
+              } else {
+                await copyMessageToTopic(newTopicId, message);
               }
+              console.log(`消息重发到新话题 ${newTopicId} 成功`);
+              
+              // 发送欢迎消息
+              try {
+                const now = new Date();
+                const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
+                const notificationContent = await getNotificationContent();
+                const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${chatId}\n重建时间: ${formattedTime}\n\n${notificationContent}`;
+                
+                await sendMessageToTopic(newTopicId, pinnedMessage);
+              } catch (welcomeError) {
+                console.error(`发送欢迎消息失败: ${welcomeError.message}`);
+              }
+            } catch (resendError) {
+              console.error(`消息重发到新话题失败: ${resendError.message}`);
             }
-          } catch (rebuildError) {
-            console.error(`强制重建话题失败: ${rebuildError.message}`);
-            topicIdCache.set(chatId, undefined); // 重置缓存状态
+          } catch (directError) {
+            console.error(`直接创建话题失败: ${directError.message}`);
+            topicIdCache.set(chatId, undefined);
+            
+            // 最后尝试通过常规方式创建
+            try {
+              console.log(`尝试通过常规方式为用户 ${chatId} 创建话题`);
+              topicIdCache.set(chatId, undefined);
+              const finalTopicId = await ensureUserTopic(chatId, userInfo);
+              if (finalTopicId) {
+                console.log(`通过常规方式创建话题成功: ${finalTopicId}`);
+              }
+            } catch (finalError) {
+              console.error(`所有创建话题尝试均失败: ${finalError.message}`);
+            }
           }
         } else {
           // 其他类型的发送错误
@@ -1746,31 +1801,53 @@ export default {
     // 修改 createForumTopic 函数，使用队列机制实现真正的串行处理
     async function createForumTopic(topicName, userName, nickname, userId) {
       try {
-        // 先检查缓存
-        const cachedTopicId = topicIdCache.get(userId);
-        if (cachedTopicId && cachedTopicId !== 'creating') {
-          console.log(`[队列] 缓存命中，用户 ${userId} 已有话题ID: ${cachedTopicId}`);
-          return cachedTopicId;
+        // 检查是否处于重建模式
+        const isRebuilding = topicIdCache.get(userId) === 'rebuilding';
+        
+        // 只有在非重建模式下才检查现有话题
+        if (!isRebuilding) {
+          // 先检查缓存
+          const cachedTopicId = topicIdCache.get(userId);
+          if (cachedTopicId && cachedTopicId !== 'creating' && cachedTopicId !== 'rebuilding') {
+            console.log(`[队列] 缓存命中，用户 ${userId} 已有话题ID: ${cachedTopicId}`);
+            return cachedTopicId;
+          }
+          
+          // 快速检查数据库
+          const quickCheck = await env.D1.prepare(`
+            SELECT topic_id FROM chat_topic_mappings 
+            WHERE chat_id = ? AND topic_id != 'creating' AND topic_id != 'rebuilding'
+            LIMIT 1
+          `).bind(userId).first();
+          
+          if (quickCheck && quickCheck.topic_id) {
+            console.log(`[队列] 数据库查询，用户 ${userId} 已有话题ID: ${quickCheck.topic_id}`);
+            topicIdCache.set(userId, quickCheck.topic_id);
+            return quickCheck.topic_id;
+          }
+        } else {
+          console.log(`[队列] 用户 ${userId} 处于重建模式，跳过检查现有话题`);
         }
         
-        // 快速检查数据库
-        const quickCheck = await env.D1.prepare(`
-          SELECT topic_id FROM chat_topic_mappings 
-          WHERE chat_id = ? AND topic_id != 'creating'
-          LIMIT 1
-        `).bind(userId).first();
+        // 确保重建模式下直接进入创建流程
+        console.log(`[队列] 将用户 ${userId} 的话题${isRebuilding ? '重建' : '创建'}任务加入队列`);
         
-        if (quickCheck && quickCheck.topic_id) {
-          console.log(`[队列] 数据库查询，用户 ${userId} 已有话题ID: ${quickCheck.topic_id}`);
-          topicIdCache.set(userId, quickCheck.topic_id);
-          return quickCheck.topic_id;
+        // 创建前先清理旧记录 - 重要解决方案：确保在重建时彻底清除旧记录
+        if (isRebuilding) {
+          try {
+            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+              .bind(userId)
+              .run();
+            console.log(`[队列] 成功清理用户 ${userId} 的所有话题映射记录`);
+          } catch (cleanError) {
+            console.error(`[队列] 清理用户 ${userId} 旧记录失败: ${cleanError.message}`);
+          }
         }
         
         // 将任务添加到队列，确保串行执行
-        console.log(`[队列] 将用户 ${userId} 的话题创建任务加入队列`);
         return await enqueueTopicCreation(_createForumTopicInternal, topicName, userName, nickname, userId);
       } catch (error) {
-        console.error(`[队列] 话题创建任务失败: ${error.message}`);
+        console.error(`[队列] 话题${isRebuilding ? '重建' : '创建'}任务失败: ${error.message}`);
         
         // 清除缓存
         topicIdCache.set(userId, undefined);
