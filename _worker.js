@@ -2,8 +2,15 @@ let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
 
+// 添加当前版本常量
+const CURRENT_VERSION = "v1.3.0";
+const VERSION_CHECK_URL = "https://raw.githubusercontent.com/iawooo/tz/refs/heads/main/CFTeleTrans/tag.md?token=GHSAT0AAAAAADAQE7XDNTJMBTSZB6F4AG6U2BFR63Q";
+const UPDATE_INFO_URL = "https://raw.githubusercontent.com/iawooo/tz/refs/heads/main/CFTeleTrans/admin.md?token=GHSAT0AAAAAADAQE7XCXKEPJGD2UXCQZFDY2BFR7GA";
+
 let lastCleanupTime = 0;
+let lastCacheCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
+const CACHE_CLEANUP_INTERVAL = 1 * 60 * 60 * 1000; // 1 小时
 let isInitialized = false;
 const processedMessages = new Set();
 const processedCallbacks = new Set();
@@ -19,12 +26,14 @@ class LRUCache {
   constructor(maxSize) {
     this.maxSize = maxSize;
     this.cache = new Map();
+    this.lastAccess = new Map(); // 记录每个键的最后访问时间
   }
   get(key) {
     const value = this.cache.get(key);
     if (value !== undefined) {
       this.cache.delete(key);
       this.cache.set(key, value);
+      this.lastAccess.set(key, Date.now()); // 更新访问时间
     }
     return value;
   }
@@ -32,11 +41,25 @@ class LRUCache {
     if (this.cache.size >= this.maxSize) {
       const firstKey = this.cache.keys().next().value;
       this.cache.delete(firstKey);
+      this.lastAccess.delete(firstKey);
     }
     this.cache.set(key, value);
+    this.lastAccess.set(key, Date.now()); // 记录访问时间
   }
   clear() {
     this.cache.clear();
+    this.lastAccess.clear();
+  }
+  
+  // 新增: 清理指定时间前未访问的项
+  cleanStale(maxAge = 3600000) { // 默认1小时
+    const now = Date.now();
+    for (const [key, lastAccessTime] of this.lastAccess.entries()) {
+      if (now - lastAccessTime > maxAge) {
+        this.cache.delete(key);
+        this.lastAccess.delete(key);
+      }
+    }
   }
 }
 
@@ -91,8 +114,29 @@ export default {
         autoRegisterWebhook(request),
         checkBotPermissions(),
         cleanExpiredVerificationCodes(d1),
-        cleanupCreatingTopics(d1)
+        cleanupCreatingTopics(d1),
+        setupPeriodicCleanup(d1),
+        preloadSettings(d1)
       ]);
+    }
+
+    async function preloadSettings(d1) {
+      try {
+        console.log('预加载常用设置...');
+        const settingsResult = await d1.prepare('SELECT key, value FROM settings WHERE key IN (?, ?)')
+          .bind('verification_enabled', 'user_raw_enabled')
+          .all();
+        
+        if (settingsResult.results && settingsResult.results.length > 0) {
+          for (const row of settingsResult.results) {
+            settingsCache.set(row.key, row.value === 'true');
+          }
+        }
+        console.log('设置预加载完成');
+      } catch (error) {
+        console.error(`预加载设置失败: ${error.message}`);
+        // 预加载失败不影响主流程
+      }
     }
 
     async function autoRegisterWebhook(request) {
@@ -352,11 +396,13 @@ export default {
         // 验证码关闭时，所有用户都可以直接发送消息
       } else {
         const nowSeconds = Math.floor(Date.now() / 1000);
-        const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+        // 修改验证检查逻辑，只检查是否验证过，不再检查过期时间
+        const isVerified = userState.is_verified;
         const isFirstVerification = userState.is_first_verification;
         const isRateLimited = await checkMessageRate(chatId);
         const isVerifying = userState.is_verifying || false;
 
+        // 只有未验证或达到频率限制时才需要验证
         if (!isVerified || (isRateLimited && !isFirstVerification)) {
           if (isVerifying) {
             // 检查验证码是否已过期
@@ -670,6 +716,7 @@ export default {
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
       const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
+      const hasUpdate = await hasNewVersion();
 
       const buttons = [
         [
@@ -688,8 +735,15 @@ export default {
           { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
         ]
       ];
+      
+      // 如果有新版本，添加更新信息按钮
+      if (hasUpdate) {
+        buttons.push([
+          { text: '🔄 有新版本可用', callback_data: `show_update_${privateChatId}` }
+        ]);
+      }
 
-      const adminMessage = '管理员面板：请选择操作';
+      const adminMessage = '管理员面板：请选择操作' + (hasUpdate ? '\n🔄 检测到新版本！' : '');
       await Promise.all([
         fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
@@ -816,10 +870,9 @@ export default {
       if (key === 'verification_enabled') {
         settingsCache.set('verification_enabled', value === 'true');
         if (value === 'false') {
-          const nowSeconds = Math.floor(Date.now() / 1000);
-          const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, is_verifying = ?, verification_code = NULL, code_expiry = NULL, is_first_verification = ? WHERE chat_id NOT IN (SELECT chat_id FROM user_states WHERE is_blocked = TRUE)')
-            .bind(true, verifiedExpiry, false, false)
+          // 关闭验证码时将所有未拉黑用户标记为已验证，不设置过期时间
+          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL, is_verifying = ?, verification_code = NULL, code_expiry = NULL, is_first_verification = ? WHERE chat_id NOT IN (SELECT chat_id FROM user_states WHERE is_blocked = TRUE)')
+            .bind(true, false, false)
             .run();
           userStateCache.clear();
         }
@@ -864,6 +917,9 @@ export default {
         privateChatId = parts.slice(1).join('_');
       } else if (data.startsWith('delete_user_')) {
         action = 'delete_user';
+        privateChatId = parts.slice(2).join('_');
+      } else if (data.startsWith('show_update_')) {
+        action = 'show_update';
         privateChatId = parts.slice(2).join('_');
       } else {
         action = data;
@@ -932,9 +988,9 @@ export default {
         }
 
         if (result === 'correct') {
-          const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
-            .bind(true, verifiedExpiry, false, false, chatId)
+          // 移除过期时间设置，让验证永久有效
+          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
+            .bind(true, false, false, chatId)
             .run();
           verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_first_verification, is_verifying FROM user_states WHERE chat_id = ?')
             .bind(chatId)
@@ -1032,6 +1088,16 @@ export default {
             env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId)
           ]);
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
+        } else if (action === 'show_update') {
+          const hasUpdate = await hasNewVersion();
+          if (hasUpdate) {
+            const updateInfo = await getUpdateInfo();
+            const remoteVersion = await getRemoteVersion();
+            const updateMessage = `🔄 检测到新版本！\n\n当前版本: ${CURRENT_VERSION}\n最新版本: ${remoteVersion}\n\n${updateInfo}\n\n请访问GitHub项目更新: https://github.com/iawooo/ctt`;
+            await sendMessageToTopic(topicId, updateMessage);
+          } else {
+            await sendMessageToTopic(topicId, `当前已是最新版本 ${CURRENT_VERSION}，无需更新。`);
+          }
         } else {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
         }
@@ -1392,7 +1458,7 @@ export default {
       }
     }
 
-    async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
+    async function fetchWithRetry(url, options, retries = 3, initialBackoff = 1000) {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
@@ -1403,16 +1469,28 @@ export default {
           if (response.ok) {
             return response;
           }
+          
+          // 特殊处理 429 Too Many Requests
           if (response.status === 429) {
             const retryAfter = response.headers.get('Retry-After') || 5;
             const delay = parseInt(retryAfter) * 1000;
+            console.log(`Rate limited. Waiting for ${delay}ms before retry.`);
             await new Promise(resolve => setTimeout(resolve, delay));
             continue;
           }
+          
+          // 其他错误状态码
           throw new Error(`Request failed with status ${response.status}: ${await response.text()}`);
         } catch (error) {
           if (i === retries - 1) throw error;
-          await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
+          
+          // 计算指数退避时间，并添加随机抖动
+          const exponentialWait = initialBackoff * Math.pow(2, i);
+          const jitter = Math.random() * 0.3 * exponentialWait; // 添加30%以内的随机抖动
+          const waitTime = Math.floor(exponentialWait + jitter);
+          
+          console.log(`Request to ${url} failed (attempt ${i+1}/${retries}). Retrying in ${waitTime}ms. Error: ${error.message}`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
         }
       }
       throw new Error(`Failed to fetch ${url} after ${retries} retries`);
@@ -1435,6 +1513,93 @@ export default {
         body: JSON.stringify({ url: '' })
       }).then(r => r.json());
       return new Response(response.ok ? 'Webhook removed' : JSON.stringify(response, null, 2));
+    }
+
+    // 新增：设置定期清理任务
+    async function setupPeriodicCleanup(d1) {
+      // 立即执行一次清理
+      await performCacheCleanup();
+      
+      // 设置定期执行
+      setInterval(async () => {
+        try {
+          await performCacheCleanup();
+        } catch (error) {
+          console.error(`定期缓存清理失败: ${error.message}`);
+        }
+      }, CACHE_CLEANUP_INTERVAL);
+    }
+
+    // 执行缓存清理
+    async function performCacheCleanup() {
+      const now = Date.now();
+      if (now - lastCacheCleanupTime < CACHE_CLEANUP_INTERVAL) {
+        return;
+      }
+      
+      console.log('执行缓存清理...');
+      
+      // 清理超过3小时未访问的缓存项
+      userInfoCache.cleanStale(3 * 60 * 60 * 1000);
+      topicIdCache.cleanStale(3 * 60 * 60 * 1000);
+      userStateCache.cleanStale(3 * 60 * 60 * 1000);
+      messageRateCache.cleanStale(3 * 60 * 60 * 1000);
+      
+      // 更新最后清理时间
+      lastCacheCleanupTime = now;
+      console.log('缓存清理完成');
+    }
+
+    // 批量更新用户状态
+    async function batchUpdateUserStates(d1, operations, batchSize = 50) {
+      const batches = [];
+      for (let i = 0; i < operations.length; i += batchSize) {
+        batches.push(operations.slice(i, i + batchSize));
+      }
+      
+      for (const batch of batches) {
+        await d1.batch(batch);
+      }
+    }
+
+    // 获取远程版本信息
+    async function getRemoteVersion() {
+      try {
+        const response = await fetch(VERSION_CHECK_URL);
+        if (!response.ok) {
+          console.error(`获取远程版本失败: ${response.status}`);
+          return CURRENT_VERSION; // 如果获取失败，返回当前版本，防止误报更新
+        }
+        
+        const versionText = await response.text();
+        return versionText.trim(); // 去除可能的空白字符
+      } catch (error) {
+        console.error(`获取远程版本异常: ${error.message}`);
+        return CURRENT_VERSION; // 如果出现异常，返回当前版本
+      }
+    }
+
+    // 获取更新信息
+    async function getUpdateInfo() {
+      try {
+        const response = await fetch(UPDATE_INFO_URL);
+        if (!response.ok) {
+          console.error(`获取更新信息失败: ${response.status}`);
+          return "获取更新信息失败，请直接访问项目仓库查看。";
+        }
+        
+        const updateText = await response.text();
+        return updateText.trim() || "有新版本可用，请访问GitHub项目查看详情。";
+      } catch (error) {
+        console.error(`获取更新信息异常: ${error.message}`);
+        return "获取更新信息发生错误，请直接访问项目仓库。";
+      }
+    }
+
+    // 检查是否有新版本
+    async function hasNewVersion() {
+      const remoteVersion = await getRemoteVersion();
+      return remoteVersion !== CURRENT_VERSION;
     }
 
     try {
