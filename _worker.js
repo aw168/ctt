@@ -549,10 +549,23 @@ export default {
           // 先检查是否已有话题
           const existingTopicId = await getExistingTopicId(chatId);
           if (existingTopicId) {
-            console.log(`用户 ${chatId} 已有话题ID: ${existingTopicId}，无需创建新话题`);
-            const successMessage = await getVerificationSuccessMessage();
-            await sendMessageToUser(chatId, `${successMessage}\n➡️您已经在聊天中，无需重复发送 /start 命令。`);
-            return;
+            console.log(`用户 ${chatId} 已有话题ID: ${existingTopicId}，验证是否有效`);
+            
+            // 验证话题是否有效
+            const isTopicValid = await validateTopic(existingTopicId);
+            if (isTopicValid) {
+              const successMessage = await getVerificationSuccessMessage();
+              await sendMessageToUser(chatId, `${successMessage}\n➡️您已经在聊天中，无需重复发送 /start 命令。`);
+              return;
+            } else {
+              console.log(`用户 ${chatId} 的话题 ${existingTopicId} 已失效，将重新创建`);
+              // 删除数据库中的旧映射
+              await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+                .bind(chatId)
+                .run();
+              topicIdCache.set(chatId, undefined);
+              // 继续创建新话题
+            }
           }
 
           // 获取用户信息
@@ -579,8 +592,20 @@ export default {
               const checkTopicId = await getExistingTopicId(chatId);
               if (checkTopicId) {
                 console.log(`重试前检查到用户 ${chatId} 已有话题ID: ${checkTopicId}`);
-                topicId = checkTopicId;
-                break;
+                
+                // 验证话题是否有效
+                const isCheckValid = await validateTopic(checkTopicId);
+                if (isCheckValid) {
+                  topicId = checkTopicId;
+                  break;
+                } else {
+                  console.log(`检测到的话题 ${checkTopicId} 无效，将继续创建`);
+                  // 删除无效映射
+                  await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+                    .bind(chatId)
+                    .run();
+                  topicIdCache.set(chatId, undefined);
+                }
               }
               
               topicId = await ensureUserTopic(chatId, userInfo);
@@ -611,16 +636,11 @@ export default {
           const isTopicValid = await validateTopic(topicId);
           if (!isTopicValid) {
             console.error(`为用户 ${chatId} 创建的话题 ${topicId} 验证失败`);
-            await sendMessageToUser(chatId, "创建的聊天话题无效，请稍后再试或联系管理员。");
+            await sendMessageToUser(chatId, "创建的聊天话题暂时无法验证，请发送任意消息再次尝试。");
             
-            // 尝试删除无效的话题
+            // 不自动删除话题ID映射，让用户下次消息能重试
+            // 但尝试删除无效的话题防止垃圾数据堆积
             await deleteForumTopic(topicId);
-            
-            // 清理无效话题映射
-            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
-              .bind(chatId, topicId)
-              .run();
-            topicIdCache.set(chatId, undefined);
           } else {
             console.log(`为用户 ${chatId} 创建的话题 ${topicId} 验证成功`);
           }
@@ -650,15 +670,11 @@ export default {
         console.log(`话题 ${topicId} 无效，尝试删除并重新创建`);
         
         // 先尝试删除无效的话题
-        const deleteResult = await deleteForumTopic(topicId);
+        await deleteForumTopic(topicId);
         
         // 无论删除成功与否，都清理数据库映射
         await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
         topicIdCache.set(chatId, undefined);
-        
-        if (!deleteResult) {
-          console.log(`无法删除无效话题 ${topicId}，但已清理数据库映射`);
-        }
         
         // 等待一小段时间，确保Telegram服务器处理完成
         await new Promise(resolve => setTimeout(resolve, 500));
@@ -674,28 +690,42 @@ export default {
         // 再次验证新创建的话题
         const isNewTopicValid = await validateTopic(topicId);
         if (!isNewTopicValid) {
-          console.error(`用户 ${chatId} 的新话题 ${topicId} 仍然无效，放弃处理`);
-          
-          // 尝试删除新创建的无效话题
-          await deleteForumTopic(topicId);
-          
-          // 清理数据库映射
-          await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
-          topicIdCache.set(chatId, undefined);
-          
-          await sendMessageToUser(chatId, "话题验证失败，请稍后再试或联系管理员。");
-          return;
+          console.error(`用户 ${chatId} 的新话题 ${topicId} 仍然无法验证，但仍会尝试发送消息`);
+          // 不再删除话题映射，允许下次消息时重试
+          // 不再立即返回，而是尝试发送消息
         }
       }
 
       const userName = userInfo.username || `User_${chatId}`;
       const nickname = userInfo.nickname || userName;
 
-      if (text) {
-        const formattedMessage = `${nickname}:\n${text}`;
-        await sendMessageToTopic(topicId, formattedMessage);
-      } else {
-        await copyMessageToTopic(topicId, message);
+      // 尝试发送消息，即使话题验证失败也尝试
+      try {
+        if (text) {
+          const formattedMessage = `${nickname}:\n${text}`;
+          await sendMessageToTopic(topicId, formattedMessage);
+        } else {
+          await copyMessageToTopic(topicId, message);
+        }
+      } catch (sendError) {
+        console.error(`发送消息到话题 ${topicId} 失败: ${sendError.message}`);
+        
+        // 如果发送失败，尝试检查是否是因为话题不存在
+        if (sendError.message && (
+            sendError.message.includes("Bad Request") ||
+            sendError.message.includes("chat not found") ||
+            sendError.message.includes("message thread not found")
+          )) {
+          await sendMessageToUser(chatId, "消息发送失败，正在尝试重建您的聊天话题，请稍后再试。");
+          
+          // 删除原有映射，以便下次消息重新创建话题
+          await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+            .bind(chatId)
+            .run();
+          topicIdCache.set(chatId, undefined);
+        } else {
+          await sendMessageToUser(chatId, "消息发送失败，请稍后再试。");
+        }
       }
     }
 
@@ -746,9 +776,28 @@ export default {
       try {
         // 先检查现有话题
         const existingTopicId = await getExistingTopicId(chatId);
+        
         if (existingTopicId) {
           console.log(`[确保话题] 用户 ${chatId} 已有话题ID: ${existingTopicId}`);
-          return existingTopicId;
+          
+          // 验证现有话题是否有效
+          const isValid = await validateTopic(existingTopicId);
+          if (isValid) {
+            return existingTopicId;
+          } else {
+            // 如果话题无效（可能已在群组中被删除），则在数据库中标记为已删除
+            console.log(`[确保话题] 用户 ${chatId} 的话题 ${existingTopicId} 已在群组中被删除，将重新创建`);
+            
+            // 删除数据库中的旧映射
+            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+              .bind(chatId)
+              .run();
+            
+            // 清除缓存
+            topicIdCache.set(chatId, undefined);
+            
+            // 继续下面的逻辑创建新话题
+          }
         }
         
         // 如果缓存中有"creating"状态，等待一段时间看是否能找到已创建的话题
@@ -762,11 +811,24 @@ export default {
             const checkResult = await getExistingTopicId(chatId);
             if (checkResult) {
               console.log(`[确保话题] 等待后发现用户 ${chatId} 已有话题ID: ${checkResult}`);
-              return checkResult;
+              
+              // 验证是否有效
+              const isStillValid = await validateTopic(checkResult);
+              if (isStillValid) {
+                return checkResult;
+              } else {
+                // 如果无效，清除后创建新话题
+                console.log(`[确保话题] 等待期间发现的话题 ${checkResult} 无效，将重新创建`);
+                await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+                  .bind(chatId)
+                  .run();
+                topicIdCache.set(chatId, undefined);
+                break;
+              }
             }
           }
           
-          console.log(`[确保话题] 用户 ${chatId} 的话题创建等待超时，将尝试重新创建`);
+          console.log(`[确保话题] 用户 ${chatId} 的话题创建等待超时或无效，将尝试重新创建`);
           topicIdCache.set(chatId, undefined); // 清除可能卡住的状态
         }
         
@@ -781,6 +843,15 @@ export default {
           // 创建话题
           const topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
           console.log(`[确保话题] 为用户 ${chatId} 创建话题成功: ${topicId}`);
+          
+          // 创建成功后再次验证
+          const isNewTopicValid = await validateTopic(topicId);
+          if (!isNewTopicValid) {
+            console.error(`[确保话题] 新创建的话题 ${topicId} 验证失败，这可能是暂时性问题`);
+            // 尽管验证失败，我们仍然返回话题ID，让用户可以尝试使用
+            // 如果真的无效，下次消息会再次触发创建
+          }
+          
           return topicId;
         } catch (error) {
           console.error(`[确保话题] 创建话题失败: ${error.message}`);
