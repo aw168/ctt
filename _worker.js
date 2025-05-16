@@ -615,30 +615,54 @@ export default {
           // 等待前一个锁完成
           await lock;
           
-          // 再次检查是否已有话题（可能在等待期间已被创建）
-          let topicId = await getExistingTopicId(chatId);
-          if (topicId) {
+          // 优先检查缓存和数据库中是否已有有效话题
+          let topicId = topicIdCache.get(chatId);
+          if (topicId && topicId !== 'creating') {
             return topicId;
           }
           
-          // 添加数据库级别的锁定机制
-          // 使用事务和唯一约束来确保不会重复创建
+          // 查询数据库
+          const existingTopic = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
+            .bind(chatId)
+            .first();
+          
+          if (existingTopic && existingTopic.topic_id !== 'creating') {
+            // 话题已存在且有效，更新缓存并返回
+            topicIdCache.set(chatId, existingTopic.topic_id);
+            return existingTopic.topic_id;
+          }
+          
+          // 使用事务确保原子性操作
           try {
-            // 创建临时标记表示正在创建话题
-            await env.D1.prepare('INSERT OR IGNORE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-              .bind(chatId, 'creating')
-              .run();
+            // 开始事务
+            await env.D1.exec('BEGIN TRANSACTION');
             
-            // 再次检查，确保没有其他进程已经创建了话题
+            // 再次检查是否存在有效映射（在事务内）
             const checkAgain = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
               .bind(chatId)
               .first();
             
-            if (checkAgain && checkAgain.topic_id !== 'creating') {
-              // 另一个进程已经创建了话题
-              topicIdCache.set(chatId, checkAgain.topic_id);
-              return checkAgain.topic_id;
+            if (checkAgain) {
+              if (checkAgain.topic_id !== 'creating') {
+                // 已有有效话题，提交事务并返回
+                await env.D1.exec('COMMIT');
+                topicIdCache.set(chatId, checkAgain.topic_id);
+                return checkAgain.topic_id;
+              } else {
+                // 存在临时标记，删除它
+                await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+                  .bind(chatId, 'creating')
+                  .run();
+              }
             }
+            
+            // 设置临时标记
+            await env.D1.prepare('INSERT INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
+              .bind(chatId, 'creating')
+              .run();
+            
+            // 提交事务
+            await env.D1.exec('COMMIT');
             
             // 创建新话题
             const userName = userInfo.username || `User_${chatId}`;
@@ -654,24 +678,29 @@ export default {
             topicIdCache.set(chatId, topicId);
             return topicId;
           } catch (error) {
-            // 如果创建过程中出错，清除临时标记
-            console.error(`创建话题时出错: ${error.message}`);
-            
-            // 再次检查是否已有话题（可能在出错期间已被创建）
-            const finalCheck = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
-              .bind(chatId)
-              .first();
-            
-            if (finalCheck && finalCheck.topic_id !== 'creating') {
-              // 已有有效话题
-              topicIdCache.set(chatId, finalCheck.topic_id);
-              return finalCheck.topic_id;
+            // 如果创建过程中出错，回滚事务并清除临时标记
+            try {
+              await env.D1.exec('ROLLBACK');
+              console.error(`创建话题时出错: ${error.message}`);
+              
+              // 再次检查是否已有话题（可能在出错期间已被创建）
+              const finalCheck = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
+                .bind(chatId)
+                .first();
+              
+              if (finalCheck && finalCheck.topic_id !== 'creating') {
+                // 已有有效话题
+                topicIdCache.set(chatId, finalCheck.topic_id);
+                return finalCheck.topic_id;
+              }
+              
+              // 清除临时标记
+              await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+                .bind(chatId, 'creating')
+                .run();
+            } catch (rollbackError) {
+              console.error(`回滚事务失败: ${rollbackError.message}`);
             }
-            
-            // 清除临时标记
-            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
-              .bind(chatId, 'creating')
-              .run();
             
             throw error; // 重新抛出错误
           }
