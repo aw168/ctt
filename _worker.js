@@ -1,7 +1,7 @@
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
-const CURRENT_VERSION = "v1.4.0";
+const CURRENT_VERSION = "v1.3.0";
 const VERSION_CHECK_URL = "https://raw.githubusercontent.com/iawooo/tz/main/CFTeleTrans/tag.md";
 const UPDATE_INFO_URL = "https://raw.githubusercontent.com/iawooo/tz/main/CFTeleTrans/admin.md";
 let lastCleanupTime = 0;
@@ -111,6 +111,15 @@ export default {
         setupPeriodicCleanup(d1),
         preloadSettings(d1)
       ]);
+      
+      // 在主要初始化完成后再检查无效话题，避免阻塞启动流程
+      setTimeout(async () => {
+        try {
+          await cleanupInvalidTopics(d1);
+        } catch (error) {
+          console.error(`延迟清理无效话题失败: ${error.message}`);
+        }
+      }, 10000); // 延迟10秒执行
     }
 
     async function preloadSettings(d1) {
@@ -296,20 +305,74 @@ export default {
         const creatingTopics = await d1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
           .bind('creating')
           .all();
-        
         if (creatingTopics.results.length > 0) {
           console.log(`清理 ${creatingTopics.results.length} 个遗留的临时话题标记`);
-          
           await d1.prepare('DELETE FROM chat_topic_mappings WHERE topic_id = ?')
             .bind('creating')
             .run();
-          
           for (const row of creatingTopics.results) {
             topicIdCache.set(row.chat_id, undefined);
           }
         }
+        
+        // 清理创建时间戳
+        await d1.prepare('DELETE FROM settings WHERE key LIKE ?')
+          .bind('creating_timestamp_%')
+          .run();
       } catch (error) {
         console.error(`清理临时话题标记时出错: ${error.message}`);
+      }
+    }
+
+    async function cleanupInvalidTopics(d1) {
+      try {
+        // 只在系统启动时执行一次，不需要频繁进行
+        const topicMappings = await d1.prepare('SELECT chat_id, topic_id FROM chat_topic_mappings WHERE topic_id != ?')
+          .bind('creating')
+          .all();
+        
+        if (!topicMappings.results || topicMappings.results.length === 0) {
+          return;
+        }
+        
+        console.log(`检查 ${topicMappings.results.length} 个话题ID是否有效`);
+        let invalidCount = 0;
+        const batchSize = 5;
+        
+        // 每次批量处理一部分，避免一次性请求过多
+        for (let i = 0; i < topicMappings.results.length; i += batchSize) {
+          const batch = topicMappings.results.slice(i, i + batchSize);
+          
+          for (const mapping of batch) {
+            try {
+              // 使用快速验证
+              const isValid = await validateTopic(mapping.topic_id, true);
+              if (!isValid) {
+                console.log(`话题ID ${mapping.topic_id} 无效，将从数据库删除`);
+                await d1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+                  .bind(mapping.chat_id)
+                  .run();
+                topicIdCache.set(mapping.chat_id, undefined);
+                invalidCount++;
+              }
+            } catch (error) {
+              console.error(`验证话题ID ${mapping.topic_id} 时出错: ${error.message}`);
+            }
+          }
+          
+          // 每批处理后稍微暂停，避免API限流
+          if (i + batchSize < topicMappings.results.length) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
+        
+        if (invalidCount > 0) {
+          console.log(`已清理 ${invalidCount} 个无效话题ID`);
+        } else {
+          console.log(`所有话题ID有效`);
+        }
+      } catch (error) {
+        console.error(`清理无效话题ID时出错: ${error.message}`);
       }
     }
 
@@ -518,8 +581,9 @@ export default {
         return;
       }
 
-      const isTopicValid = await validateTopic(topicId);
+      const isTopicValid = await validateTopic(topicId, false); // 使用完整验证
       if (!isTopicValid) {
+        console.log(`用户 ${chatId} 的话题 ${topicId} 无效，将重新创建`);
         await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
         topicIdCache.set(chatId, undefined);
         topicId = await ensureUserTopic(chatId, userInfo);
@@ -540,8 +604,31 @@ export default {
       }
     }
 
-    async function validateTopic(topicId) {
+    async function validateTopic(topicId, quickCheck = false) {
+      if (!topicId || topicId === 'creating') {
+        return false;
+      }
       try {
+        // 快速检查模式只验证话题ID是否有效，不会发送测试消息
+        if (quickCheck) {
+          const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: GROUP_ID
+            })
+          }, 1); // 仅重试1次，加快返回速度
+          
+          if (!response.ok) {
+            console.error(`快速验证话题ID失败: 无法访问目标群组`);
+            return false;
+          }
+          
+          // 话题ID存在即视为有效，不做进一步验证
+          return true;
+        }
+        
+        // 完整验证包括发送测试消息
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -566,131 +653,247 @@ export default {
         }
         return false;
       } catch (error) {
+        console.error(`验证话题ID ${topicId} 失败: ${error.message}`);
         return false;
       }
     }
 
     async function ensureUserTopic(chatId, userInfo) {
+      // 在真正创建话题之前，先检查是否有有效话题ID
+             const cachedTopicId = topicIdCache.get(chatId);
+       if (cachedTopicId && cachedTopicId !== 'creating') {
+         try {
+           // 快速验证话题是否可用
+           const isValid = await validateTopic(cachedTopicId, true);
+           if (isValid) {
+             return cachedTopicId;
+           } else {
+             // 无效话题ID从缓存中删除
+             console.log(`缓存中话题ID ${cachedTopicId} 无效，将重新创建`);
+             topicIdCache.set(chatId, undefined);
+           }
+         } catch (error) {
+           console.error(`验证缓存话题ID失败: ${error.message}`);
+           // 出错不立即清除缓存，继续检查数据库
+         }
+       }
+      
+      // 全局同步锁，确保同一用户的话题创建请求串行处理
       let lock = topicCreationLocks.get(chatId);
       if (!lock) {
         lock = Promise.resolve();
         topicCreationLocks.set(chatId, lock);
       }
-
+      
+      // 创建新锁
       const newLock = (async () => {
         try {
+          // 等待前一个锁完成
           await lock;
           
-          const existingTopic = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
+          // 再次从数据库查询最新状态
+          const dbTopicInfo = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
             .bind(chatId)
             .first();
           
-          if (existingTopic && existingTopic.topic_id !== 'creating') {
-            topicIdCache.set(chatId, existingTopic.topic_id);
-            return existingTopic.topic_id;
+          // 如果数据库中已有有效话题ID，优先使用
+                     if (dbTopicInfo && dbTopicInfo.topic_id !== 'creating') {
+             try {
+               // 验证话题是否可用
+               const isValid = await validateTopic(dbTopicInfo.topic_id, true);
+               if (isValid) {
+                 topicIdCache.set(chatId, dbTopicInfo.topic_id);
+                 return dbTopicInfo.topic_id;
+               } else {
+                 // 无效话题ID需要从数据库删除
+                 console.log(`数据库中话题ID ${dbTopicInfo.topic_id} 无效，将删除并重新创建`);
+                 await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?')
+                   .bind(chatId)
+                   .run();
+               }
+             } catch (error) {
+               console.error(`验证数据库话题ID失败: ${error.message}`);
+               // 验证失败也继续执行创建流程
+             }
+           }
+          
+          // 清除任何临时标记
+          if (dbTopicInfo && dbTopicInfo.topic_id === 'creating') {
+            // 检查创建标记是否过期（5分钟内的临时标记视为有效，可能是其他进程正在创建）
+            const nowTimestamp = Date.now();
+            // 尝试获取创建时间，如果能查询到
+            const createTimeRecord = await env.D1.prepare('SELECT value FROM settings WHERE key = ?')
+              .bind(`creating_timestamp_${chatId}`)
+              .first();
+            
+            let shouldClear = true;
+            if (createTimeRecord && createTimeRecord.value) {
+              const createTime = parseInt(createTimeRecord.value);
+              const timeDiff = nowTimestamp - createTime;
+              
+              // 如果标记时间在5分钟内，等待其他进程完成创建
+              if (timeDiff < 5 * 60 * 1000) {
+                console.log(`话题正在由其他进程创建中(${Math.floor(timeDiff/1000)}秒前)，等待完成...`);
+                // 等待短暂时间后再次检查
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                // 再次检查是否创建完成
+                const recheckResult = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
+                  .bind(chatId)
+                  .first();
+                
+                if (recheckResult && recheckResult.topic_id !== 'creating') {
+                  // 已创建完成，直接返回
+                  topicIdCache.set(chatId, recheckResult.topic_id);
+                  return recheckResult.topic_id;
+                }
+                
+                // 创建超时，清除锁继续创建
+                shouldClear = true;
+              }
+            }
+            
+            if (shouldClear) {
+              console.log(`清理过期的临时话题标记: ${chatId}`);
+              try {
+                await env.D1.batch([
+                  env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+                    .bind(chatId, 'creating'),
+                  env.D1.prepare('DELETE FROM settings WHERE key = ?')
+                    .bind(`creating_timestamp_${chatId}`)
+                ]);
+              } catch (clearError) {
+                console.error(`清理临时标记失败: ${clearError.message}`);
+                // 继续执行，不阻断流程
+              }
+            }
           }
           
-          if (existingTopic && existingTopic.topic_id === 'creating') {
-            const cleanupResult = await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
-              .bind(chatId, 'creating')
-              .run();
-            
-            console.log(`清除过期的临时话题标记: ${chatId}, 影响行数: ${cleanupResult.count || 0}`);
-            
-            topicIdCache.set(chatId, undefined);
-          }
-          
+          // 使用事务确保原子性操作
           try {
-            const insertResult = await env.D1.prepare('INSERT OR IGNORE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
+            // 1. 先尝试插入临时标记
+            const insertOp = await env.D1.prepare('INSERT OR IGNORE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
               .bind(chatId, 'creating')
               .run();
             
-            if (insertResult.count === 0) {
-              console.log(`用户 ${chatId} 的话题创建已由其他进程处理`);
+            // 2. 记录创建开始时间
+            await env.D1.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
+              .bind(`creating_timestamp_${chatId}`, Date.now().toString())
+              .run();
+            
+            // 检查是否真的获取到了锁（插入成功）
+            if (insertOp.changes === 0) {
+              // 插入失败，可能其他进程已经在创建中
+              console.log(`无法获取话题创建锁，可能其他进程正在处理: ${chatId}`);
               
-              await new Promise(resolve => setTimeout(resolve, 1000));
+              // 等待一段时间后检查结果
+              await new Promise(resolve => setTimeout(resolve, 3000));
               
-              const recheckResult = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
+              // 再次查询结果
+              const checkAgain = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
                 .bind(chatId)
                 .first();
               
-              if (recheckResult && recheckResult.topic_id !== 'creating') {
-                topicIdCache.set(chatId, recheckResult.topic_id);
-                return recheckResult.topic_id;
+              if (checkAgain && checkAgain.topic_id !== 'creating') {
+                // 另一个进程已创建完成
+                topicIdCache.set(chatId, checkAgain.topic_id);
+                return checkAgain.topic_id;
               } else {
-                console.log(`用户 ${chatId} 的话题创建等待超时`);
+                // 创建仍未完成，返回null等待下次请求重试
+                console.log(`等待话题创建超时: ${chatId}`);
                 return null;
               }
             }
             
+            // 成功获取创建锁，开始创建话题
             console.log(`为用户 ${chatId} 创建新话题...`);
-            const userName = userInfo.username || `User_${chatId}`;
-            const nickname = userInfo.nickname || userName;
             
             try {
+              // 创建话题
+              const userName = userInfo.username || `User_${chatId}`;
+              const nickname = userInfo.nickname || userName;
               const topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
               
+              // 更新数据库，使用条件更新确保原子性
               const updateResult = await env.D1.prepare('UPDATE chat_topic_mappings SET topic_id = ? WHERE chat_id = ? AND topic_id = ?')
                 .bind(topicId, chatId, 'creating')
                 .run();
               
-              if (updateResult.count === 0) {
-                console.log(`用户 ${chatId} 的话题映射更新失败，可能已被其他进程处理`);
-                
+              // 清理临时时间戳
+              await env.D1.prepare('DELETE FROM settings WHERE key = ?')
+                .bind(`creating_timestamp_${chatId}`)
+                .run();
+              
+              if (updateResult.changes === 0) {
+                // 更新失败，再次检查是否已被其他进程更新
                 const finalCheck = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
                   .bind(chatId)
                   .first();
                 
                 if (finalCheck && finalCheck.topic_id !== 'creating') {
+                  // 使用数据库中已存在的值
+                  console.log(`话题ID已被其他进程更新为 ${finalCheck.topic_id}`);
                   topicIdCache.set(chatId, finalCheck.topic_id);
                   return finalCheck.topic_id;
                 } else {
-                  await env.D1.prepare('UPDATE chat_topic_mappings SET topic_id = ? WHERE chat_id = ?')
-                    .bind(topicId, chatId)
+                  // 强制更新数据库
+                  console.log(`强制更新话题ID: ${chatId} -> ${topicId}`);
+                  await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
+                    .bind(chatId, topicId)
                     .run();
-                  
-                  topicIdCache.set(chatId, topicId);
-                  return topicId;
                 }
-              } else {
-                topicIdCache.set(chatId, topicId);
-                return topicId;
               }
-            } catch (error) {
-              console.error(`为用户 ${chatId} 创建话题失败: ${error.message}`);
-              await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
-                .bind(chatId, 'creating')
-                .run();
+              
+              // 更新缓存并返回结果
+              topicIdCache.set(chatId, topicId);
+              return topicId;
+            } catch (createError) {
+              // 创建失败，清理临时标记
+              console.error(`创建话题失败: ${createError.message}`);
+              await env.D1.batch([
+                env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+                  .bind(chatId, 'creating'),
+                env.D1.prepare('DELETE FROM settings WHERE key = ?')
+                  .bind(`creating_timestamp_${chatId}`)
+              ]);
               
               topicIdCache.set(chatId, undefined);
-              throw error;
+              throw createError;
             }
-          } catch (error) {
-            console.error(`用户 ${chatId} 的话题创建事务失败: ${error.message}`);
+          } catch (txError) {
+            // 事务错误，最后检查一次
+            console.error(`话题创建事务失败: ${txError.message}`);
             
             const emergencyCheck = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
               .bind(chatId)
               .first();
             
             if (emergencyCheck && emergencyCheck.topic_id !== 'creating') {
+              // 使用现有的话题ID
               topicIdCache.set(chatId, emergencyCheck.topic_id);
               return emergencyCheck.topic_id;
             }
             
-            await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
-              .bind(chatId, 'creating')
-              .run();
+            // 清理所有临时状态
+            await env.D1.batch([
+              env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
+                .bind(chatId, 'creating'),
+              env.D1.prepare('DELETE FROM settings WHERE key = ?')
+                .bind(`creating_timestamp_${chatId}`)
+            ]);
             
             topicIdCache.set(chatId, undefined);
-            throw error;
+            throw txError;
           }
         } finally {
+          // 清理锁
           if (topicCreationLocks.get(chatId) === newLock) {
             topicCreationLocks.delete(chatId);
           }
         }
       })();
       
+      // 更新全局锁
       topicCreationLocks.set(chatId, newLock);
       return newLock;
     }
