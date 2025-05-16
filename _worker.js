@@ -1,7 +1,7 @@
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
-const CURRENT_VERSION = "v1.3.0";
+const CURRENT_VERSION = "v1.4.0";
 const VERSION_CHECK_URL = "https://raw.githubusercontent.com/iawooo/tz/main/CFTeleTrans/tag.md";
 const UPDATE_INFO_URL = "https://raw.githubusercontent.com/iawooo/tz/main/CFTeleTrans/admin.md";
 let lastCleanupTime = 0;
