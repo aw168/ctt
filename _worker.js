@@ -1,23 +1,17 @@
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
-
-// 添加当前版本常量
 const CURRENT_VERSION = "v1.3.0";
-// 更新链接，移除已过期的token
 const VERSION_CHECK_URL = "https://raw.githubusercontent.com/iawooo/tz/main/CFTeleTrans/tag.md";
 const UPDATE_INFO_URL = "https://raw.githubusercontent.com/iawooo/tz/main/CFTeleTrans/admin.md";
-
 let lastCleanupTime = 0;
 let lastCacheCleanupTime = 0;
-const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
-const CACHE_CLEANUP_INTERVAL = 1 * 60 * 60 * 1000; // 1 小时
+const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000;
+const CACHE_CLEANUP_INTERVAL = 1 * 60 * 60 * 1000;
 let isInitialized = false;
 const processedMessages = new Set();
 const processedCallbacks = new Set();
-
 const topicCreationLocks = new Map();
-
 const settingsCache = new Map([
   ['verification_enabled', null],
   ['user_raw_enabled', null]
@@ -27,14 +21,14 @@ class LRUCache {
   constructor(maxSize) {
     this.maxSize = maxSize;
     this.cache = new Map();
-    this.lastAccess = new Map(); // 记录每个键的最后访问时间
+    this.lastAccess = new Map();
   }
   get(key) {
     const value = this.cache.get(key);
     if (value !== undefined) {
       this.cache.delete(key);
       this.cache.set(key, value);
-      this.lastAccess.set(key, Date.now()); // 更新访问时间
+      this.lastAccess.set(key, Date.now());
     }
     return value;
   }
@@ -45,15 +39,14 @@ class LRUCache {
       this.lastAccess.delete(firstKey);
     }
     this.cache.set(key, value);
-    this.lastAccess.set(key, Date.now()); // 记录访问时间
+    this.lastAccess.set(key, Date.now());
   }
   clear() {
     this.cache.clear();
     this.lastAccess.clear();
   }
   
-  // 新增: 清理指定时间前未访问的项
-  cleanStale(maxAge = 3600000) { // 默认1小时
+  cleanStale(maxAge = 3600000) {
     const now = Date.now();
     for (const [key, lastAccessTime] of this.lastAccess.entries()) {
       if (now - lastAccessTime > maxAge) {
@@ -88,7 +81,6 @@ export default {
       if (!BOT_TOKEN || !GROUP_ID) {
         return new Response('Server configuration error: Missing required environment variables', { status: 500 });
       }
-
       const url = new URL(request.url);
       if (url.pathname === '/webhook') {
         try {
@@ -127,7 +119,6 @@ export default {
         const settingsResult = await d1.prepare('SELECT key, value FROM settings WHERE key IN (?, ?)')
           .bind('verification_enabled', 'user_raw_enabled')
           .all();
-        
         if (settingsResult.results && settingsResult.results.length > 0) {
           for (const row of settingsResult.results) {
             settingsCache.set(row.key, row.value === 'true');
@@ -136,7 +127,6 @@ export default {
         console.log('设置预加载完成');
       } catch (error) {
         console.error(`预加载设置失败: ${error.message}`);
-        // 预加载失败不影响主流程
       }
     }
 
@@ -303,7 +293,6 @@ export default {
 
     async function cleanupCreatingTopics(d1) {
       try {
-        // 查找所有标记为正在创建的话题映射
         const creatingTopics = await d1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
           .bind('creating')
           .all();
@@ -311,19 +300,16 @@ export default {
         if (creatingTopics.results.length > 0) {
           console.log(`清理 ${creatingTopics.results.length} 个遗留的临时话题标记`);
           
-          // 删除所有临时标记
           await d1.prepare('DELETE FROM chat_topic_mappings WHERE topic_id = ?')
             .bind('creating')
             .run();
           
-          // 从缓存中清除这些用户的话题ID
           for (const row of creatingTopics.results) {
             topicIdCache.set(row.chat_id, undefined);
           }
         }
       } catch (error) {
         console.error(`清理临时话题标记时出错: ${error.message}`);
-        // 继续执行，不中断初始化流程
       }
     }
 
@@ -352,7 +338,6 @@ export default {
       const chatId = message.chat.id.toString();
       const text = message.text || '';
       const messageId = message.message_id;
-
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
@@ -394,19 +379,15 @@ export default {
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
 
       if (!verificationEnabled) {
-        // 验证码关闭时，所有用户都可以直接发送消息
       } else {
         const nowSeconds = Math.floor(Date.now() / 1000);
-        // 修改验证检查逻辑，只检查是否验证过，不再检查过期时间
         const isVerified = userState.is_verified;
         const isFirstVerification = userState.is_first_verification;
         const isRateLimited = await checkMessageRate(chatId);
         const isVerifying = userState.is_verifying || false;
 
-        // 只有未验证或达到频率限制时才需要验证
         if (!isVerified || (isRateLimited && !isFirstVerification)) {
           if (isVerifying) {
-            // 检查验证码是否已过期
             const storedCode = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
               .bind(chatId)
               .first();
@@ -415,14 +396,12 @@ export default {
             const isCodeExpired = !storedCode?.verification_code || !storedCode?.code_expiry || nowSeconds > storedCode.code_expiry;
             
             if (isCodeExpired) {
-              // 如果验证码已过期，重新发送验证码
               await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
               await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
                 .bind(chatId)
                 .run();
               userStateCache.set(chatId, { ...userState, verification_code: null, code_expiry: null, is_verifying: false });
               
-              // 删除旧的验证消息（如果存在）
               try {
                 const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
                   .bind(chatId)
@@ -440,7 +419,6 @@ export default {
                     });
                   } catch (deleteError) {
                     console.log(`删除旧验证消息失败: ${deleteError.message}`);
-                    // 删除失败仍继续处理
                   }
                   
                   await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
@@ -449,15 +427,12 @@ export default {
                 }
               } catch (error) {
                 console.log(`查询旧验证消息失败: ${error.message}`);
-                // 即使出错也继续处理
               }
               
-              // 立即发送新的验证码
               try {
                 await handleVerification(chatId, 0);
               } catch (verificationError) {
                 console.error(`发送新验证码失败: ${verificationError.message}`);
-                // 如果发送验证码失败，则再次尝试
                 setTimeout(async () => {
                   try {
                     await handleVerification(chatId, 0);
@@ -486,7 +461,6 @@ export default {
             return;
           }
 
-          // 先检查是否已有话题
           const existingTopicId = await getExistingTopicId(chatId);
           if (existingTopicId) {
             const successMessage = await getVerificationSuccessMessage();
@@ -494,18 +468,15 @@ export default {
             return;
           }
 
-          // 获取用户信息
           const userInfo = await getUserInfo(chatId);
           if (!userInfo) {
             await sendMessageToUser(chatId, "无法获取用户信息，请稍后再试。");
             return;
           }
 
-          // 发送欢迎消息
           const successMessage = await getVerificationSuccessMessage();
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
           
-          // 创建话题，添加重试机制
           let topicId = null;
           let retries = 3;
           let error = null;
@@ -518,7 +489,6 @@ export default {
               error = err;
               console.error(`创建话题失败，剩余重试次数: ${retries-1}, 错误: ${err.message}`);
               retries--;
-              // 短暂延迟后重试
               if (retries > 0) {
                 await new Promise(resolve => setTimeout(resolve, 1000));
               }
@@ -532,7 +502,6 @@ export default {
           }
         } catch (error) {
           console.error(`处理 /start 命令时出错: ${error.message}`);
-          // 不向用户发送错误信息，因为已经在上面处理过了
         }
         return;
       }
@@ -602,74 +571,58 @@ export default {
     }
 
     async function ensureUserTopic(chatId, userInfo) {
-      // 使用全局锁防止同一用户创建多个话题
       let lock = topicCreationLocks.get(chatId);
       if (!lock) {
         lock = Promise.resolve();
         topicCreationLocks.set(chatId, lock);
       }
 
-      // 创建新的锁，确保在当前锁完成前不会执行新的创建操作
       const newLock = (async () => {
         try {
-          // 等待前一个锁完成
           await lock;
           
-          // 首先查询数据库，检查是否已有话题
           const existingTopic = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
             .bind(chatId)
             .first();
           
-          // 如果已经存在有效话题ID，直接返回
           if (existingTopic && existingTopic.topic_id !== 'creating') {
             topicIdCache.set(chatId, existingTopic.topic_id);
             return existingTopic.topic_id;
           }
           
-          // 如果存在临时标记，且是由当前进程创建的，则清除
           if (existingTopic && existingTopic.topic_id === 'creating') {
-            // 检查临时标记存在时间，如果超过5分钟，则视为过期
             const cleanupResult = await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
               .bind(chatId, 'creating')
               .run();
             
             console.log(`清除过期的临时话题标记: ${chatId}, 影响行数: ${cleanupResult.count || 0}`);
             
-            // 删除缓存
             topicIdCache.set(chatId, undefined);
           }
           
-          // 使用事务进行原子操作
           try {
-            // 开始事务：先插入临时标记，如果其他进程已插入则会失败
             const insertResult = await env.D1.prepare('INSERT OR IGNORE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
               .bind(chatId, 'creating')
               .run();
             
-            // 如果插入失败（affected rows = 0），说明其他进程已开始创建
             if (insertResult.count === 0) {
               console.log(`用户 ${chatId} 的话题创建已由其他进程处理`);
               
-              // 等待短暂时间，让其他进程完成创建
               await new Promise(resolve => setTimeout(resolve, 1000));
               
-              // 再次查询是否已创建完成
               const recheckResult = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
                 .bind(chatId)
                 .first();
               
               if (recheckResult && recheckResult.topic_id !== 'creating') {
-                // 其他进程已完成创建
                 topicIdCache.set(chatId, recheckResult.topic_id);
                 return recheckResult.topic_id;
               } else {
-                // 其他进程创建时间过长或失败，返回null以便调用方处理
                 console.log(`用户 ${chatId} 的话题创建等待超时`);
                 return null;
               }
             }
             
-            // 成功插入临时标记后，创建新话题
             console.log(`为用户 ${chatId} 创建新话题...`);
             const userName = userInfo.username || `User_${chatId}`;
             const nickname = userInfo.nickname || userName;
@@ -677,27 +630,21 @@ export default {
             try {
               const topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
               
-              // 创建成功后，更新数据库
               const updateResult = await env.D1.prepare('UPDATE chat_topic_mappings SET topic_id = ? WHERE chat_id = ? AND topic_id = ?')
                 .bind(topicId, chatId, 'creating')
                 .run();
               
-              // 检查更新是否成功
               if (updateResult.count === 0) {
-                // 如果更新失败，说明临时标记已被其他进程更改
                 console.log(`用户 ${chatId} 的话题映射更新失败，可能已被其他进程处理`);
                 
-                // 再次查询最新状态
                 const finalCheck = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
                   .bind(chatId)
                   .first();
                 
                 if (finalCheck && finalCheck.topic_id !== 'creating') {
-                  // 使用已存在的话题ID
                   topicIdCache.set(chatId, finalCheck.topic_id);
                   return finalCheck.topic_id;
                 } else {
-                  // 更新临时标记为新创建的话题ID
                   await env.D1.prepare('UPDATE chat_topic_mappings SET topic_id = ? WHERE chat_id = ?')
                     .bind(topicId, chatId)
                     .run();
@@ -706,12 +653,10 @@ export default {
                   return topicId;
                 }
               } else {
-                // 更新成功
                 topicIdCache.set(chatId, topicId);
                 return topicId;
               }
             } catch (error) {
-              // 创建话题失败，清除临时标记
               console.error(`为用户 ${chatId} 创建话题失败: ${error.message}`);
               await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
                 .bind(chatId, 'creating')
@@ -723,7 +668,6 @@ export default {
           } catch (error) {
             console.error(`用户 ${chatId} 的话题创建事务失败: ${error.message}`);
             
-            // 再次检查是否有有效话题ID（可能在出错过程中已被其他进程创建）
             const emergencyCheck = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
               .bind(chatId)
               .first();
@@ -733,7 +677,6 @@ export default {
               return emergencyCheck.topic_id;
             }
             
-            // 确保清理临时标记
             await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ? AND topic_id = ?')
               .bind(chatId, 'creating')
               .run();
@@ -742,14 +685,12 @@ export default {
             throw error;
           }
         } finally {
-          // 只有当这个锁是最新的锁时才删除
           if (topicCreationLocks.get(chatId) === newLock) {
             topicCreationLocks.delete(chatId);
           }
         }
       })();
       
-      // 更新锁
       topicCreationLocks.set(chatId, newLock);
       return newLock;
     }
@@ -785,12 +726,10 @@ export default {
         const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
         const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
         
-        // 增加try-catch，确保版本检测失败不影响面板显示
         let hasUpdate = false;
         try {
           if (forceCheckUpdate) {
             console.log("强制检查更新...");
-            // 清除缓存，确保获取最新版本
             hasUpdate = await hasNewVersion();
           } else {
             hasUpdate = await hasNewVersion();
@@ -818,7 +757,6 @@ export default {
           ]
         ];
         
-        // 如果有新版本，添加更新信息按钮
         if (hasUpdate) {
           buttons.push([
             { text: '🔄 有新版本可用', callback_data: `show_update_${privateChatId}` }
@@ -848,7 +786,6 @@ export default {
         ]);
       } catch (error) {
         console.error(`发送管理面板失败: ${error.message}`);
-        // 尝试发送简化版面板
         try {
           await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
             method: 'POST',
@@ -884,8 +821,8 @@ export default {
 
     async function checkStartCommandRate(chatId) {
       const now = Date.now();
-      const window = 5 * 60 * 1000; // 5分钟窗口
-      const maxStartsPerWindow = 1; // 每个窗口最多允许1次 /start 命令
+      const window = 5 * 60 * 1000;
+      const maxStartsPerWindow = 1;
 
       let data = messageRateCache.get(chatId);
       if (data === undefined) {
@@ -901,25 +838,21 @@ export default {
         messageRateCache.set(chatId, data);
       }
 
-      // 如果窗口已过期，重置计数
       if (now - data.start_window_start > window) {
-        data.start_count = 1; // 设置为1因为当前请求也算一次
+        data.start_count = 1;
         data.start_window_start = now;
         await env.D1.prepare('UPDATE message_rates SET start_count = ?, start_window_start = ? WHERE chat_id = ?')
           .bind(data.start_count, data.start_window_start, chatId)
           .run();
       } else {
-        // 窗口内增加计数
         data.start_count += 1;
         await env.D1.prepare('UPDATE message_rates SET start_count = ? WHERE chat_id = ?')
           .bind(data.start_count, chatId)
           .run();
       }
 
-      // 更新缓存
       messageRateCache.set(chatId, data);
       
-      // 返回是否超出限制
       return data.start_count > maxStartsPerWindow;
     }
 
@@ -969,7 +902,6 @@ export default {
       if (key === 'verification_enabled') {
         settingsCache.set('verification_enabled', value === 'true');
         if (value === 'false') {
-          // 关闭验证码时将所有未拉黑用户标记为已验证，不设置过期时间
           await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL, is_verifying = ?, verification_code = NULL, code_expiry = NULL, is_first_verification = ? WHERE chat_id NOT IN (SELECT chat_id FROM user_states WHERE is_blocked = TRUE)')
             .bind(true, false, false)
             .run();
@@ -1056,7 +988,6 @@ export default {
             .run();
           userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
           
-          // 删除旧的验证消息
           try {
             await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
               method: 'POST',
@@ -1068,15 +999,12 @@ export default {
             });
           } catch (error) {
             console.log(`删除过期验证按钮失败: ${error.message}`);
-            // 即使删除失败也继续处理
           }
           
-          // 立即发送新的验证码
           try {
             await handleVerification(chatId, 0);
           } catch (verificationError) {
             console.error(`发送新验证码失败: ${verificationError.message}`);
-            // 如果发送验证码失败，则再次尝试
             setTimeout(async () => {
               try {
                 await handleVerification(chatId, 0);
@@ -1090,7 +1018,6 @@ export default {
         }
 
         if (result === 'correct') {
-          // 移除过期时间设置，让验证永久有效
           await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = NULL, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
             .bind(true, false, false, chatId)
             .run();
@@ -1274,7 +1201,6 @@ export default {
             });
           } catch (deleteError) {
             console.log(`删除上一条验证消息失败: ${deleteError.message}`);
-            // 继续处理，即使删除失败
           }
           
           userState.last_verification_message_id = null;
@@ -1284,11 +1210,9 @@ export default {
             .run();
         }
 
-        // 确保发送验证码
         await sendVerification(chatId);
       } catch (error) {
         console.error(`处理验证过程失败: ${error.message}`);
-        // 重置用户状态以防卡住
         try {
           await env.D1.prepare('UPDATE user_states SET is_verifying = FALSE WHERE chat_id = ?')
             .bind(chatId)
@@ -1301,7 +1225,7 @@ export default {
         } catch (resetError) {
           console.error(`重置用户验证状态失败: ${resetError.message}`);
         }
-        throw error; // 向上传递错误以便调用方处理
+        throw error;
       }
     }
 
@@ -1360,7 +1284,7 @@ export default {
         }
       } catch (error) {
         console.error(`发送验证码失败: ${error.message}`);
-        throw error; // 向上传递错误以便调用方处理
+        throw error;
       }
     }
 
@@ -1414,11 +1338,9 @@ export default {
     async function getExistingTopicId(chatId) {
       let topicId = topicIdCache.get(chatId);
       if (topicId !== undefined) {
-        // 确保缓存中不是临时标记
         if (topicId !== 'creating') {
           return topicId;
         }
-        // 如果是临时标记，则从缓存中移除，重新查询数据库
         topicIdCache.set(chatId, undefined);
       }
 
@@ -1426,7 +1348,6 @@ export default {
         .bind(chatId)
         .first();
       
-      // 确保数据库中不是临时标记
       if (result && result.topic_id !== 'creating') {
         topicId = result.topic_id;
         topicIdCache.set(chatId, topicId);
@@ -1458,29 +1379,24 @@ export default {
     }
 
     async function saveTopicId(chatId, topicId) {
-      // 先检查是否已存在映射
       const existingMapping = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
         .bind(chatId)
         .first();
       
       if (existingMapping) {
-        // 如果存在且不是临时标记，则不更新
         if (existingMapping.topic_id !== 'creating') {
           topicIdCache.set(chatId, existingMapping.topic_id);
           return;
         }
-        // 如果是临时标记，则更新
         await env.D1.prepare('UPDATE chat_topic_mappings SET topic_id = ? WHERE chat_id = ?')
           .bind(topicId, chatId)
           .run();
       } else {
-        // 如果不存在，则插入
         await env.D1.prepare('INSERT INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
           .bind(chatId, topicId)
           .run();
       }
       
-      // 更新缓存
       topicIdCache.set(chatId, topicId);
     }
 
@@ -1588,12 +1504,9 @@ export default {
           const timeoutId = setTimeout(() => controller.abort(), 5000);
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
-
           if (response.ok) {
             return response;
           }
-          
-          // 特殊处理 429 Too Many Requests
           if (response.status === 429) {
             const retryAfter = response.headers.get('Retry-After') || 5;
             const delay = parseInt(retryAfter) * 1000;
@@ -1601,17 +1514,12 @@ export default {
             await new Promise(resolve => setTimeout(resolve, delay));
             continue;
           }
-          
-          // 其他错误状态码
           throw new Error(`Request failed with status ${response.status}: ${await response.text()}`);
         } catch (error) {
           if (i === retries - 1) throw error;
-          
-          // 计算指数退避时间，并添加随机抖动
           const exponentialWait = initialBackoff * Math.pow(2, i);
-          const jitter = Math.random() * 0.3 * exponentialWait; // 添加30%以内的随机抖动
+          const jitter = Math.random() * 0.3 * exponentialWait;
           const waitTime = Math.floor(exponentialWait + jitter);
-          
           console.log(`Request to ${url} failed (attempt ${i+1}/${retries}). Retrying in ${waitTime}ms. Error: ${error.message}`);
           await new Promise(resolve => setTimeout(resolve, waitTime));
         }
@@ -1638,12 +1546,9 @@ export default {
       return new Response(response.ok ? 'Webhook removed' : JSON.stringify(response, null, 2));
     }
 
-    // 新增：设置定期清理任务
     async function setupPeriodicCleanup(d1) {
-      // 立即执行一次清理
       await performCacheCleanup();
       
-      // 设置定期执行
       setInterval(async () => {
         try {
           await performCacheCleanup();
@@ -1653,7 +1558,6 @@ export default {
       }, CACHE_CLEANUP_INTERVAL);
     }
 
-    // 执行缓存清理
     async function performCacheCleanup() {
       const now = Date.now();
       if (now - lastCacheCleanupTime < CACHE_CLEANUP_INTERVAL) {
@@ -1662,37 +1566,41 @@ export default {
       
       console.log('执行缓存清理...');
       
-      // 清理超过3小时未访问的缓存项
       userInfoCache.cleanStale(3 * 60 * 60 * 1000);
       topicIdCache.cleanStale(3 * 60 * 60 * 1000);
       userStateCache.cleanStale(3 * 60 * 60 * 1000);
       messageRateCache.cleanStale(3 * 60 * 60 * 1000);
       
-      // 更新最后清理时间
       lastCacheCleanupTime = now;
       console.log('缓存清理完成');
     }
 
-    // 批量更新用户状态
-    async function batchUpdateUserStates(d1, operations, batchSize = 50) {
-      const batches = [];
-      for (let i = 0; i < operations.length; i += batchSize) {
-        batches.push(operations.slice(i, i + batchSize));
-      }
-      
-      for (const batch of batches) {
-        await d1.batch(batch);
+    async function hasNewVersion() {
+      try {
+        const remoteVersion = await getRemoteVersion();
+        
+        const normalizedRemote = remoteVersion.toLowerCase().replace(/\s+/g, '');
+        const normalizedCurrent = CURRENT_VERSION.toLowerCase().replace(/\s+/g, '');
+        
+        console.log(`版本比较详情:`);
+        console.log(`- 当前版本(原始): "${CURRENT_VERSION}"`);
+        console.log(`- 远程版本(原始): "${remoteVersion}"`);
+        console.log(`- 当前版本(规范化): "${normalizedCurrent}"`);
+        console.log(`- 远程版本(规范化): "${normalizedRemote}"`);
+        console.log(`- 是否需要更新: ${normalizedRemote !== normalizedCurrent}`);
+        
+        return normalizedRemote !== normalizedCurrent;
+      } catch (error) {
+        console.error(`版本比较失败: ${error.message}`);
+        return false;
       }
     }
 
-    // 获取远程版本信息
     async function getRemoteVersion() {
       try {
-        // 添加超时控制
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000); // 3秒超时
+        const timeoutId = setTimeout(() => controller.abort(), 3000);
         
-        // 添加随机参数破坏缓存
         const cacheBuster = `?t=${Date.now()}`;
         const response = await fetch(`${VERSION_CHECK_URL}${cacheBuster}`, { 
           signal: controller.signal, 
@@ -1707,25 +1615,22 @@ export default {
         
         if (!response.ok) {
           console.error(`获取远程版本失败: ${response.status}`);
-          return CURRENT_VERSION; // 如果获取失败，返回当前版本，防止误报更新
+          return CURRENT_VERSION;
         }
         
         const versionText = await response.text();
-        return versionText.trim(); // 去除可能的空白字符
+        return versionText.trim();
       } catch (error) {
         console.error(`获取远程版本异常: ${error.message}`);
-        return CURRENT_VERSION; // 如果出现异常，返回当前版本
+        return CURRENT_VERSION;
       }
     }
 
-    // 获取更新信息
     async function getUpdateInfo() {
       try {
-        // 添加超时控制
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000); // 3秒超时
+        const timeoutId = setTimeout(() => controller.abort(), 3000);
         
-        // 添加随机参数破坏缓存
         const cacheBuster = `?t=${Date.now()}`;
         const response = await fetch(`${UPDATE_INFO_URL}${cacheBuster}`, { 
           signal: controller.signal, 
@@ -1751,28 +1656,14 @@ export default {
       }
     }
 
-    // 检查是否有新版本
-    async function hasNewVersion() {
-      try {
-        // 每次都重新获取，不使用缓存
-        const remoteVersion = await getRemoteVersion();
-        
-        // 规范化版本字符串 - 去除所有空白字符和转为小写
-        const normalizedRemote = remoteVersion.toLowerCase().replace(/\s+/g, '');
-        const normalizedCurrent = CURRENT_VERSION.toLowerCase().replace(/\s+/g, '');
-        
-        console.log(`版本比较详情:`);
-        console.log(`- 当前版本(原始): "${CURRENT_VERSION}"`);
-        console.log(`- 远程版本(原始): "${remoteVersion}"`);
-        console.log(`- 当前版本(规范化): "${normalizedCurrent}"`);
-        console.log(`- 远程版本(规范化): "${normalizedRemote}"`);
-        console.log(`- 是否需要更新: ${normalizedRemote !== normalizedCurrent}`);
-        
-        // 如果版本不同，则需要更新
-        return normalizedRemote !== normalizedCurrent;
-      } catch (error) {
-        console.error(`版本比较失败: ${error.message}`);
-        return false; // 如果发生错误，返回false表示没有新版本
+    async function batchUpdateUserStates(d1, operations, batchSize = 50) {
+      const batches = [];
+      for (let i = 0; i < operations.length; i += batchSize) {
+        batches.push(operations.slice(i, i + batchSize));
+      }
+      
+      for (const batch of batches) {
+        await d1.batch(batch);
       }
     }
 
