@@ -768,20 +768,41 @@ export default {
           return;
         }
 
-        let verificationState = userStateCache.get(chatId);
-        if (verificationState === undefined) {
-          verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
-            .bind(chatId)
-            .first();
-          if (!verificationState) {
-            verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
-          }
-          userStateCache.set(chatId, verificationState);
+        // 始终从 DB 查询最新验证状态，避免缓存中缺少 verification_code/last_verification_message_id 字段
+        let verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, last_verification_message_id, is_verifying FROM user_states WHERE chat_id = ?')
+          .bind(chatId)
+          .first();
+        if (!verificationState) {
+          verificationState = { verification_code: null, code_expiry: null, last_verification_message_id: null, is_verifying: false };
         }
+        // 合并到缓存（保留其他字段如 is_blocked 等）
+        let cachedState = userStateCache.get(chatId);
+        if (cachedState) {
+          cachedState.verification_code = verificationState.verification_code;
+          cachedState.code_expiry = verificationState.code_expiry;
+          cachedState.last_verification_message_id = verificationState.last_verification_message_id;
+          cachedState.is_verifying = verificationState.is_verifying;
+          verificationState = cachedState;
+        }
+        userStateCache.set(chatId, verificationState);
 
         const storedCode = verificationState.verification_code;
         const codeExpiry = verificationState.code_expiry;
+        const currentVerificationMsgId = verificationState.last_verification_message_id;
         const nowSeconds = Math.floor(Date.now() / 1000);
+
+        // 检查回调是否来自当前验证消息，忽略旧消息的过期回调
+        if (currentVerificationMsgId && String(messageId) !== String(currentVerificationMsgId)) {
+          // 这是旧验证消息的回调，尝试删除旧消息并忽略
+          try {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: chatId, message_id: messageId })
+            });
+          } catch (e) {}
+          return;
+        }
 
         if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
           await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
@@ -847,19 +868,24 @@ export default {
           await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
           const userInfo = await getUserInfo(chatId);
           await ensureUserTopic(chatId, userInfo);
+
+          // 仅在验证成功时删除旧验证消息（失败时 handleVerification 已处理删除）
+          try {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId
+              })
+            });
+          } catch (e) {
+            // 消息可能已被删除，忽略错误
+          }
         } else {
           await sendMessageToUser(chatId, '验证失败，请重新尝试。');
           await handleVerification(chatId, messageId);
         }
-
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: messageId
-          })
-        });
       } else {
         const senderId = callbackQuery.from.id.toString();
         const isAdmin = await checkIfAdmin(senderId);
@@ -1125,7 +1151,7 @@ export default {
       const result = await env.D1.prepare('SELECT topic_id FROM chat_topic_mappings WHERE chat_id = ?')
         .bind(chatId)
         .first();
-      topicId = result?.topic_id || null;
+      topicId = result?.topic_id ? Number(result.topic_id) : null;
       if (topicId) {
         topicIdCache.set(chatId, topicId);
       }
@@ -1154,17 +1180,22 @@ export default {
     }
 
     async function saveTopicId(chatId, topicId) {
+      const topicIdNum = Number(topicId);
       await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-        .bind(chatId, topicId)
+        .bind(chatId, String(topicIdNum))
         .run();
-      topicIdCache.set(chatId, topicId);
+      topicIdCache.set(chatId, topicIdNum);
     }
 
     async function getPrivateChatId(topicId) {
-      for (const [chatId, tid] of topicIdCache.cache) if (tid === topicId) return chatId;
+      const topicIdStr = String(topicId);
+      for (const [chatId, tid] of topicIdCache.cache) if (String(tid) === topicIdStr) return chatId;
       const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?')
-        .bind(topicId)
+        .bind(topicIdStr)
         .first();
+      if (mapping?.chat_id) {
+        topicIdCache.set(mapping.chat_id, Number(topicId));
+      }
       return mapping?.chat_id || null;
     }
 
@@ -1187,6 +1218,23 @@ export default {
       if (!data.ok) {
         throw new Error(`Failed to send message to topic ${topicId}: ${data.description}`);
       }
+
+      // 检测消息是否被静默发送到 General 话题（话题可能已被删除）
+      if (topicId && data.result) {
+        const sentThreadId = data.result.message_thread_id;
+        if (!sentThreadId || Number(sentThreadId) !== Number(topicId)) {
+          // 消息发到了错误的话题，删除并抛出异常以触发话题重建
+          try {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: GROUP_ID, message_id: data.result.message_id })
+            });
+          } catch (e) {}
+          throw new Error(`Topic ${topicId} may have been deleted, message was redirected`);
+        }
+      }
+
       return data;
     }
 
